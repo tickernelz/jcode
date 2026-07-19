@@ -93,9 +93,8 @@ fn normalize_provider_id(provider: &str) -> String {
     provider.trim().to_ascii_lowercase()
 }
 
-pub fn provider_key_from_hint(provider_hint: Option<&str>) -> Option<&'static str> {
-    let normalized = normalize_provider_id(provider_hint?);
-    match normalized.as_str() {
+fn provider_key_from_normalized_hint(normalized: &str) -> Option<&'static str> {
+    match normalized {
         "anthropic" | "claude" => Some("claude"),
         "openai" => Some("openai"),
         "openrouter" => Some("openrouter"),
@@ -105,6 +104,33 @@ pub fn provider_key_from_hint(provider_hint: Option<&str>) -> Option<&'static st
         "cursor" => Some("cursor"),
         _ => None,
     }
+}
+
+pub fn provider_key_from_hint(provider_hint: Option<&str>) -> Option<&'static str> {
+    let normalized = normalize_provider_id(provider_hint?);
+    provider_key_from_normalized_hint(&normalized)
+}
+
+fn named_profile_from_model_spec(model: &str) -> Option<String> {
+    let (profile, profile_model) = model.split_once(':')?;
+    let profile = profile.trim();
+    let profile_model = profile_model.trim();
+    if profile.is_empty() || profile_model.is_empty() {
+        return None;
+    }
+    let is_windows_drive = profile.len() == 1
+        && profile.as_bytes()[0].is_ascii_alphabetic()
+        && profile_model
+            .as_bytes()
+            .first()
+            .is_some_and(|separator| matches!(*separator, b'\\' | b'/'));
+    if is_windows_drive {
+        return None;
+    }
+    let profile = normalize_provider_id(profile);
+    provider_key_from_normalized_hint(&profile)
+        .is_none()
+        .then_some(profile)
 }
 
 pub fn is_listable_model_name(model: &str) -> bool {
@@ -217,12 +243,45 @@ pub fn context_limit_for_model_with_provider_and_cache(
     provider_hint: Option<&str>,
     cached_context_limit: impl Fn(&str) -> Option<usize>,
 ) -> Option<usize> {
-    let provider = provider_key_from_hint(provider_hint).or_else(|| provider_for_model(model));
+    let provider_hint = provider_hint
+        .map(normalize_provider_id)
+        .filter(|hint| !hint.is_empty());
+
+    let hinted_provider = provider_hint
+        .as_deref()
+        .and_then(provider_key_from_normalized_hint);
+    let model_profile = if provider_hint.is_none() {
+        named_profile_from_model_spec(model)
+    } else {
+        None
+    };
+    let provider = hinted_provider.or_else(|| provider_for_model(model));
+    let named_profile = provider_hint
+        .as_deref()
+        .filter(|_| hinted_provider.is_none())
+        .or(model_profile.as_deref());
     let (model, is_1m) = model_id_for_capability_lookup(model, provider);
     let model = model.as_str();
 
     if matches!(provider, Some("copilot")) {
         return Some(copilot_context_limit_for_model(model));
+    }
+
+    // Named OpenAI-compatible profiles can reuse built-in-looking model ids. Resolve their
+    // profile-qualified cache entry before static family defaults, without consulting the bare
+    // key that may have been populated by another profile with the same model id.
+    if let Some(profile) = named_profile {
+        let already_qualified = model
+            .strip_prefix(profile)
+            .is_some_and(|suffix| suffix.starts_with(':'));
+        let limit = if already_qualified {
+            cached_context_limit(model)
+        } else {
+            cached_context_limit(&format!("{profile}:{model}"))
+        };
+        if limit.is_some() {
+            return limit;
+        }
     }
 
     // Spark variant has a smaller context window than the full codex model.
@@ -237,8 +296,7 @@ pub fn context_limit_for_model_with_provider_and_cache(
         return Some(128_000);
     }
 
-    // GPT-5.4-family models should default to the long-context window.
-    // The live Codex OAuth catalog can still override this via the dynamic cache above.
+    // GPT-5.4-family models default to the long-context window.
     if model.starts_with("gpt-5.4") {
         return Some(1_000_000);
     }
@@ -251,8 +309,8 @@ pub fn context_limit_for_model_with_provider_and_cache(
     // Claude models: classify long-context behavior centrally. This is the
     // authoritative source for known Claude models because the live catalog's
     // `max_input_tokens` field over-advertises 1M for models that are actually
-    // 200K-capped (verified against the live API). Unknown/future Claude models
-    // fall through to the dynamic cache below.
+    // 200K-capped (verified against the live API). Unknown/future Claude models use a
+    // qualified named-profile entry above or the unqualified dynamic cache below.
     if base_is_known_claude_model(model) {
         let mode = crate::anthropic::anthropic_context_mode(model);
         return Some(if is_1m {
@@ -262,7 +320,9 @@ pub fn context_limit_for_model_with_provider_and_cache(
         });
     }
 
-    if let Some(limit) = cached_context_limit(model) {
+    if named_profile.is_none()
+        && let Some(limit) = cached_context_limit(model)
+    {
         return Some(limit);
     }
 
@@ -277,8 +337,8 @@ pub fn context_limit_for_model_with_provider_and_cache(
     // (Z.AI, Moonshot, MiniMax, Alibaba, etc.). Their `/v1/models` endpoints
     // frequently omit `context_length`, so without this classifier these models
     // fall back to the generic 200K default even when their real window is
-    // larger (e.g. GLM-5.2's 1M). This is checked AFTER the dynamic cache so a
-    // live catalog or user `context_window` config always wins.
+    // larger (e.g. GLM-5.2's 1M). Explicit profile metadata is checked above;
+    // unqualified live catalog data is used here only when no named profile is active.
     if let Some(limit) = open_weight_family_context_limit(model) {
         return Some(limit);
     }
@@ -568,6 +628,20 @@ mod tests {
             }),
             Some(42_000)
         );
+    }
+
+    #[test]
+    fn named_profile_parser_ignores_windows_drive_paths() {
+        assert_eq!(
+            named_profile_from_model_spec("alpha-gateway:/opt/models/model.gguf").as_deref(),
+            Some("alpha-gateway")
+        );
+        assert_eq!(
+            named_profile_from_model_spec("alpha-gateway:gpt-5.6-sol").as_deref(),
+            Some("alpha-gateway")
+        );
+        assert_eq!(named_profile_from_model_spec(r"C:\models\model.gguf"), None);
+        assert_eq!(named_profile_from_model_spec("d:/models/model.gguf"), None);
     }
 
     #[test]

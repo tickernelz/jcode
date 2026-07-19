@@ -529,9 +529,10 @@ pub fn populate_context_limits_from_config() {
 /// - the slash base (`x.gguf` for `/opt/models/x.gguf`), because
 ///   `model_id_for_capability_lookup` reduces slash-containing ids to their
 ///   final segment;
-/// - the profile-qualified spec (`cachyai-a2000:qwen3.6-35b-a2000-128k`),
-///   because session-restored models keep the `<profile>:` routing prefix and
-///   non-slash qualified specs are looked up verbatim.
+/// - profile-qualified raw and slash-base forms
+///   (`cachyai-a2000:qwen3.6-35b-a2000-128k` and
+///   `ornith-box-1:ornith-1.0-35b-Q4_K_M.gguf`), so named-provider hints remain
+///   isolated even when multiple profiles expose the same model id.
 pub fn populate_context_limits_from_config_value(cfg: &crate::config::Config) {
     let mut limits = HashMap::new();
     for (profile_id, provider_cfg) in cfg.providers.iter() {
@@ -557,15 +558,20 @@ pub(crate) fn config_context_limit_cache_keys(profile_id: &str, model_id: &str) 
     if id.is_empty() {
         return Vec::new();
     }
-    let mut keys = vec![id.clone()];
     let slash_base = jcode_provider_core::model_id::slash_base(&id).to_string();
-    if slash_base != id && !slash_base.is_empty() {
-        keys.push(slash_base);
-    }
+    let has_slash_base = slash_base != id && !slash_base.is_empty();
     let profile = profile_id.trim().to_ascii_lowercase();
+    let mut keys = Vec::with_capacity(4);
     if !profile.is_empty() {
         keys.push(format!("{profile}:{id}"));
+        if has_slash_base {
+            keys.push(format!("{profile}:{slash_base}"));
+        }
     }
+    if has_slash_base {
+        keys.push(slash_base);
+    }
+    keys.push(id);
     keys
 }
 

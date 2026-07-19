@@ -993,6 +993,114 @@ fn populate_context_limits_from_config_seeds_qualified_runtime_model_shapes() {
 }
 
 #[test]
+fn named_provider_context_limits_are_scoped_for_duplicate_model_ids() {
+    use super::{NamedProviderConfig, NamedProviderModelConfig};
+
+    let model_id = "gpt-5.6-sol";
+    let slash_model_id = "/opt/models/shared-model.gguf";
+    let beta_only_model_id = "beta-only-model";
+    let beta_only_slash_model_id = "/opt/models/beta-only.gguf";
+    let mut cfg = Config::default();
+    for (profile_id, context_window) in [("alpha-gateway", 131_072), ("beta-gateway", 372_000)] {
+        cfg.providers.insert(
+            profile_id.to_string(),
+            NamedProviderConfig {
+                base_url: format!("https://{profile_id}.example.test/v1"),
+                models: [model_id, slash_model_id]
+                    .into_iter()
+                    .map(|id| NamedProviderModelConfig {
+                        id: id.to_string(),
+                        context_window: Some(context_window),
+                        input: Vec::new(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    cfg.providers
+        .get_mut("beta-gateway")
+        .expect("beta fixture must exist")
+        .models
+        .push(NamedProviderModelConfig {
+            id: beta_only_model_id.to_string(),
+            context_window: Some(777_000),
+            input: Vec::new(),
+        });
+    cfg.providers
+        .get_mut("beta-gateway")
+        .expect("beta fixture must exist")
+        .models
+        .push(NamedProviderModelConfig {
+            id: beta_only_slash_model_id.to_string(),
+            context_window: Some(888_000),
+            input: Vec::new(),
+        });
+
+    populate_context_limits_from_config_ref(&cfg);
+
+    assert_eq!(
+        crate::provider::context_limit_for_model_with_provider(model_id, Some("alpha-gateway")),
+        Some(131_072)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model_with_provider(model_id, Some("beta-gateway")),
+        Some(372_000)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model_with_provider(
+            slash_model_id,
+            Some("alpha-gateway")
+        ),
+        Some(131_072)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model_with_provider(
+            slash_model_id,
+            Some("beta-gateway")
+        ),
+        Some(372_000)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model("alpha-gateway:/opt/models/shared-model.gguf"),
+        Some(131_072)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model("beta-gateway:/opt/models/shared-model.gguf"),
+        Some(372_000)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model("beta-gateway:/opt/models/beta-only.gguf"),
+        Some(888_000)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model("alpha-gateway:/opt/models/beta-only.gguf"),
+        None,
+        "a session-qualified model must not inherit another profile's bare cache entry"
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model_with_provider(
+            beta_only_model_id,
+            Some("beta-gateway")
+        ),
+        Some(777_000)
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model_with_provider(
+            beta_only_model_id,
+            Some("alpha-gateway")
+        ),
+        None,
+        "a named profile must not inherit another profile's bare cache entry"
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model_with_provider(model_id, Some("openai")),
+        Some(272_000),
+        "named-provider metadata must not override the built-in OpenAI fallback"
+    );
+}
+
+#[test]
 fn migrate_legacy_swarm_spawn_mode_flips_visible_to_inline_once() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
