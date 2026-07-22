@@ -3,6 +3,11 @@ use crate::bus::BackgroundTaskStatus;
 use std::ffi::OsStr;
 use std::sync::{LazyLock, Mutex};
 
+#[test]
+fn selfdev_clone_uses_user_owned_fork() {
+    assert_eq!(JCODE_REPO_URL, "https://github.com/tickernelz/jcode.git");
+}
+
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {

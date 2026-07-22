@@ -713,13 +713,13 @@ jobs:
           cat > /tmp/homebrew-jcode/Formula/jcode.rb << FORMULA
           class Jcode < Formula
             desc "AI coding agent powered by Claude and ChatGPT"
-            homepage "https://github.com/1jehuang/jcode"
+            homepage "https://github.com/tickernelz/jcode"
             version "${VERSION_NUM}"
             license "MIT"
 
             on_macos do
               on_arm do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-macos-aarch64.tar.gz"
+                url "https://github.com/tickernelz/jcode/releases/download/${VERSION}/jcode-macos-aarch64.tar.gz"
                 sha256 "${MACOS_ARM_SHA}"
 
                 def install
@@ -728,7 +728,7 @@ jobs:
               end
 
               on_intel do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-macos-x86_64.tar.gz"
+                url "https://github.com/tickernelz/jcode/releases/download/${VERSION}/jcode-macos-x86_64.tar.gz"
                 sha256 "${MACOS_INTEL_SHA}"
 
                 def install
@@ -739,7 +739,7 @@ jobs:
 
             on_linux do
               on_intel do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
+                url "https://github.com/tickernelz/jcode/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
                 sha256 "${LINUX_SHA}"
 
                 def install
@@ -753,7 +753,7 @@ jobs:
               end
 
               on_arm do
-                url "https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-linux-aarch64.tar.gz"
+                url "https://github.com/tickernelz/jcode/releases/download/${VERSION}/jcode-linux-aarch64.tar.gz"
                 sha256 "${LINUX_ARM_SHA}"
 
                 def install
@@ -805,7 +805,7 @@ jobs:
           VERSION_NUM="${VERSION#v}"
 
           LINUX_SHA=$(sha256sum artifacts/jcode-linux-x86_64/jcode-linux-x86_64.tar.gz | cut -d' ' -f1)
-          LINUX_URL="https://github.com/1jehuang/jcode/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
+          LINUX_URL="https://github.com/tickernelz/jcode/releases/download/${VERSION}/jcode-linux-x86_64.tar.gz"
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -828,7 +828,7 @@ jobs:
           pkgrel=1
           pkgdesc="AI coding agent powered by Claude and ChatGPT"
           arch=('x86_64')
-          url="https://github.com/1jehuang/jcode"
+          url="https://github.com/tickernelz/jcode"
           license=('MIT')
           provides=('jcode')
           conflicts=('jcode')
@@ -859,7 +859,7 @@ jobs:
           printf '\tpkgdesc = AI coding agent powered by Claude and ChatGPT\n' >> .SRCINFO
           printf '\tpkgver = %s\n' "${VERSION_NUM}" >> .SRCINFO
           printf '\tpkgrel = 1\n' >> .SRCINFO
-          printf '\turl = https://github.com/1jehuang/jcode\n' >> .SRCINFO
+          printf '\turl = https://github.com/tickernelz/jcode\n' >> .SRCINFO
           printf '\tarch = x86_64\n' >> .SRCINFO
           printf '\tlicense = MIT\n' >> .SRCINFO
           printf '\tprovides = jcode\n' >> .SRCINFO

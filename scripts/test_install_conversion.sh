@@ -31,24 +31,6 @@ done
 [ -z "${DOWNLOAD_URL_LOG:-}" ] || printf '%s\n' "$url" >> "$DOWNLOAD_URL_LOG"
 case "$url" in
   *telemetry.jcode.sh*) printf '%s\n' "$payload" >> "$INSTALL_TELEMETRY_LOG" ;;
-  *jcode.sh/releases/latest/version)
-    [ "${FAIL_RELEASE:-0}" != "1" ] || exit 22
-    [ "${FAIL_METADATA_RELEASE:-0}" != "1" ] || exit 22
-    printf 'v1.2.3\n'
-    ;;
-  *jcode.sh/releases/v1.2.3/download-bases)
-    printf 'https://mirror.invalid/releases/v1.2.3\n'
-    printf 'https://github.com/1jehuang/jcode/releases/download/v1.2.3\n'
-    ;;
-  *jcode.sh/releases/v1.2.3/SHA256SUMS)
-    if [ "${METADATA_CHECKSUM_HTML:-0}" = "1" ]; then
-      printf '<!doctype html><title>fallback page</title>\n'
-      exit 0
-    fi
-    checksum='8d57abb57a0dae3ff23c8f0df1f51951b7772822e0d560e860d6f68c24ef6d3d'
-    [ "${BAD_CHECKSUM:-0}" != "1" ] || checksum='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    printf '%s  %s\n' "$checksum" "${TEST_CHECKSUM_ASSET:-jcode-linux-x86_64.tar.gz}"
-    ;;
   *github.com*/releases/download/v1.2.3/SHA256SUMS)
     checksum='8d57abb57a0dae3ff23c8f0df1f51951b7772822e0d560e860d6f68c24ef6d3d'
     [ "${BAD_CHECKSUM:-0}" != "1" ] || checksum='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -56,10 +38,8 @@ case "$url" in
     ;;
   *github.com*/releases/latest)
     [ "${FAIL_RELEASE:-0}" != "1" ] || exit 22
-    [ "${FAIL_GITHUB_RELEASE:-0}" != "1" ] || exit 22
-    printf 'https://github.com/1jehuang/jcode/releases/tag/v1.2.3'
+    printf 'https://github.com/tickernelz/jcode/releases/tag/v1.2.3'
     ;;
-  *mirror.invalid*) exit 22 ;;
   *github.com*/releases/download/*)
     [ -n "$output" ] || exit 2
     printf 'fake archive' > "$output"
@@ -92,6 +72,7 @@ chmod +x "$tmp/bin/uname" "$tmp/bin/curl" "$tmp/bin/tar"
 conversion_id="11111111-2222-4333-8444-555555555555"
 telemetry_log="$tmp/telemetry.jsonl"
 hotkey_setup_log="$tmp/hotkey-setup.log"
+owner_url_log="$tmp/owner-urls.log"
 PATH="$tmp/bin:$PATH" \
 HOME="$tmp/home" \
 JCODE_HOME="$tmp/home/.jcode" \
@@ -100,36 +81,19 @@ JCODE_INSTALL_CONVERSION_ID="$conversion_id" \
 JCODE_SKIP_SERVER_RELOAD=1 \
 INSTALL_TELEMETRY_LOG="$telemetry_log" \
 HOTKEY_SETUP_LOG="$hotkey_setup_log" \
+DOWNLOAD_URL_LOG="$owner_url_log" \
 bash "$repo_dir/scripts/install.sh" >/dev/null
 
 test "$(cat "$tmp/home/.jcode/install_conversion_id")" = "$conversion_id"
 grep -q '"stage":"installer_start".*"outcome":"success"' "$telemetry_log"
 grep -q '"stage":"installer_finish".*"outcome":"success"' "$telemetry_log"
 test "$(cat "$hotkey_setup_log")" = "setup-hotkey"
-
-# If GitHub's release page is blocked, the static jcode.sh version endpoint
-# must keep the complete install path working.
-PATH="$tmp/bin:$PATH" \
-HOME="$tmp/home-metadata-fallback" \
-JCODE_HOME="$tmp/home-metadata-fallback/.jcode" \
-JCODE_INSTALL_DIR="$tmp/install-metadata-fallback" \
-JCODE_SKIP_SERVER_RELOAD=1 \
-JCODE_NO_TELEMETRY=1 \
-FAIL_GITHUB_RELEASE=1 \
-bash "$repo_dir/scripts/install.sh" >/dev/null
-test -x "$tmp/install-metadata-fallback/jcode"
-
-# A static host may return its HTML fallback with HTTP 200 for a missing path.
-# Treat that as invalid metadata and continue to GitHub's checksum file.
-PATH="$tmp/bin:$PATH" \
-HOME="$tmp/home-checksum-fallback" \
-JCODE_HOME="$tmp/home-checksum-fallback/.jcode" \
-JCODE_INSTALL_DIR="$tmp/install-checksum-fallback" \
-JCODE_SKIP_SERVER_RELOAD=1 \
-JCODE_NO_TELEMETRY=1 \
-METADATA_CHECKSUM_HTML=1 \
-bash "$repo_dir/scripts/install.sh" >/dev/null
-test -x "$tmp/install-checksum-fallback/jcode"
+grep -q '^https://github.com/tickernelz/jcode/releases/latest$' "$owner_url_log"
+grep -q '^https://github.com/tickernelz/jcode/releases/download/v1.2.3/' "$owner_url_log"
+if grep -Eq '1jehuang/jcode|jcode\.sh/releases' "$owner_url_log"; then
+  echo "installer must retrieve releases only from tickernelz/jcode" >&2
+  exit 1
+fi
 
 # Git for Windows can be x64-emulated on Windows ARM64. In that case uname -m
 # reports x86_64 while PROCESSOR_ARCHITEW6432 exposes the native ARM64 OS.

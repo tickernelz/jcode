@@ -21,22 +21,7 @@ cd "$(git rev-parse --show-toplevel)"
 VERSION_NUM="${TAG#v}"
 CHANGELOG_FILE="changelog/v${VERSION_NUM}.json"
 
-# Determine the owner/repo slug for the compare link.
-repo_slug() {
-    if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
-        echo "$GITHUB_REPOSITORY"
-        return
-    fi
-    local url
-    url="$(git remote get-url origin 2>/dev/null || true)"
-    if [[ "$url" =~ github\.com[:/]+([^/]+/[^/ ]+) ]]; then
-        echo "${BASH_REMATCH[1]%.git}"
-        return
-    fi
-    echo "1jehuang/jcode"
-}
-
-REPO="$(repo_slug)"
+REPO="tickernelz/jcode"
 
 # Determine the previous tag if not supplied: nearest ancestor tag first,
 # falling back to the next entry in version-sorted tag order.

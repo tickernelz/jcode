@@ -432,6 +432,9 @@ jobs:
       - name: Installer conversion telemetry tests
         run: bash scripts/test_install_conversion.sh
 
+      - name: User-owned update source tests
+        run: bash scripts/test_user_owned_update_sources.sh
+
       - name: Setup friction scorecard
         run: bash scripts/setup_friction_eval.sh
 

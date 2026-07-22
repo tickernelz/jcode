@@ -16,7 +16,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-const GITHUB_REPO: &str = "1jehuang/jcode";
+const GITHUB_REPO: &str = "tickernelz/jcode";
+const GITHUB_BRANCH: &str = "master";
+const GITHUB_CLONE_URL: &str = "https://github.com/tickernelz/jcode.git";
+const GITHUB_FETCH_REFSPEC: &str = "+refs/heads/master:refs/remotes/origin/master";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60); // minimum gap between checks
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time allowed for the initial TCP/TLS connect to the download host.
@@ -331,7 +334,10 @@ fn github_api_request(
 }
 
 fn latest_main_sha_blocking() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{}/commits/main", GITHUB_REPO);
+    let url = format!(
+        "https://api.github.com/repos/{}/commits/{}",
+        GITHUB_REPO, GITHUB_BRANCH
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(UPDATE_CHECK_TIMEOUT)
         .user_agent("jcode-updater")
@@ -769,6 +775,41 @@ fn has_cargo() -> bool {
         .unwrap_or(false)
 }
 
+fn configure_source_remote(repo_dir: &Path) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "set-url", "origin", GITHUB_CLONE_URL])
+        .current_dir(repo_dir)
+        .output()
+        .context("Failed to configure source repository remote")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = std::process::Command::new("git")
+        .args([
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            GITHUB_FETCH_REFSPEC,
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .context("Failed to configure source repository branch")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git config remote.origin.fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
 /// Build jcode from source by cloning/pulling the repo and running cargo build
 fn build_from_source() -> Result<PathBuf> {
     let started = Instant::now();
@@ -778,20 +819,21 @@ fn build_from_source() -> Result<PathBuf> {
     let repo_dir = build_dir.join("jcode");
 
     if repo_dir.join(".git").exists() {
+        configure_source_remote(&repo_dir)?;
         // Pull latest
-        crate::logging::info("Main channel: pulling latest from main...");
+        crate::logging::info("Main channel: pulling latest from master...");
         let output = std::process::Command::new("git")
-            .args(["pull", "--ff-only", "origin", "main"])
+            .args(["pull", "--ff-only", "origin", GITHUB_BRANCH])
             .current_dir(&repo_dir)
             .output()
             .context("Failed to run git pull")?;
 
         if !output.status.success() {
-            // If pull fails (e.g. diverged), reset to origin/main
+            // If pull fails (e.g. diverged), reset to origin/master
             let summary = summarize_git_pull_failure(&output.stderr);
             crate::logging::warn(&format!("{}, trying reset", summary));
             let output = std::process::Command::new("git")
-                .args(["fetch", "origin", "main"])
+                .args(["fetch", "origin"])
                 .current_dir(&repo_dir)
                 .output()
                 .context("Failed to run git fetch")?;
@@ -802,7 +844,7 @@ fn build_from_source() -> Result<PathBuf> {
                 );
             }
             let output = std::process::Command::new("git")
-                .args(["reset", "--hard", "origin/main"])
+                .args(["reset", "--hard", &format!("origin/{GITHUB_BRANCH}")])
                 .current_dir(&repo_dir)
                 .output()
                 .context("Failed to run git reset")?;
@@ -816,10 +858,15 @@ fn build_from_source() -> Result<PathBuf> {
     } else {
         // Clone
         crate::logging::info("Main channel: cloning repository...");
-        let clone_url = format!("https://github.com/{}.git", GITHUB_REPO);
         let output = std::process::Command::new("git")
             .args([
-                "clone", "--depth", "1", "--branch", "main", &clone_url, "jcode",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                GITHUB_BRANCH,
+                GITHUB_CLONE_URL,
+                "jcode",
             ])
             .current_dir(&build_dir)
             .output()
@@ -1306,6 +1353,79 @@ mod tests {
     use super::*;
     use jcode_update_core::parse_sha256sums;
     use sha2::{Digest, Sha256};
+    use std::process::Command;
+
+    #[test]
+    fn test_update_source_is_user_owned() {
+        assert_eq!(GITHUB_REPO, "tickernelz/jcode");
+        assert_eq!(GITHUB_BRANCH, "master");
+        assert_eq!(
+            GITHUB_FETCH_REFSPEC,
+            "+refs/heads/master:refs/remotes/origin/master"
+        );
+        assert_eq!(
+            GITHUB_CLONE_URL,
+            format!("https://github.com/{GITHUB_REPO}.git")
+        );
+    }
+
+    #[test]
+    fn test_configure_source_remote_replaces_existing_origin() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["remote", "add", "origin", "https://example.invalid/old.git"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "config",
+                    "remote.origin.fetch",
+                    "+refs/heads/main:refs/remotes/origin/main",
+                ])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        configure_source_remote(repo.path()).unwrap();
+
+        let output = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            GITHUB_CLONE_URL
+        );
+
+        let output = Command::new("git")
+            .args(["config", "--get-all", "remote.origin.fetch"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            GITHUB_FETCH_REFSPEC
+        );
+    }
 
     #[test]
     fn test_version_is_newer() {

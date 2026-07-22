@@ -5,6 +5,14 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[test]
+fn selfdev_clone_uses_user_owned_fork() {
+    assert_eq!(
+        super::JCODE_REPO_URL,
+        "https://github.com/tickernelz/jcode.git"
+    );
+}
+
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     storage::lock_test_env()
 }
