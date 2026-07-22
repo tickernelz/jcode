@@ -451,6 +451,60 @@ fn test_model_picker_remote_comtegra_model_uses_comtegra_route_not_copilot() {
 }
 
 #[test]
+fn test_model_picker_remote_named_provider_keeps_known_openai_model_route() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var("JCODE_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"
+[providers.sub2api-codex]
+type = "openai-compatible"
+base_url = "http://localhost:62173/v1"
+auth = "none"
+
+[[providers.sub2api-codex.models]]
+id = "gpt-5.6-sol"
+context_window = 372000
+"#,
+    )
+    .expect("write config");
+    crate::env::set_var("JCODE_HOME", temp.path().display().to_string());
+    crate::config::invalidate_config_cache();
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_provider_name = Some("sub2api-codex".to_string());
+    app.remote_provider_model = Some("gpt-5.6-sol".to_string());
+    app.remote_available_entries = vec!["gpt-5.6-sol".to_string()];
+    app.open_model_picker();
+
+    match prev_home {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    crate::config::invalidate_config_cache();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("model picker should be open");
+    let entry = picker
+        .entries
+        .iter()
+        .find(|entry| entry.name == "gpt-5.6-sol")
+        .expect("custom GPT model should be listed");
+    assert!(entry.options.iter().any(|route| {
+        route.provider == "sub2api-codex"
+            && route.api_method == "openai-compatible:sub2api-codex"
+            && route.available
+    }));
+    assert!(!entry.options.iter().all(|route| {
+        route.provider == "OpenAI" && route.detail == "no credentials"
+    }));
+}
+
+#[test]
 fn test_model_picker_remote_bedrock_model_has_bedrock_route_when_configured() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var("JCODE_HOME").ok();
