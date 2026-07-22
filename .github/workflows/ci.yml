@@ -435,6 +435,9 @@ jobs:
       - name: User-owned update source tests
         run: bash scripts/test_user_owned_update_sources.sh
 
+      - name: Upstream-to-fork sync tests
+        run: python3 scripts/test_sync_upstream_to_fork.py
+
       - name: Setup friction scorecard
         run: bash scripts/setup_friction_eval.sh
 

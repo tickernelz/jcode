@@ -1,0 +1,121 @@
+name: Sync Upstream Into Fork
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-master
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Merge and validate without write credentials
+    if: github.repository == 'tickernelz/jcode'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      changed: ${{ steps.result.outputs.changed }}
+      base_sha: ${{ steps.result.outputs.base_sha }}
+      upstream_sha: ${{ steps.result.outputs.upstream_sha }}
+      tree_sha: ${{ steps.result.outputs.tree_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: master
+
+      - name: Configure read-only upstream
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/1jehuang/jcode.git
+          git remote set-url --push upstream DISABLED
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sync-upstream-validate
+          cache-all-crates: "true"
+
+      - name: Validate isolated upstream merge
+        id: result
+        shell: bash
+        env:
+          JCODE_SCRATCH_DIR: ${{ runner.temp }}
+          JCODE_SYNC_RESULT_FILE: ${{ runner.temp }}/jcode-sync-result
+        run: |
+          set -euo pipefail
+          scripts/sync_upstream_to_fork.sh --dry-run
+          test -s "$JCODE_SYNC_RESULT_FILE"
+
+          changed=
+          base_sha=
+          upstream_sha=
+          tree_sha=
+          while IFS='=' read -r key value; do
+            case "$key" in
+              changed) changed=$value ;;
+              base_sha) base_sha=$value ;;
+              upstream_sha) upstream_sha=$value ;;
+              tree_sha) tree_sha=$value ;;
+              *) exit 1 ;;
+            esac
+          done <"$JCODE_SYNC_RESULT_FILE"
+
+          [[ "$changed" =~ ^[01]$ ]]
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$tree_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'changed=%s\n' "$changed" >>"$GITHUB_OUTPUT"
+          printf 'base_sha=%s\n' "$base_sha" >>"$GITHUB_OUTPUT"
+          printf 'upstream_sha=%s\n' "$upstream_sha" >>"$GITHUB_OUTPUT"
+          printf 'tree_sha=%s\n' "$tree_sha" >>"$GITHUB_OUTPUT"
+
+  publish:
+    name: Recreate validated merge and push fork only
+    needs: validate
+    if: needs.validate.outputs.changed == '1'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EXPECTED_BASE_SHA: ${{ needs.validate.outputs.base_sha }}
+      EXPECTED_UPSTREAM_SHA: ${{ needs.validate.outputs.upstream_sha }}
+      EXPECTED_TREE_SHA: ${{ needs.validate.outputs.tree_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Recreate and publish the validated merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_TREE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_BASE_SHA" ]]
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/1jehuang/jcode.git
+          git remote set-url --push upstream DISABLED
+          git fetch --quiet upstream \
+            "refs/heads/master:refs/remotes/upstream/master"
+          [[ "$(git rev-parse upstream/master)" == "$EXPECTED_UPSTREAM_SHA" ]]
+
+          git merge --no-edit "$EXPECTED_UPSTREAM_SHA"
+          [[ "$(git rev-parse 'HEAD^{tree}')" == "$EXPECTED_TREE_SHA" ]]
+          git push --dry-run origin HEAD:refs/heads/master
+          git push origin HEAD:refs/heads/master
+          [[ "$(git ls-remote origin refs/heads/master | awk '{print $1}')" == "$(git rev-parse HEAD)" ]]
