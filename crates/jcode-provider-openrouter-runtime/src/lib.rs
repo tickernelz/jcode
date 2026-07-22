@@ -1072,17 +1072,28 @@ impl OpenRouterProvider {
     fn initial_reasoning_effort(
         reasoning_effort_support: Option<bool>,
         profile_id: Option<&str>,
+        model: &str,
+        unified_reasoning: bool,
     ) -> Option<String> {
-        let supported =
-            reasoning_effort_support.unwrap_or(Self::profile_supports_reasoning_effort(profile_id));
-        if !supported {
+        if reasoning_effort_support == Some(false) {
             return None;
         }
-        jcode_base::config::config()
+        let configured = jcode_base::config::config()
             .provider
             .openai_reasoning_effort
-            .as_deref()
-            .and_then(Self::normalize_reasoning_effort)
+            .as_deref()?;
+        if unified_reasoning {
+            Self::normalize_unified_reasoning_effort(configured)
+        } else if reasoning_effort_support == Some(true)
+            || Self::profile_supports_reasoning_effort(profile_id)
+            || Self::model_is_deepseek_family(model)
+        {
+            Self::normalize_reasoning_effort(configured)
+        } else if Self::model_is_openai_reasoning_family(model) {
+            Self::normalize_openai_reasoning_effort(configured)
+        } else {
+            None
+        }
     }
 
     fn profile_rejects_image_input(profile_id: Option<&str>) -> bool {
@@ -1412,13 +1423,16 @@ impl OpenRouterProvider {
                 Some((id.to_ascii_lowercase(), supports_images))
             })
             .collect::<HashMap<_, _>>();
+        let reasoning_effort = Self::initial_reasoning_effort(
+            profile.supports_reasoning_effort,
+            Some(profile_name),
+            &model,
+            false,
+        );
         Ok(Self {
             client: jcode_provider_core::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
-            reasoning_effort: Arc::new(RwLock::new(Self::initial_reasoning_effort(
-                profile.supports_reasoning_effort,
-                Some(profile_name),
-            ))),
+            reasoning_effort: Arc::new(RwLock::new(reasoning_effort)),
             api_base,
             auth,
             supports_provider_features: matches!(
@@ -1635,14 +1649,17 @@ impl OpenRouterProvider {
         };
         let max_tokens = Self::configured_max_tokens(profile_id.as_deref());
         let extra_body = Self::resolve_extra_body(None, &configured_env_file_name());
+        let reasoning_effort = Self::initial_reasoning_effort(
+            None,
+            profile_id.as_deref(),
+            &model,
+            send_openrouter_headers,
+        );
 
         Ok(Self {
             client: jcode_provider_core::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
-            reasoning_effort: Arc::new(RwLock::new(Self::initial_reasoning_effort(
-                None,
-                profile_id.as_deref(),
-            ))),
+            reasoning_effort: Arc::new(RwLock::new(reasoning_effort)),
             api_base,
             auth,
             supports_provider_features,
@@ -1749,14 +1766,13 @@ impl OpenRouterProvider {
             .default_model
             .clone()
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let reasoning_effort =
+            Self::initial_reasoning_effort(None, Some(&resolved.id), &model, false);
 
         Ok(Self {
             client: jcode_provider_core::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
-            reasoning_effort: Arc::new(RwLock::new(Self::initial_reasoning_effort(
-                None,
-                Some(&resolved.id),
-            ))),
+            reasoning_effort: Arc::new(RwLock::new(reasoning_effort)),
             api_base,
             auth,
             supports_provider_features: false,

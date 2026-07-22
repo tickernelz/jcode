@@ -2939,6 +2939,39 @@ fn named_profile_construction_reads_openai_reasoning_effort_config() {
         .expect("explicitly-enabled profile accepts effort");
 }
 
+#[test]
+fn named_gpt_profile_starts_with_configured_xhigh_effort() {
+    let _lock = ENV_LOCK.lock();
+    let temp = TempDir::new().expect("temp home");
+    let jcode_home = temp.path().join("jcode-home");
+    std::fs::create_dir_all(&jcode_home).expect("create config dir");
+    std::fs::write(
+        jcode_home.join("config.toml"),
+        "[provider]\nopenai_reasoning_effort = \"xhigh\"\n",
+    )
+    .expect("write config");
+    let home = EnvVarGuard::set("JCODE_HOME", &jcode_home);
+    let namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    jcode_base::config::invalidate_config_cache();
+
+    let config = jcode_base::config::NamedProviderConfig {
+        base_url: "http://localhost:62173/v1".to_string(),
+        auth: jcode_base::config::NamedProviderAuth::None,
+        default_model: Some("gpt-5.6-sol".to_string()),
+        ..Default::default()
+    };
+    let provider = OpenRouterProvider::new_named_openai_compatible("sub2api-codex", &config)
+        .expect("provider");
+
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
+    assert!(provider.available_efforts().contains(&"xhigh"));
+
+    drop(provider);
+    drop(namespace);
+    drop(home);
+    jcode_base::config::invalidate_config_cache();
+}
+
 /// Regression: when the shared interactive server boots an `OpenRouterProvider`
 /// without binding `profile_id` (the deferred-auth bootstrap path used by the
 /// TUI server), a session-routing `<name>:` prefix for a *user-defined* named
