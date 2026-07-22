@@ -303,6 +303,10 @@ fn test_parse_max_output_tokens_allows_disable_and_override() {
 
 #[test]
 fn test_build_response_request_for_gpt_5_4_1m_uses_base_model_without_extra_flags() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    jcode_base::config::invalidate_config_cache();
+
     let request = build_test_response_request(
         "gpt-5.4",
         true,
@@ -321,7 +325,7 @@ fn test_build_response_request_for_gpt_5_4_1m_uses_base_model_without_extra_flag
     assert!(request.get("prompt_cache_retention").is_none());
     assert_eq!(
         request["reasoning"],
-        serde_json::json!({ "effort": "xhigh" })
+        serde_json::json!({ "effort": "xhigh", "summary": "auto" })
     );
     assert_eq!(request["service_tier"], serde_json::json!("unused"));
     assert!(
@@ -330,6 +334,9 @@ fn test_build_response_request_for_gpt_5_4_1m_uses_base_model_without_extra_flag
             .expect("tools should be an array")
             .contains(&serde_json::json!({ "type": "image_generation" }))
     );
+
+    drop(display);
+    jcode_base::config::invalidate_config_cache();
 }
 
 #[test]

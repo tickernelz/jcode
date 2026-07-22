@@ -12,6 +12,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WEBSOCKET_FALLBACK_NOTICE: &str = "falling back from websockets to https transport";
+const STREAMED_SUMMARY_MARKER: &str = "\0jcode_streamed_summary";
 static FALLBACK_TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(1);
 static RECOVERED_TEXT_WRAPPED_TOOL_CALLS: AtomicU64 = AtomicU64::new(0);
 static NORMALIZED_NULL_TOOL_ARGUMENTS: AtomicU64 = AtomicU64::new(0);
@@ -230,11 +231,17 @@ struct ResponseSseEvent {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct StreamingToolCallState {
+pub struct StreamingResponseItemState {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    summary_streamed: bool,
+    summary_part_done: bool,
+    thinking_started: bool,
+    last_reasoning_item_id: Option<String>,
 }
+
+pub type StreamingToolCallState = StreamingResponseItemState;
 
 fn normalize_openai_tool_arguments(raw_arguments: String) -> String {
     let trimmed = raw_arguments.trim();
@@ -259,7 +266,7 @@ fn streaming_tool_item_id(item: &Value) -> Option<String> {
 
 fn stream_tool_call_from_state(
     item_id: Option<String>,
-    mut state: StreamingToolCallState,
+    mut state: StreamingResponseItemState,
     pending: &mut VecDeque<StreamEvent>,
 ) -> Option<StreamEvent> {
     let tool_name = state.name.take().filter(|name| !name.is_empty())?;
@@ -293,11 +300,13 @@ fn stream_tool_call_from_state(
 pub fn parse_openai_response_event(
     data: &str,
     saw_text_delta: &mut bool,
-    streaming_tool_calls: &mut HashMap<String, StreamingToolCallState>,
+    streaming_items: &mut HashMap<String, StreamingResponseItemState>,
     completed_tool_items: &mut HashSet<String>,
     pending: &mut VecDeque<StreamEvent>,
 ) -> Option<StreamEvent> {
     if data == "[DONE]" {
+        streaming_items.clear();
+        completed_tool_items.clear();
         return Some(StreamEvent::MessageEnd { stop_reason: None });
     }
 
@@ -337,13 +346,52 @@ pub fn parse_openai_response_event(
             }
         }
         "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
-            if let Some(delta) = event.delta {
+            if let Some(mut delta) = event.delta {
+                if let Some(item_id) = event.item_id
+                    && !delta.is_empty()
+                {
+                    let separate_items = streaming_items
+                        .get(STREAMED_SUMMARY_MARKER)
+                        .and_then(|state| state.last_reasoning_item_id.as_deref())
+                        .is_some_and(|last_item_id| last_item_id != item_id);
+                    let state = streaming_items.entry(item_id.clone()).or_default();
+                    if separate_items || (state.summary_streamed && state.summary_part_done) {
+                        delta.insert_str(0, "\n\n");
+                    }
+                    state.summary_streamed = true;
+                    state.summary_part_done = false;
+
+                    let stream_state = streaming_items
+                        .entry(STREAMED_SUMMARY_MARKER.to_string())
+                        .or_default();
+                    stream_state.last_reasoning_item_id = Some(item_id);
+                }
                 return Some(StreamEvent::ThinkingDelta(delta));
+            }
+        }
+        "response.reasoning_summary_part.done" => {
+            if let Some(item_id) = event.item_id
+                && let Some(state) = streaming_items.get_mut(&item_id)
+                && state.summary_streamed
+            {
+                state.summary_part_done = true;
             }
         }
         "response.reasoning.done" | "response.output_item.added" => {
             if let Some(item) = &event.item {
                 if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+                    if let Some(item_id) = streaming_tool_item_id(item) {
+                        let state = streaming_items.entry(item_id).or_default();
+                        state.thinking_started = true;
+                    }
+
+                    let stream_state = streaming_items
+                        .entry(STREAMED_SUMMARY_MARKER.to_string())
+                        .or_default();
+                    if stream_state.thinking_started {
+                        return None;
+                    }
+                    stream_state.thinking_started = true;
                     return Some(StreamEvent::ThinkingStart);
                 }
                 if matches!(
@@ -351,7 +399,7 @@ pub fn parse_openai_response_event(
                     Some("function_call") | Some("custom_tool_call")
                 ) && let Some(item_id) = streaming_tool_item_id(item)
                 {
-                    let state = streaming_tool_calls.entry(item_id).or_default();
+                    let state = streaming_items.entry(item_id).or_default();
                     state.call_id = item
                         .get("call_id")
                         .and_then(|v| v.as_str())
@@ -378,7 +426,7 @@ pub fn parse_openai_response_event(
         }
         "response.function_call_arguments.delta" => {
             if let Some(item_id) = event.item_id {
-                let state = streaming_tool_calls.entry(item_id).or_default();
+                let state = streaming_items.entry(item_id).or_default();
                 if let Some(call_id) = event.call_id {
                     state.call_id = Some(call_id);
                 }
@@ -392,7 +440,7 @@ pub fn parse_openai_response_event(
         }
         "response.function_call_arguments.done" => {
             if let Some(item_id) = event.item_id {
-                let mut state = streaming_tool_calls.remove(&item_id).unwrap_or_default();
+                let mut state = streaming_items.remove(&item_id).unwrap_or_default();
                 if let Some(call_id) = event.call_id {
                     state.call_id = Some(call_id);
                 }
@@ -408,27 +456,96 @@ pub fn parse_openai_response_event(
                     completed_tool_items.insert(item_id);
                     return Some(tool_event);
                 }
-                streaming_tool_calls.insert(item_id, state);
+                streaming_items.insert(item_id, state);
             }
         }
         "response.output_item.done" => {
             if let Some(item) = event.item {
-                if let Some(item_id) = streaming_tool_item_id(&item)
-                    && completed_tool_items.contains(&item_id)
+                let item_id = streaming_tool_item_id(&item);
+                if let Some(item_id) = item_id.as_ref()
+                    && completed_tool_items.contains(item_id)
                     && matches!(
                         item.get("type").and_then(|v| v.as_str()),
                         Some("function_call") | Some("custom_tool_call")
                     )
                 {
-                    completed_tool_items.remove(&item_id);
+                    completed_tool_items.remove(item_id);
                     return None;
                 }
-                if let Some(event) = handle_openai_output_item(item, saw_text_delta, pending) {
+                let state = item_id
+                    .as_ref()
+                    .and_then(|item_id| streaming_items.remove(item_id))
+                    .unwrap_or_default();
+                let is_reasoning_item =
+                    item.get("type").and_then(|value| value.as_str()) == Some("reasoning");
+                let has_final_summary = is_reasoning_item
+                    && item
+                        .get("summary")
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|summary| {
+                            summary.iter().any(|part| {
+                                part.get("type").and_then(|value| value.as_str())
+                                    == Some("summary_text")
+                                    && part
+                                        .get("text")
+                                        .and_then(|value| value.as_str())
+                                        .is_some_and(|text| !text.is_empty())
+                            })
+                        });
+                let stream_thinking_started = streaming_items
+                    .get(STREAMED_SUMMARY_MARKER)
+                    .is_some_and(|state| state.thinking_started);
+                let separate_summary = !state.summary_streamed
+                    && has_final_summary
+                    && streaming_items
+                        .get(STREAMED_SUMMARY_MARKER)
+                        .and_then(|state| state.last_reasoning_item_id.as_deref())
+                        .is_some_and(|last_item_id| item_id.as_deref() != Some(last_item_id));
+                let other_reasoning_item_active = is_reasoning_item
+                    && streaming_items.iter().any(|(item_id, state)| {
+                        item_id != STREAMED_SUMMARY_MARKER
+                            && (state.thinking_started || state.summary_streamed)
+                    });
+                let end_thinking = is_reasoning_item
+                    && (stream_thinking_started || (has_final_summary && !state.summary_streamed))
+                    && !other_reasoning_item_active;
+
+                if is_reasoning_item {
+                    let stream_state = streaming_items
+                        .entry(STREAMED_SUMMARY_MARKER.to_string())
+                        .or_default();
+                    if has_final_summary && !state.summary_streamed && item_id.is_some() {
+                        stream_state.last_reasoning_item_id = item_id.clone();
+                    }
+                    if end_thinking {
+                        stream_state.thinking_started = false;
+                    }
+                }
+                if streaming_items
+                    .get(STREAMED_SUMMARY_MARKER)
+                    .is_some_and(|state| {
+                        !state.thinking_started && state.last_reasoning_item_id.is_none()
+                    })
+                {
+                    streaming_items.remove(STREAMED_SUMMARY_MARKER);
+                }
+                let output_event = handle_openai_output_item_with_summary_state(
+                    item,
+                    saw_text_delta,
+                    pending,
+                    state.summary_streamed,
+                    stream_thinking_started,
+                    end_thinking,
+                    separate_summary,
+                );
+                if let Some(event) = output_event {
                     return Some(event);
                 }
             }
         }
         "response.incomplete" => {
+            streaming_items.clear();
+            completed_tool_items.clear();
             let stop_reason = event
                 .response
                 .as_ref()
@@ -443,6 +560,8 @@ pub fn parse_openai_response_event(
             return pending.pop_front();
         }
         "response.completed" => {
+            streaming_items.clear();
+            completed_tool_items.clear();
             let stop_reason = event
                 .response
                 .as_ref()
@@ -456,6 +575,8 @@ pub fn parse_openai_response_event(
             return pending.pop_front();
         }
         "response.failed" | "response.error" | "error" => {
+            streaming_items.clear();
+            completed_tool_items.clear();
             jcode_logging::warn(&format!(
                 "OpenAI stream error event (type={}): response={:?}, error={:?}",
                 event.kind, event.response, event.error
@@ -515,6 +636,26 @@ pub fn handle_openai_output_item(
     item: Value,
     saw_text_delta: &mut bool,
     pending: &mut VecDeque<StreamEvent>,
+) -> Option<StreamEvent> {
+    handle_openai_output_item_with_summary_state(
+        item,
+        saw_text_delta,
+        pending,
+        false,
+        false,
+        true,
+        false,
+    )
+}
+
+fn handle_openai_output_item_with_summary_state(
+    item: Value,
+    saw_text_delta: &mut bool,
+    pending: &mut VecDeque<StreamEvent>,
+    summary_streamed: bool,
+    thinking_started: bool,
+    end_thinking: bool,
+    separate_summary: bool,
 ) -> Option<StreamEvent> {
     let item_type = item.get("type")?.as_str()?;
     match item_type {
@@ -619,11 +760,29 @@ pub fn handle_openai_output_item(
                 });
             }
 
-            if !summary.is_empty() {
-                pending.push_back(StreamEvent::ThinkingStart);
-                pending.push_back(StreamEvent::ThinkingDelta(summary.join("\n")));
-                pending.push_back(StreamEvent::ThinkingEnd);
+            if summary_streamed {
+                if end_thinking {
+                    pending.push_back(StreamEvent::ThinkingEnd);
+                }
                 return pending.pop_front();
+            }
+
+            if !summary.is_empty() {
+                if !thinking_started {
+                    pending.push_back(StreamEvent::ThinkingStart);
+                }
+                let mut rendered_summary = summary.join("\n\n");
+                if separate_summary {
+                    rendered_summary.insert_str(0, "\n\n");
+                }
+                pending.push_back(StreamEvent::ThinkingDelta(rendered_summary));
+                if end_thinking {
+                    pending.push_back(StreamEvent::ThinkingEnd);
+                }
+                return pending.pop_front();
+            }
+            if thinking_started && end_thinking {
+                pending.push_back(StreamEvent::ThinkingEnd);
             }
             return pending.pop_front();
         }
@@ -763,7 +922,7 @@ pub struct OpenAIResponsesStream {
     buffer: String,
     pending: VecDeque<StreamEvent>,
     saw_text_delta: bool,
-    streaming_tool_calls: HashMap<String, StreamingToolCallState>,
+    streaming_items: HashMap<String, StreamingResponseItemState>,
     completed_tool_items: HashSet<String>,
 }
 
@@ -774,7 +933,7 @@ impl OpenAIResponsesStream {
             buffer: String::new(),
             pending: VecDeque::new(),
             saw_text_delta: false,
-            streaming_tool_calls: HashMap::new(),
+            streaming_items: HashMap::new(),
             completed_tool_items: HashSet::new(),
         }
     }
@@ -803,7 +962,7 @@ impl OpenAIResponsesStream {
             if let Some(event) = parse_openai_response_event(
                 &data,
                 &mut self.saw_text_delta,
-                &mut self.streaming_tool_calls,
+                &mut self.streaming_items,
                 &mut self.completed_tool_items,
                 &mut self.pending,
             ) {
@@ -872,6 +1031,277 @@ impl Stream for OpenAIResponsesStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_events(
+        data: &[&str],
+    ) -> (
+        Vec<StreamEvent>,
+        HashMap<String, StreamingResponseItemState>,
+    ) {
+        let mut saw_text_delta = false;
+        let mut streaming_items = HashMap::new();
+        let mut completed_tool_items = HashSet::new();
+        let mut pending = VecDeque::new();
+        let mut events = Vec::new();
+
+        for data in data {
+            if let Some(event) = parse_openai_response_event(
+                data,
+                &mut saw_text_delta,
+                &mut streaming_items,
+                &mut completed_tool_items,
+                &mut pending,
+            ) {
+                events.push(event);
+            }
+            events.extend(pending.drain(..));
+        }
+
+        (events, streaming_items)
+    }
+
+    #[test]
+    fn streamed_reasoning_summary_is_not_repeated_by_output_item_done() {
+        let (events, streaming_items) = parse_events(&[
+            r#"{"type":"response.output_item.added","item":{"id":"rs_test","type":"reasoning"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_test","delta":"Checked constraints."}"#,
+            r#"{"type":"response.reasoning_summary_part.done","item_id":"rs_test","part":{"type":"summary_text","text":"Checked constraints."}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_test","delta":"Selected fix."}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_test","type":"reasoning","status":"completed","encrypted_content":"enc_test","summary":[{"type":"summary_text","text":"Checked constraints."},{"type":"summary_text","text":"Selected fix."}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+
+        assert!(matches!(events.first(), Some(StreamEvent::ThinkingStart)));
+        let rendered: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "Checked constraints.\n\nSelected fix.");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingStart))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingEnd))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::OpenAIReasoning {
+                id,
+                summary,
+                encrypted_content: Some(encrypted_content),
+                status: Some(status),
+            } if id == "rs_test"
+                && summary == &["Checked constraints.".to_string(), "Selected fix.".to_string()]
+                && encrypted_content == "enc_test"
+                && status == "completed"
+        )));
+        assert!(streaming_items.is_empty());
+    }
+
+    #[test]
+    fn consecutive_reasoning_items_have_a_readable_separator() {
+        let (events, streaming_items) = parse_events(&[
+            r#"{"type":"response.output_item.added","item":{"id":"rs_one","type":"reasoning"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_one","delta":"First item."}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_one","type":"reasoning","encrypted_content":"enc_one","summary":[{"type":"summary_text","text":"First item."}]}}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"rs_two","type":"reasoning"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_two","delta":"Second item."}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_two","type":"reasoning","encrypted_content":"enc_two","summary":[{"type":"summary_text","text":"Second item."}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+
+        let rendered: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "First item.\n\nSecond item.");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::OpenAIReasoning { .. }))
+                .count(),
+            2
+        );
+        assert!(streaming_items.is_empty());
+    }
+
+    #[test]
+    fn interleaved_reasoning_items_share_one_lifecycle_and_keep_boundaries() {
+        let (events, streaming_items) = parse_events(&[
+            r#"{"type":"response.output_item.added","item":{"id":"rs_a","type":"reasoning"}}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"rs_b","type":"reasoning"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_a","delta":"A1"}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_b","delta":"B1"}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_a","delta":"A2"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_a","type":"reasoning","summary":[{"type":"summary_text","text":"A1A2"}]}}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_b","type":"reasoning","summary":[{"type":"summary_text","text":"B1"}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+
+        let rendered: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "A1\n\nB1\n\nA2");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingStart))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingEnd))
+                .count(),
+            1
+        );
+        assert!(streaming_items.is_empty());
+    }
+
+    #[test]
+    fn final_item_only_reasoning_renders_summary_fallback() {
+        let (events, streaming_items) = parse_events(&[
+            r#"{"type":"response.output_item.done","item":{"id":"rs_final","type":"reasoning","encrypted_content":"enc_final","summary":[{"type":"summary_text","text":"Final summary."}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+
+        assert!(events.iter().any(
+            |event| matches!(event, StreamEvent::ThinkingDelta(text) if text == "Final summary.")
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::OpenAIReasoning {
+                id,
+                summary,
+                encrypted_content: Some(encrypted_content),
+                ..
+            } if id == "rs_final"
+                && summary == &["Final summary.".to_string()]
+                && encrypted_content == "enc_final"
+        )));
+        assert!(streaming_items.is_empty());
+    }
+
+    #[test]
+    fn encrypted_only_reasoning_closes_and_cleans_up() {
+        let (events, streaming_items) = parse_events(&[
+            r#"{"type":"response.output_item.added","item":{"id":"rs_encrypted","type":"reasoning"}}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_encrypted","type":"reasoning","encrypted_content":"enc_only","summary":[]}}"#,
+        ]);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::OpenAIReasoning {
+                id,
+                summary,
+                encrypted_content: Some(encrypted_content),
+                ..
+            } if id == "rs_encrypted" && summary.is_empty() && encrypted_content == "enc_only"
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingEnd))
+                .count(),
+            1
+        );
+        assert!(streaming_items.is_empty());
+    }
+
+    #[test]
+    fn final_encrypted_only_reasoning_without_added_cleans_up() {
+        let (events, streaming_items) = parse_events(&[
+            r#"{"type":"response.output_item.done","item":{"id":"rs_final_encrypted","type":"reasoning","encrypted_content":"enc_only","summary":[]}}"#,
+        ]);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::OpenAIReasoning {
+                id,
+                summary,
+                encrypted_content: Some(encrypted_content),
+                ..
+            } if id == "rs_final_encrypted" && summary.is_empty() && encrypted_content == "enc_only"
+        )));
+        assert!(streaming_items.is_empty());
+    }
+
+    #[test]
+    fn response_reasoning_delta_behavior_is_unchanged() {
+        assert!(matches!(
+            parse_events(&[r#"{"type":"response.reasoning.delta","item_id":"rs_test","delta":"legacy reasoning"}"#]).0.as_slice(),
+            [StreamEvent::ThinkingDelta(text)] if text == "legacy reasoning"
+        ));
+    }
+
+    #[test]
+    fn streamed_reasoning_delta_is_not_repeated_by_final_summary() {
+        let (events, streaming_items) = parse_events(&[
+            r#"{"type":"response.output_item.added","item":{"id":"rs_legacy","type":"reasoning"}}"#,
+            r#"{"type":"response.reasoning.delta","item_id":"rs_legacy","delta":"Same summary"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"rs_legacy","type":"reasoning","summary":[{"type":"summary_text","text":"Same summary"}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+
+        let rendered: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "Same summary");
+        assert!(streaming_items.is_empty());
+    }
+
+    #[test]
+    fn every_terminal_event_clears_all_streaming_state() {
+        for terminal in [
+            "[DONE]",
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+            r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#,
+            r#"{"type":"response.failed","error":{"message":"failed"}}"#,
+        ] {
+            let mut saw_text_delta = false;
+            let mut streaming_items =
+                HashMap::from([("item".to_string(), StreamingResponseItemState::default())]);
+            let mut completed_tool_items = HashSet::from(["tool".to_string()]);
+            let mut pending = VecDeque::new();
+
+            let _ = parse_openai_response_event(
+                terminal,
+                &mut saw_text_delta,
+                &mut streaming_items,
+                &mut completed_tool_items,
+                &mut pending,
+            );
+
+            assert!(streaming_items.is_empty(), "terminal event: {terminal}");
+            assert!(
+                completed_tool_items.is_empty(),
+                "terminal event: {terminal}"
+            );
+        }
+    }
 
     #[test]
     fn parse_text_wrapped_tool_call_rejects_non_object_json() {

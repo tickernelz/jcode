@@ -1217,6 +1217,11 @@ impl OpenAIProvider {
 
         if let Some(effort) = reasoning_effort {
             request["reasoning"] = serde_json::json!({ "effort": effort });
+            if !effort.eq_ignore_ascii_case("none")
+                && jcode_base::config::config().display.reasoning_enabled()
+            {
+                request["reasoning"]["summary"] = serde_json::json!("auto");
+            }
         }
 
         if let Some(service_tier) = service_tier {

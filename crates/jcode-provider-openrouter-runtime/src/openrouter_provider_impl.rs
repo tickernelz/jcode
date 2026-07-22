@@ -76,6 +76,9 @@ impl Provider for OpenRouterProvider {
                     effort.as_str()
                 };
                 request["reasoning"] = serde_json::json!({ "effort": effort });
+                if jcode_base::config::config().display.reasoning_enabled() {
+                    request["reasoning"]["summary"] = serde_json::json!("auto");
+                }
             }
             if let Some(extra) = self.extra_body.as_ref()
                 && let Some(request_obj) = request.as_object_mut()

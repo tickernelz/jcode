@@ -1570,6 +1570,10 @@ fn direct_openai_compatible_chat_request_preserves_max_reasoning_effort() {
 
 #[test]
 fn named_provider_responses_api_sends_priority_tier_and_maps_swarm_effort() {
+    let _lock = ENV_LOCK.lock();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    jcode_base::config::invalidate_config_cache();
+
     let (api_base, request_rx) = spawn_single_response_chat_server();
     let provider = OpenRouterProvider {
         api_base,
@@ -1619,11 +1623,125 @@ fn named_provider_responses_api_sends_priority_tier_and_maps_swarm_effort() {
         "{request}"
     );
     assert!(
-        request.contains(r#""reasoning":{"effort":"xhigh"}"#),
+        request.contains(r#""reasoning":{"effort":"xhigh","summary":"auto"}"#),
         "swarm sentinels must map to a valid maximum wire effort: {request}"
+    );
+    assert!(
+        request.contains(r#""include":["reasoning.encrypted_content"]"#),
+        "encrypted reasoning content must remain requested: {request}"
     );
     assert!(!request.contains("swarm-deep"), "{request}");
     assert!(!request.contains(r#""messages":"#), "{request}");
+
+    drop(display);
+    jcode_base::config::invalidate_config_cache();
+}
+
+#[test]
+fn named_provider_responses_extra_body_overrides_generated_reasoning() {
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("gpt-5.6-sol".to_string())),
+        wire_api: Some("responses".to_string()),
+        extra_body: Some(
+            serde_json::json!({"reasoning": {"summary": "detailed"}})
+                .as_object()
+                .expect("extra body object")
+                .clone(),
+        ),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+    provider
+        .set_reasoning_effort("high")
+        .expect("enable reasoning");
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &[], "", None)
+            .await
+            .expect("responses request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture Responses API request");
+    assert!(
+        request.contains(r#""reasoning":{"summary":"detailed"}"#),
+        "extra_body must override the generated reasoning object: {request}"
+    );
+    assert!(!request.contains(r#""effort":"high""#), "{request}");
+}
+
+#[test]
+fn named_provider_responses_display_off_preserves_effort_without_summary() {
+    let _lock = ENV_LOCK.lock();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "off");
+    jcode_base::config::invalidate_config_cache();
+
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("gpt-5.6-sol".to_string())),
+        wire_api: Some("responses".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+    provider
+        .set_reasoning_effort("high")
+        .expect("enable reasoning");
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &[], "", None)
+            .await
+            .expect("responses request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture Responses API request");
+    assert!(
+        request.contains(r#""reasoning":{"effort":"high"}"#),
+        "display off must preserve effort without requesting summary: {request}"
+    );
+    assert!(!request.contains(r#""summary":"#), "{request}");
+
+    drop(display);
+    jcode_base::config::invalidate_config_cache();
 }
 
 #[test]
@@ -2953,6 +3071,7 @@ fn named_profile_construction_reads_openai_reasoning_effort_config() {
 #[test]
 fn named_gpt_profile_uses_configured_default_and_swarm_wire_efforts() {
     let _lock = ENV_LOCK.lock();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
     let temp = TempDir::new().expect("temp home");
     let (api_base, request_rx) = spawn_single_response_chat_server();
     let jcode_home = temp.path().join("jcode-home");
@@ -3019,7 +3138,7 @@ swarm_reasoning_effort = "medium"
         .recv_timeout(Duration::from_secs(2))
         .expect("capture Responses API request");
     assert!(
-        request.contains(r#""reasoning":{"effort":"medium"}"#),
+        request.contains(r#""reasoning":{"effort":"medium","summary":"auto"}"#),
         "configured swarm wire effort must reach the wire: {request}"
     );
     assert!(
@@ -3030,6 +3149,7 @@ swarm_reasoning_effort = "medium"
     drop(provider);
     drop(namespace);
     drop(home);
+    drop(display);
     jcode_base::config::invalidate_config_cache();
 }
 

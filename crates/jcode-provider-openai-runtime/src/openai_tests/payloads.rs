@@ -15,6 +15,65 @@ fn test_build_response_request_includes_stream_for_http() {
     );
     assert_eq!(request["stream"], serde_json::json!(true));
     assert_eq!(request["store"], serde_json::json!(false));
+    assert!(request.get("reasoning").is_none());
+    assert_eq!(
+        request["include"],
+        serde_json::json!(["reasoning.encrypted_content"])
+    );
+}
+
+#[test]
+fn test_build_response_request_preserves_effort_without_summary_when_display_is_off() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "off");
+    jcode_base::config::invalidate_config_cache();
+
+    let request = OpenAIProvider::build_response_request(
+        "gpt-5.4",
+        "system".to_string(),
+        &[],
+        &[],
+        false,
+        Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        Some("high"),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(request["reasoning"]["effort"], "high");
+    assert!(request["reasoning"].get("summary").is_none());
+
+    drop(display);
+    jcode_base::config::invalidate_config_cache();
+}
+
+#[test]
+fn test_build_response_request_effort_none_never_requests_summary() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    jcode_base::config::invalidate_config_cache();
+
+    let request = OpenAIProvider::build_response_request(
+        "gpt-5.4",
+        "system".to_string(),
+        &[],
+        &[],
+        false,
+        Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        Some("none"),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(request["reasoning"]["effort"], "none");
+    assert!(request["reasoning"].get("summary").is_none());
+
+    drop(display);
+    jcode_base::config::invalidate_config_cache();
 }
 
 #[test]
@@ -58,6 +117,10 @@ fn test_websocket_payload_strips_stream_and_background() {
 
 #[test]
 fn test_websocket_payload_preserves_required_fields() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    jcode_base::config::invalidate_config_cache();
+
     let mut request = OpenAIProvider::build_response_request(
         "gpt-5.4",
         "system prompt".to_string(),
@@ -86,8 +149,14 @@ fn test_websocket_payload_preserves_required_fields() {
     assert!(request["input"].is_array());
     assert!(request["tools"].is_array());
     assert_eq!(request["max_output_tokens"], serde_json::json!(16384));
-    assert_eq!(request["reasoning"], serde_json::json!({"effort": "high"}));
+    assert_eq!(
+        request["reasoning"],
+        serde_json::json!({"effort": "high", "summary": "auto"})
+    );
     assert_eq!(request["tool_choice"], "auto");
+
+    drop(display);
+    jcode_base::config::invalidate_config_cache();
 }
 
 #[test]
@@ -207,6 +276,10 @@ fn test_websocket_continuation_delta_skips_reasoning_items() {
 
 #[test]
 fn max_and_swarm_efforts_are_preserved_at_the_strongest_api_level() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let display = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    jcode_base::config::invalidate_config_cache();
+
     let provider = OpenAIProvider::new_browser_only();
     // The swarm sentinel is a valid stored effort...
     assert_eq!(
@@ -250,4 +323,8 @@ fn max_and_swarm_efforts_are_preserved_at_the_strongest_api_level() {
         None,
     );
     assert_eq!(request["reasoning"]["effort"], serde_json::json!("max"));
+    assert_eq!(request["reasoning"]["summary"], serde_json::json!("auto"));
+
+    drop(display);
+    jcode_base::config::invalidate_config_cache();
 }
