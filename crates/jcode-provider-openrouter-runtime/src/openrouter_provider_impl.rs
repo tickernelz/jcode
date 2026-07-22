@@ -60,6 +60,11 @@ impl Provider for OpenRouterProvider {
                 request["service_tier"] = serde_json::json!(tier);
             }
             if let Some(effort) = self.reasoning_effort().filter(|effort| effort != "none") {
+                let effort = if jcode_base::prompt::is_swarm_effort(&effort) {
+                    "xhigh"
+                } else {
+                    effort.as_str()
+                };
                 request["reasoning"] = serde_json::json!({ "effort": effort });
             }
             if let Some(extra) = self.extra_body.as_ref()

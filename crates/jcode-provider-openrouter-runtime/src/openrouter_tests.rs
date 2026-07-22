@@ -1567,7 +1567,7 @@ fn direct_openai_compatible_chat_request_preserves_max_reasoning_effort() {
 }
 
 #[test]
-fn named_provider_responses_api_sends_priority_service_tier() {
+fn named_provider_responses_api_sends_priority_tier_and_maps_swarm_effort() {
     let (api_base, request_rx) = spawn_single_response_chat_server();
     let provider = OpenRouterProvider {
         api_base,
@@ -1579,6 +1579,9 @@ fn named_provider_responses_api_sends_priority_service_tier() {
     provider
         .set_service_tier("priority")
         .expect("enable fast mode");
+    provider
+        .set_reasoning_effort("swarm-deep")
+        .expect("enable deep swarm mode");
 
     let messages = vec![Message {
         role: Role::User,
@@ -1612,6 +1615,11 @@ fn named_provider_responses_api_sends_priority_service_tier() {
         request.contains(r#""service_tier":"priority""#),
         "{request}"
     );
+    assert!(
+        request.contains(r#""reasoning":{"effort":"xhigh"}"#),
+        "swarm sentinels must map to a valid maximum wire effort: {request}"
+    );
+    assert!(!request.contains("swarm-deep"), "{request}");
     assert!(!request.contains(r#""messages":"#), "{request}");
 }
 
