@@ -1104,6 +1104,8 @@ fn make_provider() -> OpenRouterProvider {
         reasoning_effort_support: None,
         max_tokens: None,
         extra_body: None,
+        wire_api: None,
+        service_tier: Arc::new(std::sync::RwLock::new(None)),
         static_models: Vec::new(),
         static_context_limits: HashMap::new(),
         static_image_input_support: HashMap::new(),
@@ -1133,6 +1135,8 @@ fn make_custom_compatible_provider() -> OpenRouterProvider {
         reasoning_effort_support: None,
         max_tokens: None,
         extra_body: None,
+        wire_api: None,
+        service_tier: Arc::new(std::sync::RwLock::new(None)),
         static_models: Vec::new(),
         static_context_limits: HashMap::new(),
         static_image_input_support: HashMap::new(),
@@ -1560,6 +1564,55 @@ fn direct_openai_compatible_chat_request_preserves_max_reasoning_effort() {
         request.contains(r#""reasoning_effort":"max""#),
         "direct compatible request must preserve OpenAI max: {request}"
     );
+}
+
+#[test]
+fn named_provider_responses_api_sends_priority_service_tier() {
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("gpt-5.6-sol".to_string())),
+        wire_api: Some("responses".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+    provider
+        .set_service_tier("priority")
+        .expect("enable fast mode");
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &[], "system", None)
+            .await
+            .expect("responses request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture Responses API request");
+    assert!(request.starts_with("POST /v1/responses "), "{request}");
+    assert!(request.contains(r#""input":"#), "{request}");
+    assert!(
+        request.contains(r#""service_tier":"priority""#),
+        "{request}"
+    );
+    assert!(!request.contains(r#""messages":"#), "{request}");
 }
 
 #[test]

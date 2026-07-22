@@ -225,6 +225,15 @@ pub fn context_limit_for_model_with_provider_and_cache(
         return Some(copilot_context_limit_for_model(model));
     }
 
+    // Explicit user config and live provider catalogs are more authoritative
+    // than the generic GPT-family defaults below. Claude remains classified by
+    // its verified mode because its catalog can over-advertise a 1M window.
+    if !matches!(provider, Some("claude"))
+        && let Some(limit) = cached_context_limit(model)
+    {
+        return Some(limit);
+    }
+
     // Spark variant has a smaller context window than the full codex model.
     if model.starts_with("gpt-5.3-codex-spark") {
         return Some(128_000);
@@ -567,6 +576,18 @@ mod tests {
                 (model == "custom-model").then_some(42_000)
             }),
             Some(42_000)
+        );
+    }
+
+    #[test]
+    fn explicit_cache_overrides_generic_gpt_context_limit() {
+        assert_eq!(
+            context_limit_for_model_with_provider_and_cache(
+                "gpt-5.6-sol",
+                Some("sub2api-codex"),
+                |model| (model == "gpt-5.6-sol").then_some(372_000),
+            ),
+            Some(372_000)
         );
     }
 

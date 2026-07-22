@@ -42,6 +42,61 @@ impl Provider for OpenRouterProvider {
         _resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
         let model = self.model.read().await.clone();
+        if self.wire_api.as_deref() == Some("responses") {
+            let input = jcode_provider_openai::build_responses_input(messages);
+            let api_tools = jcode_provider_openai::build_tools(tools);
+            let mut request = serde_json::json!({
+                "model": model,
+                "instructions": system,
+                "input": input,
+                "tools": api_tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": false,
+                "stream": true,
+                "store": false,
+                "include": ["reasoning.encrypted_content"],
+            });
+            if let Some(tier) = self.service_tier() {
+                request["service_tier"] = serde_json::json!(tier);
+            }
+            if let Some(effort) = self.reasoning_effort().filter(|effort| effort != "none") {
+                request["reasoning"] = serde_json::json!({ "effort": effort });
+            }
+            if let Some(extra) = self.extra_body.as_ref()
+                && let Some(request_obj) = request.as_object_mut()
+            {
+                request_obj.extend(extra.clone());
+            }
+
+            let response = self
+                .auth
+                .apply(
+                    self.client
+                        .post(format!("{}/responses", self.api_base.trim_end_matches('/')))
+                        .header("Content-Type", "application/json"),
+                )
+                .await?
+                .json(&request)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = jcode_base::util::http_error_body(response, "Responses API error").await;
+                anyhow::bail!("Responses API error {status}: {body}");
+            }
+            let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
+            tokio::spawn(async move {
+                let mut stream = jcode_provider_openai::stream::OpenAIResponsesStream::new(
+                    response.bytes_stream(),
+                );
+                while let Some(event) = stream.next().await {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            return Ok(Box::pin(ReceiverStream::new(rx)));
+        }
         let reasoning_effort = self.reasoning_effort();
         let thinking_override = Self::thinking_override();
         // Moonshot's dedicated Kimi coding endpoint enables thinking server-side
@@ -317,6 +372,34 @@ impl Provider for OpenRouterProvider {
 
     fn name(&self) -> &str {
         "openrouter"
+    }
+
+    fn service_tier(&self) -> Option<String> {
+        self.service_tier
+            .read()
+            .map(|tier| tier.clone())
+            .unwrap_or_default()
+    }
+
+    fn set_service_tier(&self, service_tier: &str) -> Result<()> {
+        let tier = match service_tier.trim().to_ascii_lowercase().as_str() {
+            "priority" | "fast" => Some("priority".to_string()),
+            "off" | "default" | "standard" | "none" => None,
+            other => anyhow::bail!("Unsupported service tier '{other}'; expected priority|off"),
+        };
+        *self
+            .service_tier
+            .write()
+            .map_err(|_| anyhow::anyhow!("service tier lock poisoned"))? = tier;
+        Ok(())
+    }
+
+    fn available_service_tiers(&self) -> Vec<&'static str> {
+        if self.wire_api.as_deref() == Some("responses") {
+            vec!["off", "priority"]
+        } else {
+            Vec::new()
+        }
     }
 
     fn display_name(&self) -> String {
@@ -752,6 +835,8 @@ impl Provider for OpenRouterProvider {
             reasoning_effort_support: self.reasoning_effort_support,
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
+            wire_api: self.wire_api.clone(),
+            service_tier: Arc::clone(&self.service_tier),
             static_models: self.static_models.clone(),
             static_context_limits: self.static_context_limits.clone(),
             static_image_input_support: self.static_image_input_support.clone(),

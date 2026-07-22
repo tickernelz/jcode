@@ -146,6 +146,76 @@ fn source_build_repo_dir() -> Result<PathBuf> {
     Ok(source_build_root()?.join("jcode"))
 }
 
+fn apply_local_update_patches(repo_dir: &Path) -> Result<()> {
+    let patch_dir = storage::jcode_dir()?.join("update-patches");
+    if !patch_dir.is_dir() {
+        return Ok(());
+    }
+    let mut patches = fs::read_dir(&patch_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+        .collect::<Vec<_>>();
+    patches.sort();
+
+    for patch in patches {
+        let check = std::process::Command::new("git")
+            .args(["apply", "--check"])
+            .arg(&patch)
+            .current_dir(repo_dir)
+            .output()
+            .with_context(|| format!("Failed to check local update patch {}", patch.display()))?;
+        if check.status.success() {
+            let apply = std::process::Command::new("git")
+                .arg("apply")
+                .arg(&patch)
+                .current_dir(repo_dir)
+                .output()
+                .with_context(|| {
+                    format!("Failed to apply local update patch {}", patch.display())
+                })?;
+            if !apply.status.success() {
+                anyhow::bail!(
+                    "Local update patch {} failed to apply:\n{}",
+                    patch.display(),
+                    String::from_utf8_lossy(&apply.stderr)
+                );
+            }
+            crate::logging::info(&format!("Applied local update patch {}", patch.display()));
+            continue;
+        }
+
+        let already_applied = std::process::Command::new("git")
+            .args(["apply", "--reverse", "--check"])
+            .arg(&patch)
+            .current_dir(repo_dir)
+            .output()
+            .with_context(|| format!("Failed to verify local update patch {}", patch.display()))?;
+        if !already_applied.status.success() {
+            anyhow::bail!(
+                "Local update patch {} no longer applies. Rebase or replace it before updating.\n{}",
+                patch.display(),
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn has_local_update_patches() -> bool {
+    storage::jcode_dir()
+        .ok()
+        .map(|dir| dir.join("update-patches"))
+        .and_then(|dir| fs::read_dir(dir).ok())
+        .is_some_and(|entries| {
+            entries.filter_map(|entry| entry.ok()).any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "patch")
+            })
+        })
+}
+
 fn record_release_update_duration(duration: Duration) {
     if let Ok(mut metadata) = UpdateMetadata::load() {
         metadata.last_release_update_secs = Some(duration.as_secs_f64());
@@ -367,6 +437,11 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
 }
 
 fn prepare_stable_update_blocking() -> Result<PreparedUpdate> {
+    if has_local_update_patches() {
+        anyhow::bail!(
+            "Stable prebuilt updates cannot reapply ~/.jcode/update-patches. Set [features] update_channel = \"main\" or remove the patches. No update was installed."
+        );
+    }
     let current_version = jcode_build_meta::version();
     let current_update_version = current_update_semver();
     let release = fetch_latest_release_blocking()?;
@@ -757,6 +832,9 @@ fn build_from_source() -> Result<PathBuf> {
             );
         }
     }
+
+    apply_local_update_patches(&repo_dir)
+        .context("Automatic local patch reapply failed; the update was not installed")?;
 
     // Build
     crate::logging::info("Main channel: building with cargo...");

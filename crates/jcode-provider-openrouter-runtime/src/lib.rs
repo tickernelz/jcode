@@ -962,6 +962,8 @@ pub struct OpenRouterProvider {
     /// Resolved once at construction from named-profile config or the
     /// `JCODE_OPENAI_EXTRA_BODY` env/env-file value.
     extra_body: Option<serde_json::Map<String, Value>>,
+    wire_api: Option<String>,
+    service_tier: Arc<std::sync::RwLock<Option<String>>>,
     static_models: Vec<String>,
     static_context_limits: HashMap<String, usize>,
     /// Explicit per-model image-input capability from named-provider `models[].input`.
@@ -1440,6 +1442,21 @@ impl OpenRouterProvider {
                     .filter(|name| is_safe_env_file_name(name))
                     .unwrap_or(DEFAULT_ENV_FILE),
             ),
+            wire_api: profile
+                .wire_api
+                .as_deref()
+                .or(profile.api.as_deref())
+                .map(str::trim)
+                .filter(|api| api.eq_ignore_ascii_case("responses"))
+                .map(|_| "responses".to_string()),
+            service_tier: Arc::new(std::sync::RwLock::new(
+                jcode_base::config::config()
+                    .provider
+                    .openai_service_tier
+                    .as_deref()
+                    .filter(|tier| tier.eq_ignore_ascii_case("priority"))
+                    .map(|_| "priority".to_string()),
+            )),
             static_models,
             static_context_limits,
             static_image_input_support,
@@ -1634,6 +1651,8 @@ impl OpenRouterProvider {
             reasoning_effort_support: None,
             max_tokens,
             extra_body,
+            wire_api: None,
+            service_tier: Arc::new(std::sync::RwLock::new(None)),
             static_models,
             static_context_limits,
             static_image_input_support: HashMap::new(),
@@ -1675,6 +1694,8 @@ impl OpenRouterProvider {
             reasoning_effort_support: None,
             max_tokens: Self::configured_max_tokens(None),
             extra_body: Self::resolve_extra_body(None, DEFAULT_ENV_FILE),
+            wire_api: None,
+            service_tier: Arc::new(std::sync::RwLock::new(None)),
             static_models: Vec::new(),
             static_context_limits: HashMap::new(),
             static_image_input_support: HashMap::new(),
@@ -1744,6 +1765,8 @@ impl OpenRouterProvider {
             reasoning_effort_support: None,
             max_tokens: Self::configured_max_tokens(Some(&resolved.id)),
             extra_body: Self::resolve_extra_body(None, &resolved.env_file),
+            wire_api: None,
+            service_tier: Arc::new(std::sync::RwLock::new(None)),
             static_models,
             static_context_limits,
             static_image_input_support: HashMap::new(),
@@ -1968,6 +1991,8 @@ impl OpenRouterProvider {
                 reasoning_effort_support: None,
                 max_tokens: None,
                 extra_body: None,
+                wire_api: None,
+                service_tier: Arc::new(std::sync::RwLock::new(None)),
                 static_models: Vec::new(),
                 static_context_limits: HashMap::new(),
                 static_image_input_support: HashMap::new(),

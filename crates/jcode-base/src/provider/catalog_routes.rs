@@ -929,6 +929,16 @@ pub fn remote_model_routes_fallback(
 
         let mut added_any = false;
 
+        // A names-only remote catalog belongs to the active server provider.
+        // Preserve that route even when the model id also looks like a known
+        // upstream model (for example a custom gateway serving `gpt-*`).
+        if let Some(route) =
+            remote_current_openai_compatible_route_for_model(remote_provider_name, model)
+        {
+            routes.push(route);
+            added_any = true;
+        }
+
         if provider_for_model(model) == Some("claude") {
             if auth.anthropic.has_oauth {
                 let (available, detail) = anthropic_oauth_route_availability(model);
@@ -1110,11 +1120,24 @@ pub fn remote_current_openai_compatible_route_for_model(
     remote_provider_name: Option<&str>,
     model: &str,
 ) -> Option<ModelRoute> {
-    if model.trim().is_empty() || model.contains('/') || provider_for_model(model).is_some() {
+    if model.trim().is_empty() || model.contains('/') {
         return None;
     }
 
     let provider_name = remote_provider_name?.trim();
+    if let Some(profile) = crate::config::config().providers.get(provider_name) {
+        return Some(ModelRoute {
+            model: model.to_string(),
+            provider: provider_name.to_string(),
+            api_method: format!("openai-compatible:{provider_name}"),
+            available: true,
+            detail: profile.base_url.trim().to_string(),
+            cheapness: None,
+        });
+    }
+    if provider_for_model(model).is_some() {
+        return None;
+    }
     let profile_id =
         crate::provider_catalog::openai_compatible_profile_id_for_display_name(provider_name)?;
     let profile = crate::provider_catalog::openai_compatible_profile_by_id(profile_id)?;

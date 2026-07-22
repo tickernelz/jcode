@@ -433,6 +433,10 @@ pub struct NamedProviderConfig {
     pub provider_type: NamedProviderType,
     pub base_url: String,
     pub api: Option<String>,
+    /// Optional OpenAI wire protocol. `responses` uses `/v1/responses`;
+    /// omitted or `chat-completions` uses `/v1/chat/completions`.
+    #[serde(default, alias = "wire_api", alias = "wire-api")]
+    pub wire_api: Option<String>,
     pub auth: NamedProviderAuth,
     pub auth_header: Option<String>,
     pub api_key_env: Option<String>,
@@ -475,6 +479,7 @@ impl Default for NamedProviderConfig {
             provider_type: NamedProviderType::OpenAiCompatible,
             base_url: String::new(),
             api: None,
+            wire_api: None,
             auth: NamedProviderAuth::Bearer,
             auth_header: None,
             api_key_env: None,

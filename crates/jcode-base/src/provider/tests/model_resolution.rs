@@ -1061,6 +1061,36 @@ input = ["image"]
 }
 
 #[test]
+fn remote_named_provider_keeps_its_route_for_known_openai_model_ids() {
+    with_clean_provider_test_env(|| {
+        let jcode_home = std::env::var_os("JCODE_HOME").expect("test JCODE_HOME should be set");
+        std::fs::write(
+            std::path::PathBuf::from(jcode_home).join("config.toml"),
+            r#"
+[providers.my-gateway]
+type = "openai-compatible"
+base_url = "http://localhost:1234/v1"
+auth = "none"
+"#,
+        )
+        .expect("write test config.toml");
+        crate::config::invalidate_config_cache();
+
+        let routes = remote_model_routes_fallback(
+            Some("my-gateway"),
+            &["gpt-5.6-sol".to_string()],
+        );
+
+        assert!(routes.iter().any(|route| {
+            route.model == "gpt-5.6-sol"
+                && route.provider == "my-gateway"
+                && route.api_method == "openai-compatible:my-gateway"
+                && route.available
+        }));
+    });
+}
+
+#[test]
 fn test_config_default_provider_deepseek_applies_without_openrouter_key() {
     // Issue #448: `default_provider = "deepseek"` + `default_model =
     // "deepseek-v4-pro"` with only DEEPSEEK_API_KEY set must bind the DeepSeek
