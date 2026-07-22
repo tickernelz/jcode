@@ -157,6 +157,7 @@ pub(crate) fn configure_provider_profile(
         provider_type: NamedProviderType::OpenAiCompatible,
         base_url: api_base.clone(),
         api: None,
+        wire_api: None,
         auth: auth.clone(),
         auth_header: match auth {
             NamedProviderAuth::Header => options
