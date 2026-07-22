@@ -2943,6 +2943,7 @@ fn named_profile_construction_reads_openai_reasoning_effort_config() {
 fn named_gpt_profile_starts_with_configured_xhigh_effort() {
     let _lock = ENV_LOCK.lock();
     let temp = TempDir::new().expect("temp home");
+    let (api_base, request_rx) = spawn_single_response_chat_server();
     let jcode_home = temp.path().join("jcode-home");
     std::fs::create_dir_all(&jcode_home).expect("create config dir");
     std::fs::write(
@@ -2955,9 +2956,10 @@ fn named_gpt_profile_starts_with_configured_xhigh_effort() {
     jcode_base::config::invalidate_config_cache();
 
     let config = jcode_base::config::NamedProviderConfig {
-        base_url: "http://localhost:62173/v1".to_string(),
+        base_url: api_base,
         auth: jcode_base::config::NamedProviderAuth::None,
         default_model: Some("gpt-5.6-sol".to_string()),
+        wire_api: Some("responses".to_string()),
         ..Default::default()
     };
     let provider = OpenRouterProvider::new_named_openai_compatible("sub2api-codex", &config)
@@ -2965,6 +2967,36 @@ fn named_gpt_profile_starts_with_configured_xhigh_effort() {
 
     assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
     assert!(provider.available_efforts().contains(&"xhigh"));
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &[], "system", None)
+            .await
+            .expect("responses request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("stream event should parse");
+        }
+    });
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture Responses API request");
+    assert!(
+        request.contains(r#""reasoning":{"effort":"xhigh"}"#),
+        "configured xhigh effort must reach the wire: {request}"
+    );
 
     drop(provider);
     drop(namespace);
