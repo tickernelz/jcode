@@ -1,9 +1,9 @@
 {
-  "total": 3137,
+  "total": 3144,
   "totals_by_pattern": {
-    "dot_ok": 1146,
+    "dot_ok": 1150,
     "let_underscore": 1172,
-    "unwrap_or_default": 819
+    "unwrap_or_default": 822
   },
   "tracked_files": {
     "crates/jcode-app-core/src/agent.rs": {
@@ -547,7 +547,7 @@
       "unwrap_or_default": 1
     },
     "crates/jcode-app-core/src/update.rs": {
-      "dot_ok": 2,
+      "dot_ok": 6,
       "let_underscore": 8,
       "unwrap_or_default": 9
     },
@@ -854,7 +854,7 @@
     "crates/jcode-base/src/provider/mod.rs": {
       "dot_ok": 3,
       "let_underscore": 1,
-      "unwrap_or_default": 15
+      "unwrap_or_default": 16
     },
     "crates/jcode-base/src/provider/model_catalog_service.rs": {
       "dot_ok": 6,
@@ -1544,7 +1544,7 @@
     "crates/jcode-provider-openai/src/stream.rs": {
       "dot_ok": 3,
       "let_underscore": 0,
-      "unwrap_or_default": 6
+      "unwrap_or_default": 7
     },
     "crates/jcode-provider-openrouter-runtime/src/lib.rs": {
       "dot_ok": 23,
@@ -1554,7 +1554,7 @@
     "crates/jcode-provider-openrouter-runtime/src/openrouter_provider_impl.rs": {
       "dot_ok": 2,
       "let_underscore": 3,
-      "unwrap_or_default": 3
+      "unwrap_or_default": 4
     },
     "crates/jcode-provider-openrouter-runtime/src/openrouter_sse_stream.rs": {
       "dot_ok": 1,
