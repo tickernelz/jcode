@@ -437,6 +437,14 @@ pub struct NamedProviderConfig {
     /// omitted or `chat-completions` uses `/v1/chat/completions`.
     #[serde(default, alias = "wire_api", alias = "wire-api")]
     pub wire_api: Option<String>,
+    /// Concrete provider effort sent on the wire when Jcode runs in `swarm` or
+    /// `swarm-deep` mode. Required for Responses-compatible named providers.
+    #[serde(
+        default,
+        alias = "swarm-reasoning-effort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub swarm_reasoning_effort: Option<String>,
     pub auth: NamedProviderAuth,
     pub auth_header: Option<String>,
     pub api_key_env: Option<String>,
@@ -480,6 +488,7 @@ impl Default for NamedProviderConfig {
             base_url: String::new(),
             api: None,
             wire_api: None,
+            swarm_reasoning_effort: None,
             auth: NamedProviderAuth::Bearer,
             auth_header: None,
             api_key_env: None,

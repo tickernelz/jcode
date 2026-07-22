@@ -61,7 +61,17 @@ impl Provider for OpenRouterProvider {
             }
             if let Some(effort) = self.reasoning_effort().filter(|effort| effort != "none") {
                 let effort = if jcode_base::prompt::is_swarm_effort(&effort) {
-                    "xhigh"
+                    let configured = self.swarm_reasoning_effort.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Responses API swarm mode requires `swarm_reasoning_effort` in the active named-provider config"
+                        )
+                    })?;
+                    if jcode_base::prompt::is_swarm_effort(configured) {
+                        anyhow::bail!(
+                            "`swarm_reasoning_effort` must be a concrete provider effort, not a Jcode swarm sentinel"
+                        );
+                    }
+                    configured
                 } else {
                     effort.as_str()
                 };
@@ -859,6 +869,7 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
             wire_api: self.wire_api.clone(),
+            swarm_reasoning_effort: self.swarm_reasoning_effort.clone(),
             service_tier: Arc::clone(&self.service_tier),
             static_models: self.static_models.clone(),
             static_context_limits: self.static_context_limits.clone(),

@@ -1105,6 +1105,7 @@ fn make_provider() -> OpenRouterProvider {
         max_tokens: None,
         extra_body: None,
         wire_api: None,
+        swarm_reasoning_effort: None,
         service_tier: Arc::new(std::sync::RwLock::new(None)),
         static_models: Vec::new(),
         static_context_limits: HashMap::new(),
@@ -1136,6 +1137,7 @@ fn make_custom_compatible_provider() -> OpenRouterProvider {
         max_tokens: None,
         extra_body: None,
         wire_api: None,
+        swarm_reasoning_effort: None,
         service_tier: Arc::new(std::sync::RwLock::new(None)),
         static_models: Vec::new(),
         static_context_limits: HashMap::new(),
@@ -1573,6 +1575,7 @@ fn named_provider_responses_api_sends_priority_tier_and_maps_swarm_effort() {
         api_base,
         model: Arc::new(RwLock::new("gpt-5.6-sol".to_string())),
         wire_api: Some("responses".to_string()),
+        swarm_reasoning_effort: Some("xhigh".to_string()),
         supports_provider_features: false,
         ..make_custom_compatible_provider()
     };
@@ -2948,7 +2951,7 @@ fn named_profile_construction_reads_openai_reasoning_effort_config() {
 }
 
 #[test]
-fn named_gpt_profile_starts_with_configured_xhigh_effort() {
+fn named_gpt_profile_uses_configured_default_and_swarm_wire_efforts() {
     let _lock = ENV_LOCK.lock();
     let temp = TempDir::new().expect("temp home");
     let (api_base, request_rx) = spawn_single_response_chat_server();
@@ -2956,25 +2959,39 @@ fn named_gpt_profile_starts_with_configured_xhigh_effort() {
     std::fs::create_dir_all(&jcode_home).expect("create config dir");
     std::fs::write(
         jcode_home.join("config.toml"),
-        "[provider]\nopenai_reasoning_effort = \"xhigh\"\n",
+        format!(
+            r#"[provider]
+openai_reasoning_effort = "xhigh"
+openai_service_tier = "flex"
+
+[providers.sub2api-codex]
+type = "openai-compatible"
+base_url = {api_base:?}
+auth = "none"
+default_model = "gpt-5.6-sol"
+wire_api = "responses"
+swarm_reasoning_effort = "medium"
+"#
+        ),
     )
     .expect("write config");
     let home = EnvVarGuard::set("JCODE_HOME", &jcode_home);
     let namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
     jcode_base::config::invalidate_config_cache();
 
-    let config = jcode_base::config::NamedProviderConfig {
-        base_url: api_base,
-        auth: jcode_base::config::NamedProviderAuth::None,
-        default_model: Some("gpt-5.6-sol".to_string()),
-        wire_api: Some("responses".to_string()),
-        ..Default::default()
-    };
+    let config = jcode_base::config::config()
+        .providers
+        .get("sub2api-codex")
+        .cloned()
+        .expect("configured provider");
     let provider = OpenRouterProvider::new_named_openai_compatible("sub2api-codex", &config)
         .expect("provider");
 
     assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
     assert!(provider.available_efforts().contains(&"xhigh"));
+    provider
+        .set_reasoning_effort("swarm-deep")
+        .expect("enable deep swarm mode");
 
     let messages = vec![Message {
         role: Role::User,
@@ -3002,8 +3019,12 @@ fn named_gpt_profile_starts_with_configured_xhigh_effort() {
         .recv_timeout(Duration::from_secs(2))
         .expect("capture Responses API request");
     assert!(
-        request.contains(r#""reasoning":{"effort":"xhigh"}"#),
-        "configured xhigh effort must reach the wire: {request}"
+        request.contains(r#""reasoning":{"effort":"medium"}"#),
+        "configured swarm wire effort must reach the wire: {request}"
+    );
+    assert!(
+        request.contains(r#""service_tier":"flex""#),
+        "configured service tier must reach the wire: {request}"
     );
 
     drop(provider);

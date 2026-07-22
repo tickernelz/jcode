@@ -963,6 +963,7 @@ pub struct OpenRouterProvider {
     /// `JCODE_OPENAI_EXTRA_BODY` env/env-file value.
     extra_body: Option<serde_json::Map<String, Value>>,
     wire_api: Option<String>,
+    swarm_reasoning_effort: Option<String>,
     service_tier: Arc<std::sync::RwLock<Option<String>>>,
     static_models: Vec<String>,
     static_context_limits: HashMap<String, usize>,
@@ -1463,13 +1464,24 @@ impl OpenRouterProvider {
                 .map(str::trim)
                 .filter(|api| api.eq_ignore_ascii_case("responses"))
                 .map(|_| "responses".to_string()),
+            swarm_reasoning_effort: profile
+                .swarm_reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+                .map(ToString::to_string),
             service_tier: Arc::new(std::sync::RwLock::new(
                 jcode_base::config::config()
                     .provider
                     .openai_service_tier
                     .as_deref()
-                    .filter(|tier| tier.eq_ignore_ascii_case("priority"))
-                    .map(|_| "priority".to_string()),
+                    .map(str::trim)
+                    .filter(|tier| {
+                        !tier.is_empty()
+                            && !tier.eq_ignore_ascii_case("off")
+                            && !tier.eq_ignore_ascii_case("none")
+                    })
+                    .map(ToString::to_string),
             )),
             static_models,
             static_context_limits,
@@ -1669,6 +1681,7 @@ impl OpenRouterProvider {
             max_tokens,
             extra_body,
             wire_api: None,
+            swarm_reasoning_effort: None,
             service_tier: Arc::new(std::sync::RwLock::new(None)),
             static_models,
             static_context_limits,
@@ -1712,6 +1725,7 @@ impl OpenRouterProvider {
             max_tokens: Self::configured_max_tokens(None),
             extra_body: Self::resolve_extra_body(None, DEFAULT_ENV_FILE),
             wire_api: None,
+            swarm_reasoning_effort: None,
             service_tier: Arc::new(std::sync::RwLock::new(None)),
             static_models: Vec::new(),
             static_context_limits: HashMap::new(),
@@ -1782,6 +1796,7 @@ impl OpenRouterProvider {
             max_tokens: Self::configured_max_tokens(Some(&resolved.id)),
             extra_body: Self::resolve_extra_body(None, &resolved.env_file),
             wire_api: None,
+            swarm_reasoning_effort: None,
             service_tier: Arc::new(std::sync::RwLock::new(None)),
             static_models,
             static_context_limits,
@@ -2008,6 +2023,7 @@ impl OpenRouterProvider {
                 max_tokens: None,
                 extra_body: None,
                 wire_api: None,
+                swarm_reasoning_effort: None,
                 service_tier: Arc::new(std::sync::RwLock::new(None)),
                 static_models: Vec::new(),
                 static_context_limits: HashMap::new(),
