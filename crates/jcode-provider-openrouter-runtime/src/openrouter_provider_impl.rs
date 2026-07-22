@@ -68,6 +68,15 @@ impl Provider for OpenRouterProvider {
                 request_obj.extend(extra.clone());
             }
 
+            jcode_base::logging::info(&format!(
+                "OpenAI-compatible request: profile={} wire_api=responses service_tier={}",
+                self.profile_id.as_deref().unwrap_or("custom"),
+                request
+                    .get("service_tier")
+                    .and_then(|tier| tier.as_str())
+                    .unwrap_or("default")
+            ));
+
             let response = self
                 .auth
                 .apply(
@@ -86,6 +95,15 @@ impl Provider for OpenRouterProvider {
             }
             let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
             tokio::spawn(async move {
+                if tx
+                    .send(Ok(StreamEvent::ConnectionType {
+                        connection: "https/sse".to_string(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
                 let mut stream = jcode_provider_openai::stream::OpenAIResponsesStream::new(
                     response.bytes_stream(),
                 );
