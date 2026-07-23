@@ -60,8 +60,24 @@ pub fn redact_secrets(text: &str) -> String {
         && !text.contains("AIza")
         && !text.contains("ya29.")
         && !text.contains("xox")
+        && !text.contains("AKIA")
+        && !text.contains("PRIVATE KEY-----")
         && !lower.contains("api_key")
+        && !lower.contains("api-key")
+        && !lower.contains("password")
+        && !lower.contains("client_secret")
+        && !lower.contains("secret")
+        && !lower.contains("cookie")
+        && !lower.contains("credential")
+        && !lower.contains("database_url")
+        && !lower.contains("postgres://")
+        && !lower.contains("postgresql://")
+        && !lower.contains("mysql://")
+        && !lower.contains("mongodb://")
+        && !lower.contains("mongodb+srv://")
+        && !lower.contains("redis://")
         && !lower.contains("token")
+        && !lower.contains("bearer ")
     {
         logging::debug("secret redaction fast path skipped regex scan");
         return text.to_string();
@@ -77,6 +93,7 @@ pub fn redact_secrets(text: &str) -> String {
 
     let direct_patterns = DIRECT_PATTERNS.get_or_init(|| {
         compile_static_regexes(&[
+            r"sk-[A-Za-z0-9_-]{12,}",
             r"sk-ant-(?:oat|ort)01-[A-Za-z0-9_-]{20,}",
             r"sk-or-v1-[A-Za-z0-9_-]{20,}",
             r"ghp_[A-Za-z0-9]{20,}",
@@ -84,6 +101,11 @@ pub fn redact_secrets(text: &str) -> String {
             r"ya29\.[A-Za-z0-9._-]{20,}",
             r"AIza[0-9A-Za-z_-]{20,}",
             r"xox[baprs]-[A-Za-z0-9-]{10,}",
+            r"AKIA[0-9A-Z]{16}",
+            r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{12,}",
+            r"(?im)^\s*(?:cookie|set-cookie)\s*:\s*[^\r\n]+",
+            r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            r#"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s\"']+"#,
         ])
     });
 
@@ -120,6 +142,7 @@ pub fn redact_secrets(text: &str) -> String {
             r"(?m)^\s*(AZURE_OPENAI_API_KEY\s*=\s*)[^\r\n]+",
             r"(?m)^\s*(CURSOR_API_KEY\s*=\s*)[^\r\n]+",
             r"(?m)^\s*(GITHUB_TOKEN\s*=\s*)[^\r\n]+",
+            r#"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|password|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|session[_-]?token)|session[_-]?cookie|cookie|database[_-]?url|credential)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}\r\n]+"#,
         ])
     });
 

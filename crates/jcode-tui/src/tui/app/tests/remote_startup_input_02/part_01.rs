@@ -1265,6 +1265,7 @@ fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_cont
             &app.session.id,
             &app.session,
             Some(transfer_compaction.clone()),
+            crate::config::CompactionEngine::Rolling,
         )
         .expect("create transfer session");
         let child = crate::session::Session::load(&child_id).expect("load child session");

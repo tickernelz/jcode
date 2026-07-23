@@ -308,6 +308,25 @@ pub fn set_model_with_auth_refresh(provider: &dyn Provider, model: &str) -> Resu
     }
 }
 
+/// Persist enough model identity to reconstruct the exact selected runtime.
+/// OpenRouter's provider object exposes only its normalized catalog model after
+/// selection, while the explicit `@provider` pin is held separately in memory.
+/// Keep that pin in the session model so restart, transfer, and LCM compactor
+/// forks do not silently fall back to OpenRouter auto-routing.
+pub fn persisted_session_model_for_route(
+    selection: &RouteSelection,
+    resolved_model: &str,
+) -> String {
+    if matches!(selection.runtime_key, RuntimeKey::OpenRouter)
+        && !selection.provider_label.trim().is_empty()
+        && !selection.provider_label.eq_ignore_ascii_case("auto")
+    {
+        selection.routed_model_spec()
+    } else {
+        resolved_model.to_string()
+    }
+}
+
 use self::dispatch::CompletionMode;
 pub use self::models::{
     AccountModelAvailability, AccountModelAvailabilityState, AnthropicModelCatalog,
@@ -1920,6 +1939,44 @@ impl Provider for MultiProvider {
     fn set_route_selection(&self, selection: &RouteSelection) -> Result<()> {
         if selection.model.trim().is_empty() {
             anyhow::bail!("Model cannot be empty");
+        }
+
+        let gemini_developer_api = matches!(
+            &selection.runtime_key,
+            RuntimeKey::Other(method)
+                if matches!(
+                    method.trim().to_ascii_lowercase().as_str(),
+                    "gemini-api-key" | "gemini-developer-api"
+                )
+        );
+        if matches!(
+            selection.runtime_key,
+            RuntimeKey::CodeAssistOAuth | RuntimeKey::Gemini
+        ) || gemini_developer_api
+        {
+            let Some(gemini) = self.gemini_provider() else {
+                anyhow::bail!(
+                    "Gemini credentials not available. Run `jcode login --provider gemini` first."
+                );
+            };
+            if gemini_developer_api {
+                let mut typed = selection.clone();
+                typed.runtime_key = RuntimeKey::Gemini;
+                gemini.set_route_selection(&typed)?;
+            } else {
+                gemini.set_route_selection(selection)?;
+            }
+            self.set_active_provider(ActiveProvider::Gemini);
+            return Ok(());
+        }
+
+        if matches!(selection.runtime_key, RuntimeKey::RemoteCatalog) {
+            anyhow::bail!(
+                "Remote catalog route is not a concrete runtime identity; refresh routes before selecting it"
+            );
+        }
+        if let RuntimeKey::Other(method) = &selection.runtime_key {
+            anyhow::bail!("Route API method {method} is not a concrete supported runtime identity");
         }
 
         // Routing-prefix policy lives once in RouteSelection::routed_model_spec

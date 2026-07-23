@@ -156,6 +156,7 @@ struct TurnReasoningTrace {
 struct LocalRewindUndoSnapshot {
     messages: Vec<StoredMessage>,
     compaction: Option<crate::session::StoredCompactionState>,
+    context_graph: crate::session::ContextGraphState,
     provider_session_id: Option<String>,
     session_provider_session_id: Option<String>,
     visible_message_count: usize,

@@ -264,6 +264,7 @@ fn apply_judge_visible_context_if_needed(session: &mut Session, title_override: 
     let transcript = build_judge_visible_transcript_messages(&parent_session);
     session.replace_messages(transcript);
     session.compaction = None;
+    session.clear_context_graph_state();
     session.provider_session_id = None;
 }
 

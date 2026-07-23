@@ -68,6 +68,8 @@ pub(super) struct SessionPersistState {
     pub(super) memory_injections_len: usize,
     pub(super) replay_events_len: usize,
     pub(super) context_nodes_len: usize,
+    pub(super) context_generation: u64,
+    pub(super) context_op_id: Option<String>,
     pub(super) messages_mode: PersistVectorMode,
     pub(super) env_snapshots_mode: PersistVectorMode,
     pub(super) memory_injections_mode: PersistVectorMode,

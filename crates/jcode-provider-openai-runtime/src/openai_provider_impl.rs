@@ -3,6 +3,15 @@ use super::openai_stream_runtime::{
 };
 use super::*;
 
+fn provider_native_threshold_for_engine(
+    engine: jcode_base::config::CompactionEngine,
+    threshold: Option<usize>,
+) -> Option<usize> {
+    (engine != jcode_base::config::CompactionEngine::Lcm)
+        .then_some(threshold)
+        .flatten()
+}
+
 /// Whether a model catalog fetch error is an auth rejection (401/403) that a
 /// token force-refresh may fix, as opposed to a network/server failure.
 fn catalog_error_is_auth_rejection(err: &anyhow::Error) -> bool {
@@ -59,8 +68,10 @@ impl Provider for OpenAIProvider {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-        let native_compaction_threshold =
-            self.native_compaction_threshold_for_context_window(self.context_window());
+        let native_compaction_threshold = provider_native_threshold_for_engine(
+            jcode_base::config::config().compaction.engine.clone(),
+            self.native_compaction_threshold_for_context_window(self.context_window()),
+        );
         let request = Self::build_response_request(
             &model_id,
             instructions,
@@ -1189,5 +1200,28 @@ impl Provider for OpenAIProvider {
         }
 
         self.clear_persistent_ws("credentials invalidated").await;
+    }
+}
+
+#[cfg(test)]
+mod lcm_ownership_tests {
+    use super::provider_native_threshold_for_engine;
+
+    #[test]
+    fn lcm_suppresses_provider_native_auto_compaction() {
+        assert_eq!(
+            provider_native_threshold_for_engine(
+                jcode_base::config::CompactionEngine::Rolling,
+                Some(100_000),
+            ),
+            Some(100_000)
+        );
+        assert_eq!(
+            provider_native_threshold_for_engine(
+                jcode_base::config::CompactionEngine::Lcm,
+                Some(100_000),
+            ),
+            None
+        );
     }
 }

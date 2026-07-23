@@ -32,6 +32,89 @@ fn test_compaction_model_mutation_roundtrip_preserves_route_spec() -> Result<()>
 }
 
 #[test]
+fn test_compaction_event_decodes_old_payload_without_lcm_telemetry() -> Result<()> {
+    let decoded = parse_event_json(
+        r#"{"type":"compaction","trigger":"background","pre_tokens":900,"post_tokens":400}"#,
+    )?;
+    let ServerEvent::Compaction {
+        trigger,
+        engine,
+        ownership,
+        configured_route,
+        effective_route,
+        fallback_reason,
+        leaf_count,
+        parent_count,
+        frontier_size,
+        max_node_level,
+        graph_generation,
+        ..
+    } = decoded
+    else {
+        panic!("expected compaction event")
+    };
+    assert_eq!(trigger, "background");
+    assert!(engine.is_none());
+    assert!(ownership.is_none());
+    assert!(configured_route.is_none());
+    assert!(effective_route.is_none());
+    assert!(fallback_reason.is_none());
+    assert!(leaf_count.is_none());
+    assert!(parent_count.is_none());
+    assert!(frontier_size.is_none());
+    assert!(max_node_level.is_none());
+    assert!(graph_generation.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_old_client_shape_ignores_new_compaction_telemetry_fields() -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum LegacyEvent {
+        #[serde(rename = "compaction")]
+        Compaction {
+            trigger: String,
+            pre_tokens: Option<u64>,
+        },
+    }
+
+    let event = ServerEvent::Compaction {
+        trigger: "reactive".to_string(),
+        engine: Some("lcm".to_string()),
+        ownership: Some("lcm".to_string()),
+        configured_route: Some("openai-api:gpt-5.5".to_string()),
+        effective_route: Some("openai-api:gpt-5.5".to_string()),
+        fallback_reason: None,
+        leaf_count: Some(4),
+        parent_count: Some(1),
+        frontier_size: Some(1),
+        max_node_level: Some(1),
+        graph_generation: Some(5),
+        pre_tokens: Some(900),
+        post_tokens: Some(400),
+        tokens_saved: Some(500),
+        duration_ms: Some(12),
+        messages_dropped: None,
+        messages_compacted: Some(10),
+        summary_chars: Some(300),
+        active_messages: Some(10),
+    };
+    let json = encode_event(&event);
+    let decoded: LegacyEvent = serde_json::from_str(json.trim())?;
+    match decoded {
+        LegacyEvent::Compaction {
+            trigger,
+            pre_tokens,
+        } => {
+            assert_eq!(trigger, "reactive");
+            assert_eq!(pre_tokens, Some(900));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_transcript_request_roundtrip() -> Result<()> {
     let req = Request::Transcript {
         id: 77,

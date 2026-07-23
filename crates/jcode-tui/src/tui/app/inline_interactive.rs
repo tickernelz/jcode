@@ -3256,7 +3256,11 @@ impl App {
                                         self.provider.name(),
                                         self.session.provider_key.as_deref(),
                                     );
-                                    self.session.model = Some(active_model.clone());
+                                    self.session.model =
+                                        Some(crate::provider::persisted_session_model_for_route(
+                                            &route_selection,
+                                            &active_model,
+                                        ));
                                     self.session.route_api_method =
                                         Some(route_selection.api_method.clone());
                                     let _ = self.session.save();

@@ -21,8 +21,10 @@ use crate::provider::openai_request::{
     openai_encrypted_content_fallback_summary, openai_encrypted_content_is_sendable,
 };
 use anyhow::Result;
+use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -33,30 +35,295 @@ fn message_fingerprint(messages: &[Message]) -> Option<u64> {
         .reduce(jcode_message_types::extend_stable_hash)
 }
 
+fn stored_message_prefix_sha256(messages: &[crate::session::StoredMessage]) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(messages)?)
+    ))
+}
+
+fn lcm_node_id(
+    source: &PendingLcmSource,
+    summary_text: &str,
+    prompt_schema_version: u32,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(source.session_id.as_bytes());
+    digest.update(source.generation.to_le_bytes());
+    digest.update(source.next_node_sequence.to_le_bytes());
+    digest.update(source.source_sha256.as_bytes());
+    digest.update(source.summarizer_route.as_bytes());
+    digest.update(prompt_schema_version.to_le_bytes());
+    digest.update(summary_text.as_bytes());
+    format!("lcm-{:x}", digest.finalize())
+}
+
+fn lcm_atomic_parent_id(
+    generation: u64,
+    sequence: u64,
+    children_sha256: &str,
+    summarizer_route: &str,
+    summary_text: &str,
+    prompt_schema_version: u32,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"jcode-lcm-parent-v1");
+    digest.update(generation.to_le_bytes());
+    digest.update(sequence.to_le_bytes());
+    digest.update(children_sha256.as_bytes());
+    digest.update(summarizer_route.as_bytes());
+    digest.update(prompt_schema_version.to_le_bytes());
+    digest.update(summary_text.as_bytes());
+    format!("lcm-{:x}", digest.finalize())
+}
+
+fn lcm_route_spec(
+    session: &crate::session::Session,
+    inherited_model: &str,
+    configured_model: Option<&str>,
+) -> String {
+    configured_model.map(str::to_string).unwrap_or_else(|| {
+        crate::provider::MultiProvider::model_switch_request_for_session_route(
+            session.model.as_deref().unwrap_or(inherited_model),
+            session.provider_key.as_deref(),
+            session.route_api_method.as_deref(),
+        )
+    })
+}
+
+fn lcm_inherited_route_selection(
+    session: &crate::session::Session,
+    inherited_model: &str,
+) -> Option<crate::provider::RouteSelection> {
+    let api_method = session.route_api_method.as_deref()?.trim();
+    if api_method.is_empty() {
+        return None;
+    }
+    let method = crate::provider::ModelRouteApiMethod::parse(api_method);
+    let runtime_key = crate::provider::RuntimeKey::from_api_method(
+        &method,
+        session.provider_key.as_deref().unwrap_or_default(),
+    );
+    let mut model = session
+        .model
+        .as_deref()
+        .unwrap_or(inherited_model)
+        .trim()
+        .to_string();
+    let mut provider_label = session.provider_key.clone().unwrap_or_default();
+    let openrouter_preference = matches!(runtime_key, crate::provider::RuntimeKey::OpenRouter)
+        .then(|| {
+            model
+                .rsplit_once('@')
+                .map(|(catalog, provider)| (catalog.to_string(), provider.to_string()))
+        })
+        .flatten()
+        .filter(|(_, provider)| !provider.trim().is_empty());
+    if let Some((catalog_model, preferred_provider)) = openrouter_preference {
+        model = catalog_model;
+        provider_label = preferred_provider;
+    }
+    Some(crate::provider::RouteSelection {
+        model,
+        runtime_key,
+        api_method: api_method.to_string(),
+        provider_label,
+        detail: String::new(),
+    })
+}
+
+fn set_lcm_inherited_route(
+    provider: &dyn Provider,
+    selection: &crate::provider::RouteSelection,
+) -> Result<()> {
+    match provider.set_route_selection(selection) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            provider.on_auth_changed_preserve_current_provider();
+            provider
+                .set_route_selection(selection)
+                .map_err(|second_error| {
+                    anyhow::anyhow!(
+                        "{} (typed route retried after auth refresh: {})",
+                        first_error,
+                        second_error
+                    )
+                })
+        }
+    }
+}
+
+fn lcm_route_policy_fingerprint(
+    session: &crate::session::Session,
+    configured_model: Option<&str>,
+) -> String {
+    lcm_route_policy_fingerprint_with_auth_generation(
+        session,
+        configured_model,
+        crate::provider::pricing::auth_pricing_generation(),
+    )
+}
+
+fn lcm_route_policy_fingerprint_with_auth_generation(
+    session: &crate::session::Session,
+    configured_model: Option<&str>,
+    auth_generation: u64,
+) -> String {
+    lcm_route_policy_fingerprint_with_runtime_identity(
+        session,
+        configured_model,
+        auth_generation,
+        crate::auth::claude::active_account_label().as_deref(),
+        crate::auth::codex::active_account_label().as_deref(),
+    )
+}
+
+fn lcm_route_policy_fingerprint_with_runtime_identity(
+    session: &crate::session::Session,
+    configured_model: Option<&str>,
+    auth_generation: u64,
+    active_anthropic_account: Option<&str>,
+    active_openai_account: Option<&str>,
+) -> String {
+    let config = crate::config::config();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "configured_model": configured_model,
+        "engine": config.compaction.engine,
+        "provider_config": config.provider,
+        "named_providers": config.providers,
+        "auth_generation": auth_generation,
+        "active_anthropic_account": active_anthropic_account,
+        "active_openai_account": active_openai_account,
+        "session_model": session.model,
+        "session_provider_key": session.provider_key,
+        "session_api_method": session.route_api_method,
+    }))
+    .unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn lcm_summary_with_retrieval_anchor(
+    summary: &str,
+    source_session_id: &str,
+    source_message_ids: &[String],
+) -> String {
+    let range = match (source_message_ids.first(), source_message_ids.last()) {
+        (Some(first), Some(last)) => format!("{first}..{last}"),
+        _ => "imported-session-root".to_string(),
+    };
+    format!(
+        "{}\n\n## Retrieval anchor\nUse `conversation_search` against source session `{source_session_id}` and canonical message range `{range}` when exact raw details are needed.",
+        summary.trim()
+    )
+}
+
 pub use jcode_compaction_core::{
     CHARS_PER_TOKEN, COMPACTION_THRESHOLD, CRITICAL_THRESHOLD, CompactionAction, CompactionEvent,
     CompactionStats, DEFAULT_TOKEN_BUDGET, EMBED_MAX_CHARS_PER_MSG, EMBEDDING_HISTORY_WINDOW,
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS, MANUAL_COMPACT_MIN_THRESHOLD,
     MIN_TURNS_TO_KEEP, PAYLOAD_IMAGE_CHAR_BUDGET, RECENT_TURNS_TO_KEEP,
     SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_PROMPT, SYSTEM_OVERHEAD_TOKENS, Summary,
-    TOKEN_HISTORY_WINDOW, build_compaction_prompt, build_emergency_summary_text,
-    compacted_summary_text_block, content_char_count, effective_context_tokens_from_usage,
-    emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,
+    TOKEN_HISTORY_WINDOW, build_compaction_conversation_text, build_compaction_prompt,
+    build_emergency_summary_text, compacted_summary_text_block, content_char_count,
+    effective_context_tokens_from_usage, emergency_strip_large_images,
+    emergency_truncate_large_payloads, estimate_compaction_tokens,
     is_request_payload_too_large_error, mean_embedding, message_char_count, safe_compaction_cutoff,
     semantic_cache_key, semantic_goal_text, semantic_message_text, strip_large_images_in_contents,
     summary_payload_char_count,
 };
 
+#[cfg(not(test))]
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
+#[cfg(test)]
+const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 350;
+#[cfg(not(test))]
 const HARD_THRESHOLD_PENDING_POLL_MS: u64 = 50;
+#[cfg(test)]
+const HARD_THRESHOLD_PENDING_POLL_MS: u64 = 10;
 
 /// Result from background compaction task
 struct CompactionResult {
     summary_text: String,
+    atomic_parent_summaries: Vec<String>,
     openai_encrypted_content: Option<String>,
     covers_up_to_turn: usize,
     duration_ms: u64,
     summarized_messages: usize,
+}
+
+struct PendingLcmSource {
+    session_id: String,
+    base_generation: u64,
+    generation: u64,
+    next_node_sequence: u64,
+    covered_message_count: usize,
+    source_message_ids: Vec<String>,
+    input_proof_ids: Vec<String>,
+    source_sha256: String,
+    source_prefix_sha256: String,
+    covered_through_message_id: String,
+    prior_active_nodes: Vec<crate::session::StoredContextNode>,
+    node_level: u32,
+    child_nodes: Vec<crate::session::StoredContextNode>,
+    summarizer_model: String,
+    summarizer_provider: String,
+    summarizer_route: String,
+    configured_model: Option<String>,
+    cutoff: usize,
+    source_fingerprint: Option<u64>,
+    pre_tokens: u64,
+    trigger: String,
+    route_policy_fingerprint: String,
+}
+
+impl PendingLcmSource {
+    fn matches_runtime_policy(
+        &self,
+        session: &crate::session::Session,
+        policy: &crate::config::CompactionConfig,
+    ) -> bool {
+        if policy.engine != crate::config::CompactionEngine::Lcm {
+            return false;
+        }
+        if policy.model != self.configured_model {
+            return false;
+        }
+        if self.trigger == "critical_active_route" {
+            return lcm_route_spec(
+                session,
+                session
+                    .model
+                    .as_deref()
+                    .unwrap_or(self.summarizer_model.as_str()),
+                None,
+            ) == self.summarizer_route;
+        }
+        self.configured_model.is_some()
+            || lcm_route_spec(
+                session,
+                session
+                    .model
+                    .as_deref()
+                    .unwrap_or(self.summarizer_model.as_str()),
+                None,
+            ) == self.summarizer_route
+    }
+}
+
+struct PreparedLcmContext {
+    transaction: crate::session::ContextGraphTransaction,
+    projection: crate::session::StoredCompactionState,
+    summary: Summary,
+    covered_message_count: usize,
+    cutoff: usize,
+    pre_tokens: u64,
+    duration_ms: u64,
+    trigger: String,
+    messages_dropped: Option<usize>,
+    configured_model: Option<String>,
+    effective_route: String,
+    allow_active_route_fallback: bool,
+    route_policy_fingerprint: String,
 }
 
 struct CompactionOutcomeLog<'a> {
@@ -139,6 +406,9 @@ impl ActiveCharEstimate {
 /// records `compacted_count` — the number of leading messages that have
 /// been summarized and should be skipped when building API payloads.
 pub struct CompactionManager {
+    /// Storage/materialization engine. Trigger policy remains in `mode`.
+    engine: crate::config::CompactionEngine,
+
     /// Number of leading messages that have been compacted into the summary.
     /// When building API messages, skip the first `compacted_count` messages.
     compacted_count: usize,
@@ -166,6 +436,13 @@ pub struct CompactionManager {
     /// Stable cache-relevant fingerprint of the exact source prefix captured by
     /// the pending task. Message count alone cannot detect same-length rewrites.
     pending_source_fingerprint: Option<u64>,
+
+    /// Canonical source captured for an in-flight LCM leaf job.
+    pending_lcm_source: Option<PendingLcmSource>,
+
+    /// Completed LCM candidate waiting for durable commit. It is never visible
+    /// through provider materialization before commit succeeds.
+    prepared_lcm_context: Option<PreparedLcmContext>,
 
     /// Total turns seen (for tracking)
     total_turns: usize,
@@ -220,6 +497,7 @@ impl CompactionManager {
         let cfg = crate::config::config().compaction.clone();
         let mode = cfg.mode.clone();
         Self {
+            engine: cfg.engine.clone(),
             compacted_count: 0,
             active_summary: None,
             active_chars: ActiveCharEstimate::default(),
@@ -227,6 +505,8 @@ impl CompactionManager {
             pending_trigger: None,
             pending_cutoff: 0,
             pending_source_fingerprint: None,
+            pending_lcm_source: None,
+            prepared_lcm_context: None,
             total_turns: 0,
             suppress_compaction_until_new_message: false,
             token_budget: DEFAULT_TOKEN_BUDGET,
@@ -244,10 +524,19 @@ impl CompactionManager {
 
     /// Reset all compaction state
     pub fn reset(&mut self) {
+        self.cancel_pending_work();
+        *self = Self::new();
+    }
+
+    fn cancel_pending_work(&mut self) {
         if let Some(task) = self.pending_task.take() {
             task.abort();
         }
-        *self = Self::new();
+        self.pending_trigger = None;
+        self.pending_cutoff = 0;
+        self.pending_source_fingerprint = None;
+        self.pending_lcm_source = None;
+        self.prepared_lcm_context = None;
     }
 
     pub fn with_budget(mut self, budget: usize) -> Self {
@@ -342,6 +631,8 @@ impl CompactionManager {
         self.pending_trigger = None;
         self.pending_cutoff = 0;
         self.pending_source_fingerprint = None;
+        self.pending_lcm_source = None;
+        self.prepared_lcm_context = None;
         self.observed_input_tokens = None;
         self.last_compaction = None;
         self.token_history.clear();
@@ -350,6 +641,17 @@ impl CompactionManager {
         self.semantic_embed_cache.clear();
         self.semantic_embed_cache_counter = 0;
         self.total_turns = total_messages;
+        if self.engine == crate::config::CompactionEngine::Lcm {
+            // A process may restart after config was already changed to LCM, so
+            // `synchronize_engine` will not observe an engine transition. Never
+            // restore a rolling or provider-native projection in that case. The
+            // raw journal remains canonical and the first LCM leaf starts at zero.
+            self.compacted_count = 0;
+            self.active_summary = None;
+            self.active_chars.reset_pending(total_messages > 0);
+            self.suppress_compaction_until_new_message = total_messages > 0;
+            return;
+        }
         self.compacted_count = state.compacted_count.min(total_messages);
         self.active_chars
             .reset_pending(total_messages > self.compacted_count);
@@ -855,7 +1157,10 @@ impl CompactionManager {
     /// Check if we should start compaction
     pub fn should_compact_with(&self, all_messages: &[Message]) -> bool {
         use crate::config::CompactionMode;
-        if self.suppress_compaction_until_new_message {
+        if self.suppress_compaction_until_new_message
+            || self.pending_task.is_some()
+            || self.prepared_lcm_context.is_some()
+        {
             return false;
         }
         let active = self.active_messages(all_messages);
@@ -941,6 +1246,1184 @@ impl CompactionManager {
                 result
             })
         }));
+    }
+
+    fn capture_lcm_source(
+        &self,
+        session: &crate::session::Session,
+        cutoff: usize,
+        summarizer_model: String,
+        summarizer_provider: String,
+        summarizer_route: String,
+        configured_model: Option<String>,
+        pre_tokens: u64,
+        trigger: String,
+    ) -> Result<PendingLcmSource> {
+        let route_policy_fingerprint =
+            lcm_route_policy_fingerprint(session, configured_model.as_deref());
+        let covered_message_count = self.compacted_count.saturating_add(cutoff);
+        if covered_message_count == 0 || covered_message_count > session.messages.len() {
+            anyhow::bail!("LCM cutoff does not map to canonical session history");
+        }
+        let prior_frontier = session.context_frontier.as_ref();
+        let source_start = prior_frontier
+            .map_or(0, |frontier| frontier.covered_message_count)
+            .min(covered_message_count);
+        let source = &session.messages[source_start..covered_message_count];
+        let source_prefix = &session.messages[..covered_message_count];
+        if source.is_empty() {
+            anyhow::bail!("LCM leaf source is empty");
+        }
+        let prior_active_nodes = prior_frontier
+            .into_iter()
+            .flat_map(|frontier| frontier.active_node_ids.iter())
+            .map(|id| {
+                session
+                    .context_nodes
+                    .iter()
+                    .find(|node| node.id == *id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("LCM frontier node {id} is missing"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let current_generation = session
+            .context_frontier
+            .as_ref()
+            .map_or(0, |frontier| frontier.generation);
+        Ok(PendingLcmSource {
+            session_id: session.id.clone(),
+            base_generation: current_generation,
+            generation: current_generation.saturating_add(1),
+            next_node_sequence: session
+                .context_frontier
+                .as_ref()
+                .map_or(1, |frontier| frontier.next_node_sequence),
+            covered_message_count,
+            source_message_ids: source.iter().map(|message| message.id.clone()).collect(),
+            input_proof_ids: source.iter().map(|message| message.id.clone()).collect(),
+            source_sha256: stored_message_prefix_sha256(source)?,
+            source_prefix_sha256: stored_message_prefix_sha256(source_prefix)?,
+            covered_through_message_id: source
+                .last()
+                .expect("covered prefix is non-empty")
+                .id
+                .clone(),
+            prior_active_nodes,
+            node_level: 0,
+            child_nodes: Vec::new(),
+            summarizer_model,
+            summarizer_provider,
+            summarizer_route,
+            configured_model,
+            cutoff,
+            source_fingerprint: message_fingerprint(
+                &session.messages[source_start..covered_message_count]
+                    .iter()
+                    .map(crate::session::StoredMessage::to_message)
+                    .collect::<Vec<_>>(),
+            ),
+            pre_tokens,
+            trigger,
+            route_policy_fingerprint,
+        })
+    }
+
+    fn lcm_provider_for_session(
+        &self,
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+    ) -> Result<(Arc<dyn Provider>, String, String, String, Option<String>)> {
+        let configured_model = crate::config::config().compaction.model.clone();
+        self.lcm_provider_for_session_with_model(session, provider, configured_model)
+    }
+
+    fn lcm_provider_for_session_with_model(
+        &self,
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+        configured_model: Option<String>,
+    ) -> Result<(Arc<dyn Provider>, String, String, String, Option<String>)> {
+        let compactor = provider.fork();
+        let inherited_model = session.model.clone().unwrap_or_else(|| provider.model());
+        let route = lcm_route_spec(session, &inherited_model, configured_model.as_deref());
+        if configured_model.is_some() {
+            crate::provider::set_model_with_auth_refresh(compactor.as_ref(), &route)?;
+        } else if let Some(selection) = lcm_inherited_route_selection(session, &inherited_model) {
+            set_lcm_inherited_route(compactor.as_ref(), &selection)?;
+        } else {
+            crate::provider::set_model_with_auth_refresh(compactor.as_ref(), &route)?;
+        }
+        let model = compactor.model();
+        let provider_name = compactor.name().to_string();
+        Ok((compactor, model, provider_name, route, configured_model))
+    }
+
+    /// Fork and route a provider exactly as native LCM would for this session.
+    /// Lifecycle callers use this to avoid silently reverting to the active chat
+    /// route or provider-native compaction while creating a transferred child.
+    pub fn portable_provider_for_session(
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+    ) -> Result<Arc<dyn Provider>> {
+        let manager = Self::new();
+        let (provider, _, _, _, _) = manager.lcm_provider_for_session(session, provider)?;
+        Ok(provider)
+    }
+
+    fn maybe_start_lcm_with(
+        &mut self,
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+    ) -> bool {
+        if self.pending_task.is_none()
+            && self.prepared_lcm_context.is_none()
+            && match self.maybe_start_lcm_condensation(session, provider.clone()) {
+                Ok(started) => started,
+                Err(error) => {
+                    crate::logging::error(&format!("LCM hierarchy start failed: {error}"));
+                    false
+                }
+            }
+        {
+            return true;
+        }
+        let all_messages = session.messages_for_provider_uncached();
+        if !self.should_compact_with(&all_messages) {
+            return false;
+        }
+        let active = self.active_messages(&all_messages);
+        let mut cutoff = match self.mode {
+            crate::config::CompactionMode::Semantic => self.semantic_cutoff(active),
+            _ => active.len().saturating_sub(RECENT_TURNS_TO_KEEP),
+        };
+        cutoff = safe_compaction_cutoff(active, cutoff);
+        if cutoff == 0 {
+            return false;
+        }
+
+        let trigger = self.mode_trigger_label().to_string();
+        match self.start_lcm_job(session, provider, &all_messages, cutoff, trigger) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::logging::error(&format!(
+                    "LCM job start failed; keeping canonical history: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    fn maybe_start_lcm_condensation(
+        &mut self,
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+    ) -> Result<bool> {
+        const FANOUT: usize = 4;
+        let Some(frontier) = session.context_frontier.as_ref() else {
+            return Ok(false);
+        };
+        let all_messages = session.messages_for_provider_uncached();
+        if !self.should_compact_with(&all_messages) {
+            return Ok(false);
+        }
+        let active = self.active_messages(&all_messages);
+        let active_chars = active.iter().map(message_char_count).sum();
+        let tail_tokens = estimate_compaction_tokens(None, active_chars, self.token_budget);
+        if (tail_tokens as f64 / self.token_budget.max(1) as f64) >= f64::from(COMPACTION_THRESHOLD)
+        {
+            // The raw tail itself needs a new leaf. Condensing the frontier first
+            // would cause two provider-prefix changes where one leaf generation
+            // is the actual fit operation.
+            return Ok(false);
+        }
+        let active_nodes = frontier
+            .active_node_ids
+            .iter()
+            .map(|id| {
+                session
+                    .context_nodes
+                    .iter()
+                    .find(|node| node.id == *id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("LCM frontier node {id} is missing"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if active_nodes.len() < FANOUT {
+            return Ok(false);
+        }
+        let children = active_nodes[active_nodes.len() - FANOUT..].to_vec();
+        let child_level = children[0].level;
+        if children.iter().any(|node| node.level != child_level) {
+            return Ok(false);
+        }
+
+        let (compactor, model, provider_name, route, configured_model) =
+            self.lcm_provider_for_session(session, provider)?;
+        let budget_route = route.clone();
+        let route_policy_fingerprint =
+            lcm_route_policy_fingerprint(session, configured_model.as_deref());
+        let child_bytes = serde_json::to_vec(&children)?;
+        let source_sha256 = format!("{:x}", Sha256::digest(child_bytes));
+        let mut seen_message_ids = std::collections::HashSet::new();
+        let source_message_ids = children
+            .iter()
+            .flat_map(|node| node.source_message_ids.iter().cloned())
+            .filter(|id| seen_message_ids.insert(id.clone()))
+            .collect::<Vec<_>>();
+        let input_proof_ids = children.iter().map(|node| node.id.clone()).collect();
+        let source = PendingLcmSource {
+            session_id: session.id.clone(),
+            base_generation: frontier.generation,
+            generation: frontier.generation.saturating_add(1),
+            next_node_sequence: frontier.next_node_sequence,
+            covered_message_count: frontier.covered_message_count,
+            source_message_ids,
+            input_proof_ids,
+            source_sha256,
+            source_prefix_sha256: frontier.source_prefix_sha256.clone(),
+            covered_through_message_id: frontier
+                .covered_through_message_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("LCM frontier lacks covered message id"))?,
+            prior_active_nodes: active_nodes[..active_nodes.len() - FANOUT].to_vec(),
+            node_level: child_level.saturating_add(1),
+            child_nodes: children.clone(),
+            summarizer_model: model,
+            summarizer_provider: provider_name,
+            summarizer_route: route,
+            configured_model,
+            cutoff: 0,
+            source_fingerprint: None,
+            pre_tokens: self.effective_token_count_with(&session.messages_for_provider_uncached())
+                as u64,
+            trigger: "hierarchy".to_string(),
+            route_policy_fingerprint,
+        };
+        let messages_to_summarize = children
+            .iter()
+            .map(|node| Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!(
+                        "[LCM child {} level {}]\n{}",
+                        node.id, node.level, node.summary_text
+                    ),
+                    cache_control: None,
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            })
+            .collect::<Vec<_>>();
+        let message_count = messages_to_summarize.len();
+        self.pending_cutoff = 0;
+        self.pending_source_fingerprint = None;
+        self.pending_trigger = Some("hierarchy".to_string());
+        self.pending_lcm_source = Some(source);
+        self.pending_task = Some(tokio::spawn(async move {
+            let start = Instant::now();
+            let result = generate_lcm_compaction_artifact(
+                compactor,
+                messages_to_summarize,
+                None,
+                Some(budget_route),
+                LcmJobPriority::Background,
+            )
+            .await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            crate::bus::Bus::global().publish(crate::bus::BusEvent::CompactionFinished);
+            result.map(|mut result| {
+                result.duration_ms = duration_ms;
+                result.summarized_messages = message_count;
+                result
+            })
+        }));
+        Ok(true)
+    }
+
+    fn start_lcm_job(
+        &mut self,
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+        all_messages: &[Message],
+        cutoff: usize,
+        trigger: String,
+    ) -> Result<()> {
+        let policy_model = crate::config::config().compaction.model.clone();
+        self.start_lcm_job_with_model(
+            session,
+            provider,
+            all_messages,
+            cutoff,
+            trigger,
+            policy_model.clone(),
+            policy_model,
+        )
+    }
+
+    fn start_lcm_job_with_model(
+        &mut self,
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+        all_messages: &[Message],
+        cutoff: usize,
+        trigger: String,
+        route_model: Option<String>,
+        policy_model: Option<String>,
+    ) -> Result<()> {
+        let active = self.active_messages(all_messages);
+        if cutoff == 0 || cutoff > active.len() {
+            anyhow::bail!("LCM cutoff is outside the active message suffix");
+        }
+        let (compactor, model, provider_name, route, _) =
+            self.lcm_provider_for_session_with_model(session, provider, route_model)?;
+        let budget_route = route.clone();
+        let pre_tokens = self.effective_token_count_with(all_messages) as u64;
+        let source = self.capture_lcm_source(
+            session,
+            cutoff,
+            model,
+            provider_name,
+            route,
+            policy_model,
+            pre_tokens,
+            trigger.clone(),
+        )?;
+        let messages_to_summarize = active[..cutoff].to_vec();
+        let existing_summary = if session.context_frontier.is_none() {
+            self.active_summary.clone()
+        } else {
+            None
+        };
+        let message_count = messages_to_summarize.len();
+        const ATOMIC_PARENT_PRIOR_CHILDREN: usize = 3;
+        let mut carry_frontier = source.prior_active_nodes.clone();
+        let mut carry_level = source.node_level;
+        let mut atomic_carry_tiers = Vec::new();
+        loop {
+            let Some(children) = carry_frontier.get(
+                carry_frontier
+                    .len()
+                    .saturating_sub(ATOMIC_PARENT_PRIOR_CHILDREN)..,
+            ) else {
+                break;
+            };
+            if children.len() != ATOMIC_PARENT_PRIOR_CHILDREN
+                || children.iter().any(|node| node.level != carry_level)
+            {
+                break;
+            }
+            atomic_carry_tiers.push(children.to_vec());
+            carry_frontier.truncate(
+                carry_frontier
+                    .len()
+                    .saturating_sub(ATOMIC_PARENT_PRIOR_CHILDREN),
+            );
+            carry_level = carry_level.saturating_add(1);
+        }
+
+        self.pending_cutoff = cutoff;
+        self.pending_source_fingerprint = source.source_fingerprint;
+        self.pending_trigger = Some(trigger.clone());
+        self.pending_lcm_source = Some(source);
+        let priority = if trigger.starts_with("critical_") || trigger == "hard_compact" {
+            LcmJobPriority::Critical
+        } else {
+            LcmJobPriority::Background
+        };
+        self.pending_task = Some(tokio::spawn(async move {
+            let start = Instant::now();
+            let mut result = generate_lcm_compaction_artifact(
+                Arc::clone(&compactor),
+                messages_to_summarize,
+                existing_summary,
+                Some(budget_route.clone()),
+                priority,
+            )
+            .await?;
+            let mut carried_summary = result.summary_text.clone();
+            for carry_children in atomic_carry_tiers {
+                let child_level = carry_children[0].level;
+                let mut parent_messages = carry_children
+                    .iter()
+                    .map(|node| Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: format!(
+                                "[LCM child {} level {}]\n{}",
+                                node.id, node.level, node.summary_text
+                            ),
+                            cache_control: None,
+                        }],
+                        timestamp: None,
+                        tool_duration_ms: None,
+                    })
+                    .collect::<Vec<_>>();
+                parent_messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: format!("[LCM new child level {child_level}]\n{carried_summary}"),
+                        cache_control: None,
+                    }],
+                    timestamp: None,
+                    tool_duration_ms: None,
+                });
+                let parent = generate_lcm_compaction_artifact(
+                    Arc::clone(&compactor),
+                    parent_messages,
+                    None,
+                    Some(budget_route.clone()),
+                    priority,
+                )
+                .await?;
+                carried_summary = parent.summary_text.clone();
+                result.atomic_parent_summaries.push(parent.summary_text);
+            }
+            let duration_ms = start.elapsed().as_millis() as u64;
+            crate::bus::Bus::global().publish(crate::bus::BusEvent::CompactionFinished);
+            result.duration_ms = duration_ms;
+            result.summarized_messages = message_count;
+            Ok(result)
+        }));
+        Ok(())
+    }
+
+    fn prepare_lcm_context(
+        source: PendingLcmSource,
+        result: CompactionResult,
+    ) -> Result<PreparedLcmContext> {
+        const PROMPT_SCHEMA_VERSION: u32 = 1;
+        if result.summary_text.trim().is_empty() {
+            anyhow::bail!("LCM compactor returned an empty summary");
+        }
+        let node_id = lcm_node_id(&source, &result.summary_text, PROMPT_SCHEMA_VERSION);
+        let durable_summary = lcm_summary_with_retrieval_anchor(
+            &result.summary_text,
+            &source.session_id,
+            &source.source_message_ids,
+        );
+        let node = crate::session::StoredContextNode {
+            id: node_id.clone(),
+            schema_version: 1,
+            level: source.node_level,
+            source_session_id: source.session_id.clone(),
+            source_message_ids: source.source_message_ids.clone(),
+            source_sha256: source.source_sha256.clone(),
+            child_node_ids: source
+                .child_nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect(),
+            summary_text: durable_summary.clone(),
+            summary_sha256: Some(format!("{:x}", Sha256::digest(durable_summary.as_bytes()))),
+            estimated_tokens: ((durable_summary.len() + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN)
+                .max(1) as u64,
+            summarizer_model: source.summarizer_model.clone(),
+            summarizer_provider: source.summarizer_provider.clone(),
+            summarizer_route: source.summarizer_route.clone(),
+            prompt_schema_version: PROMPT_SCHEMA_VERSION,
+            created_at: Utc::now(),
+        };
+        let mut active_nodes = source.prior_active_nodes.clone();
+        let mut append_context_nodes = vec![node.clone()];
+        let mut carried_node = node;
+        for parent_summary in &result.atomic_parent_summaries {
+            const FANOUT: usize = 4;
+            if active_nodes.len() < FANOUT - 1 {
+                anyhow::bail!(
+                    "LCM atomic carry candidate does not have three prior level-{} nodes",
+                    carried_node.level
+                );
+            }
+            let mut children = active_nodes.split_off(active_nodes.len() - (FANOUT - 1));
+            children.push(carried_node.clone());
+            if children.len() != FANOUT
+                || children
+                    .iter()
+                    .any(|child| child.level != carried_node.level)
+            {
+                anyhow::bail!(
+                    "LCM atomic parent children are not four adjacent level-{} nodes",
+                    carried_node.level
+                );
+            }
+            let children_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&children)?));
+            let mut seen = std::collections::HashSet::new();
+            let source_message_ids = children
+                .iter()
+                .flat_map(|child| child.source_message_ids.iter().cloned())
+                .filter(|id| seen.insert(id.clone()))
+                .collect::<Vec<_>>();
+            let parent_durable_summary = lcm_summary_with_retrieval_anchor(
+                parent_summary,
+                &source.session_id,
+                &source_message_ids,
+            );
+            let parent_id = lcm_atomic_parent_id(
+                source.generation,
+                source
+                    .next_node_sequence
+                    .saturating_add(append_context_nodes.len() as u64),
+                &children_sha256,
+                &source.summarizer_route,
+                parent_summary,
+                PROMPT_SCHEMA_VERSION,
+            );
+            let parent = crate::session::StoredContextNode {
+                id: parent_id,
+                schema_version: 1,
+                level: carried_node.level.saturating_add(1),
+                source_session_id: source.session_id.clone(),
+                source_message_ids,
+                source_sha256: children_sha256,
+                child_node_ids: children.iter().map(|child| child.id.clone()).collect(),
+                summary_text: parent_durable_summary.clone(),
+                summary_sha256: Some(format!(
+                    "{:x}",
+                    Sha256::digest(parent_durable_summary.as_bytes())
+                )),
+                estimated_tokens: ((parent_durable_summary.len() + CHARS_PER_TOKEN - 1)
+                    / CHARS_PER_TOKEN)
+                    .max(1) as u64,
+                summarizer_model: source.summarizer_model.clone(),
+                summarizer_provider: source.summarizer_provider.clone(),
+                summarizer_route: source.summarizer_route.clone(),
+                prompt_schema_version: PROMPT_SCHEMA_VERSION,
+                created_at: Utc::now(),
+            };
+            append_context_nodes.push(parent.clone());
+            carried_node = parent;
+        }
+        active_nodes.push(carried_node);
+        let active_node_ids = active_nodes.iter().map(|node| node.id.clone()).collect();
+        let projection_text = active_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                format!(
+                    "[LCM context node {} level {}]\n{}",
+                    index + 1,
+                    node.level,
+                    node.summary_text
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let frontier = crate::session::StoredContextFrontier {
+            schema_version: 1,
+            generation: source.generation,
+            active_node_ids,
+            covered_message_count: source.covered_message_count,
+            covered_through_message_id: Some(source.covered_through_message_id),
+            source_prefix_sha256: source.source_prefix_sha256.clone(),
+            next_node_sequence: source
+                .next_node_sequence
+                .saturating_add(append_context_nodes.len() as u64),
+        };
+        let transaction = crate::session::ContextGraphTransaction {
+            schema_version: 1,
+            op_id: format!("lcm-op-{}-{node_id}", source.generation),
+            base_generation: source.base_generation,
+            generation: source.generation,
+            append_context_nodes,
+            frontier,
+            input_proof: crate::session::ContextGraphInputProof {
+                schema_version: 1,
+                source_session_id: source.session_id,
+                source_message_ids: source.input_proof_ids,
+                source_sha256: source.source_sha256,
+            },
+        };
+        let projection = crate::session::StoredCompactionState {
+            summary_text: projection_text.clone(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: source.covered_message_count,
+            original_turn_count: source.covered_message_count,
+            compacted_count: source.covered_message_count,
+        };
+        Ok(PreparedLcmContext {
+            transaction,
+            projection,
+            summary: Summary {
+                text: projection_text,
+                openai_encrypted_content: None,
+                covers_up_to_turn: source.covered_message_count,
+                original_turn_count: source.covered_message_count,
+            },
+            covered_message_count: source.covered_message_count,
+            cutoff: source.cutoff,
+            pre_tokens: source.pre_tokens,
+            duration_ms: result.duration_ms,
+            trigger: source.trigger.clone(),
+            messages_dropped: None,
+            configured_model: source.configured_model,
+            effective_route: source.summarizer_route,
+            allow_active_route_fallback: source.trigger == "critical_active_route",
+            route_policy_fingerprint: source.route_policy_fingerprint,
+        })
+    }
+
+    fn poll_lcm_candidate(&mut self, session: &crate::session::Session) {
+        if self.prepared_lcm_context.is_some() {
+            return;
+        }
+        let Some(task) = self.pending_task.take() else {
+            return;
+        };
+        if !task.is_finished() {
+            self.pending_task = Some(task);
+            return;
+        }
+        let Some(source) = self.pending_lcm_source.take() else {
+            task.abort();
+            crate::logging::error("LCM task completed without its canonical source snapshot");
+            return;
+        };
+
+        self.pending_cutoff = 0;
+        self.pending_source_fingerprint = None;
+        self.pending_trigger = None;
+
+        let current_policy = crate::config::config().compaction.clone();
+        if !source.matches_runtime_policy(session, &current_policy) {
+            crate::logging::warn(
+                "Discarding completed LCM job because compaction engine/model/route policy changed",
+            );
+            return;
+        }
+        let all_messages = session.messages_for_provider_uncached();
+        let source_end = source.covered_message_count.min(all_messages.len());
+        let source_start = self.compacted_count.min(source_end);
+        if source_end != source.covered_message_count
+            || message_fingerprint(&all_messages[source_start..source_end])
+                != source.source_fingerprint
+        {
+            crate::logging::warn(
+                "Discarding completed LCM job because canonical source history changed",
+            );
+            return;
+        }
+
+        match futures::executor::block_on(task) {
+            Ok(Ok(result)) => match Self::prepare_lcm_context(source, result) {
+                Ok(prepared) => self.prepared_lcm_context = Some(prepared),
+                Err(error) => crate::logging::error(&format!(
+                    "Failed to prepare completed LCM transaction: {error}"
+                )),
+            },
+            Ok(Err(error)) => {
+                crate::logging::error(&format!("LCM summary generation failed: {error}"));
+            }
+            Err(error) => {
+                crate::logging::error(&format!("LCM summary task panicked: {error}"));
+            }
+        }
+    }
+
+    fn commit_prepared_lcm(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> Result<Option<CompactionEvent>> {
+        let Some(prepared) = self.prepared_lcm_context.take() else {
+            return Ok(None);
+        };
+        let policy = &crate::config::config().compaction;
+        let inherited_model = session
+            .model
+            .as_deref()
+            .unwrap_or_else(|| prepared.effective_route.as_str());
+        let active_route = lcm_route_spec(session, inherited_model, None);
+        let policy_matches = policy.engine == crate::config::CompactionEngine::Lcm
+            && prepared.route_policy_fingerprint
+                == lcm_route_policy_fingerprint(session, prepared.configured_model.as_deref())
+            && if matches!(
+                prepared.trigger.as_str(),
+                "critical_legacy_import" | "critical_local_emergency_chain" | "hard_compact"
+            ) {
+                true
+            } else if prepared.allow_active_route_fallback {
+                active_route == prepared.effective_route
+            } else {
+                policy.model == prepared.configured_model
+                    && prepared.configured_model.as_ref().map_or_else(
+                        || active_route == prepared.effective_route,
+                        |configured| configured == &prepared.effective_route,
+                    )
+            };
+        if !policy_matches {
+            anyhow::bail!("prepared LCM candidate route policy became stale before commit");
+        }
+        let commit = session.commit_context_graph_transaction_with_compaction(
+            prepared.transaction.clone(),
+            Some(prepared.projection.clone()),
+        );
+        if let Err(error) = commit {
+            self.prepared_lcm_context = Some(prepared);
+            return Err(error);
+        }
+
+        let all_messages = session.messages_for_provider_uncached();
+        self.compacted_count = prepared.covered_message_count.min(all_messages.len());
+        self.active_chars.set_exact(
+            all_messages[self.compacted_count..]
+                .iter()
+                .map(message_char_count)
+                .sum(),
+        );
+        self.active_summary = Some(prepared.summary);
+        self.observed_input_tokens = None;
+        self.turns_since_last_compact = 0;
+        let post_tokens = self.effective_token_count_with(&all_messages) as u64;
+        let leaf_count = session
+            .context_nodes
+            .iter()
+            .filter(|node| node.level == 0)
+            .count();
+        let parent_count = session.context_nodes.len().saturating_sub(leaf_count);
+        let max_node_level = session.context_nodes.iter().map(|node| node.level).max();
+        let effective_route = prepared
+            .transaction
+            .append_context_nodes
+            .last()
+            .map(|node| node.summarizer_route.clone());
+        let fallback_reason = match prepared.trigger.as_str() {
+            "critical_active_route" => {
+                Some("selected_route_failed>active_route_succeeded".to_string())
+            }
+            "critical_legacy_import" => Some(
+                "selected_route_failed>active_route_failed_or_unavailable>legacy_summary_succeeded"
+                    .to_string(),
+            ),
+            "critical_local_emergency_chain" => Some(
+                "selected_route_failed>active_route_failed_or_unavailable>legacy_summary_rejected_or_unavailable>local_emergency_succeeded"
+                    .to_string(),
+            ),
+            "hard_compact" => Some("critical_local_emergency".to_string()),
+            _ => None,
+        };
+        let event = CompactionEvent {
+            trigger: prepared.trigger,
+            engine: Some("lcm".to_string()),
+            ownership: Some("lcm".to_string()),
+            configured_route: crate::config::config().compaction.model.clone(),
+            effective_route,
+            fallback_reason,
+            leaf_count: Some(leaf_count),
+            parent_count: Some(parent_count),
+            frontier_size: session
+                .context_frontier
+                .as_ref()
+                .map(|frontier| frontier.active_node_ids.len()),
+            max_node_level,
+            graph_generation: session
+                .context_frontier
+                .as_ref()
+                .map(|frontier| frontier.generation),
+            pre_tokens: Some(prepared.pre_tokens),
+            post_tokens: Some(post_tokens),
+            tokens_saved: Some(prepared.pre_tokens.saturating_sub(post_tokens)),
+            duration_ms: Some(prepared.duration_ms),
+            messages_dropped: prepared.messages_dropped,
+            messages_compacted: Some(prepared.cutoff),
+            summary_chars: self
+                .active_summary
+                .as_ref()
+                .map(|summary| summary.text.len()),
+            active_messages: Some(self.active_messages_count()),
+        };
+        self.last_compaction = Some(event.clone());
+        Ok(Some(event))
+    }
+
+    /// Shared Agent/local-TUI LCM completion facade. It validates the captured
+    /// source, commits graph plus projection durably, and only then exposes the
+    /// new summary in provider context.
+    pub fn materialize_lcm_context(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> Result<(Vec<Message>, Option<CompactionEvent>)> {
+        self.poll_lcm_candidate(session);
+        let event = self.commit_prepared_lcm(session)?;
+        if event.is_some() {
+            // The event is returned directly by this facade. Do not leave a
+            // duplicate for a later rolling-style `take_compaction_event` call.
+            self.last_compaction = None;
+        }
+        let all_messages = session.messages_for_provider_uncached();
+        let active = self.active_messages(&all_messages);
+        let frontier_summaries = session
+            .context_frontier
+            .as_ref()
+            .into_iter()
+            .flat_map(|frontier| frontier.active_node_ids.iter())
+            .filter_map(|id| {
+                session
+                    .context_nodes
+                    .iter()
+                    .find(|node| node.id == *id)
+                    .map(|node| node.summary_text.as_str())
+            })
+            .collect::<Vec<_>>();
+        let messages = if !frontier_summaries.is_empty() {
+            let mut messages = Vec::with_capacity(active.len() + frontier_summaries.len());
+            for summary in frontier_summaries {
+                messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: compacted_summary_text_block(summary),
+                        cache_control: None,
+                    }],
+                    timestamp: None,
+                    tool_duration_ms: None,
+                });
+            }
+            messages.extend(active.iter().cloned());
+            messages
+        } else if let Some(summary) = self.active_summary.as_ref() {
+            let mut messages = Vec::with_capacity(active.len() + 1);
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: compacted_summary_text_block(&summary.text),
+                    cache_control: None,
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            });
+            messages.extend(active.iter().cloned());
+            messages
+        } else {
+            active.to_vec()
+        };
+        Ok((messages, event))
+    }
+
+    /// Apply unchanged Jcode trigger thresholds to the LCM engine. Critical
+    /// synchronous recovery remains the next Phase 3 gate; below 95%, this
+    /// starts one source-validated background leaf job.
+    pub fn ensure_lcm_context_fits(
+        &mut self,
+        session: &mut crate::session::Session,
+        provider: Arc<dyn Provider>,
+    ) -> CompactionAction {
+        let all_messages = session.messages_for_provider_uncached();
+        if self.context_usage_with(&all_messages) >= CRITICAL_THRESHOLD {
+            let critical_policy_model = crate::config::config().compaction.model.clone();
+            let active = self.active_messages(&all_messages);
+            let cutoff =
+                safe_compaction_cutoff(active, active.len().saturating_sub(RECENT_TURNS_TO_KEEP));
+            if cutoff > 0 {
+                if self.pending_task.is_none() && self.prepared_lcm_context.is_none() {
+                    let _ = self.start_lcm_job_with_model(
+                        session,
+                        Arc::clone(&provider),
+                        &all_messages,
+                        cutoff,
+                        "critical_selected_route".to_string(),
+                        critical_policy_model.clone(),
+                        critical_policy_model.clone(),
+                    );
+                }
+                if self.pending_task.is_some() || self.prepared_lcm_context.is_some() {
+                    match self.wait_for_critical_lcm_attempt(session) {
+                        Ok(Some(compacted)) => return CompactionAction::HardCompacted(compacted),
+                        Ok(None) => {}
+                        Err(error) => crate::logging::warn(&format!(
+                            "Selected LCM critical route failed; trying active route: {error}"
+                        )),
+                    }
+                }
+
+                if critical_policy_model.is_some() {
+                    if let Err(error) = self.start_lcm_job_with_model(
+                        session,
+                        Arc::clone(&provider),
+                        &all_messages,
+                        cutoff,
+                        "critical_active_route".to_string(),
+                        None,
+                        critical_policy_model,
+                    ) {
+                        crate::logging::warn(&format!(
+                            "Active-session LCM critical route could not start: {error}"
+                        ));
+                    } else {
+                        match self.wait_for_critical_lcm_attempt(session) {
+                            Ok(Some(compacted)) => {
+                                return CompactionAction::HardCompacted(compacted);
+                            }
+                            Ok(None) => {}
+                            Err(error) => crate::logging::warn(&format!(
+                                "Active-session LCM critical route failed; trying legacy projection: {error}"
+                            )),
+                        }
+                    }
+                }
+
+                if let Ok(Some(compacted)) = self.install_critical_legacy_summary(session, cutoff) {
+                    return CompactionAction::HardCompacted(compacted);
+                }
+            }
+            return match self
+                .hard_lcm_compact_with_trigger(session, "critical_local_emergency_chain")
+            {
+                Ok(dropped) => CompactionAction::HardCompacted(dropped),
+                Err(error) => {
+                    crate::logging::error(&format!("Critical LCM recovery failed: {error}"));
+                    CompactionAction::None
+                }
+            };
+        }
+        if self.maybe_start_lcm_with(session, provider) {
+            CompactionAction::BackgroundStarted {
+                trigger: self.mode_trigger_label().to_string(),
+            }
+        } else {
+            CompactionAction::None
+        }
+    }
+
+    fn wait_for_critical_lcm_attempt(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> Result<Option<usize>> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current()
+            && !matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        {
+            // A synchronous wait on a current-thread runtime prevents the
+            // spawned provider future from ever advancing. Fail this route
+            // immediately so the deterministic local recovery can run.
+            self.cancel_pending_work();
+            anyhow::bail!("critical LCM provider wait requires a multi-thread Tokio runtime");
+        }
+        let start = Instant::now();
+        let timeout = std::time::Duration::from_millis(HARD_THRESHOLD_PENDING_WAIT_MS);
+        let poll = std::time::Duration::from_millis(HARD_THRESHOLD_PENDING_POLL_MS);
+        loop {
+            if self
+                .pending_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                self.poll_lcm_candidate(session);
+            }
+            if self.prepared_lcm_context.is_some() {
+                let event = self.commit_prepared_lcm(session)?;
+                return Ok(event.and_then(|event| event.messages_compacted));
+            }
+            if self.pending_task.is_none() {
+                return Ok(None);
+            }
+            if start.elapsed() >= timeout {
+                self.cancel_pending_work();
+                anyhow::bail!(
+                    "critical LCM route timed out after {} ms",
+                    start.elapsed().as_millis()
+                );
+            }
+            // Tell Tokio this worker is intentionally blocking so it can lend a
+            // replacement worker to the spawned compactor instead of deadlocking
+            // under concurrent critical sessions.
+            tokio::task::block_in_place(|| std::thread::sleep(poll));
+        }
+    }
+
+    fn install_critical_legacy_summary(
+        &mut self,
+        session: &mut crate::session::Session,
+        maximum_cutoff: usize,
+    ) -> Result<Option<usize>> {
+        if self.compacted_count != 0
+            || session.context_frontier.is_some()
+            || !session.context_nodes.is_empty()
+        {
+            // Legacy import is only valid before LCM has established ownership.
+            // Re-importing an iterative LCM projection would add the covered
+            // count twice and bind its summary to the wrong raw source range.
+            return Ok(None);
+        }
+        let Some(legacy) = session.compaction.as_ref().filter(|state| {
+            !state.summary_text.trim().is_empty()
+                && state.openai_encrypted_content.is_none()
+                && state.compacted_count > 0
+                && state.compacted_count == state.covers_up_to_turn
+                && state.compacted_count == state.original_turn_count
+        }) else {
+            return Ok(None);
+        };
+        let all_messages = session.messages_for_provider_uncached();
+        if legacy.compacted_count > maximum_cutoff || legacy.compacted_count > all_messages.len() {
+            return Ok(None);
+        }
+        let cutoff = legacy.compacted_count;
+        if cutoff == 0 || safe_compaction_cutoff(&all_messages, cutoff) != cutoff {
+            return Ok(None);
+        }
+        let summary_text = crate::message::redact_secrets(&legacy.summary_text);
+        let pre_tokens = self.effective_token_count_with(&all_messages) as u64;
+        let source = self.capture_lcm_source(
+            session,
+            cutoff,
+            "legacy-rolling-import-v1".to_string(),
+            "jcode".to_string(),
+            "legacy:rolling".to_string(),
+            crate::config::config().compaction.model.clone(),
+            pre_tokens,
+            "critical_legacy_import".to_string(),
+        )?;
+        self.prepared_lcm_context = Some(Self::prepare_lcm_context(
+            source,
+            CompactionResult {
+                summary_text,
+                atomic_parent_summaries: Vec::new(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: cutoff,
+                duration_ms: 0,
+                summarized_messages: cutoff,
+            },
+        )?);
+        let event = self.commit_prepared_lcm(session)?;
+        Ok(event.and_then(|event| event.messages_compacted))
+    }
+
+    pub fn hard_lcm_compact_with(
+        &mut self,
+        session: &mut crate::session::Session,
+    ) -> std::result::Result<usize, String> {
+        self.hard_lcm_compact_with_trigger(session, "hard_compact")
+    }
+
+    fn hard_lcm_compact_with_trigger(
+        &mut self,
+        session: &mut crate::session::Session,
+        trigger: &str,
+    ) -> std::result::Result<usize, String> {
+        let all_messages = session.messages_for_provider_uncached();
+        let active = self.active_messages(&all_messages);
+        if active.len() <= MIN_TURNS_TO_KEEP {
+            return Err(format!(
+                "Not enough messages to compact (have {}, need more than {})",
+                active.len(),
+                MIN_TURNS_TO_KEEP
+            ));
+        }
+        let pre_tokens = self.effective_token_count_with(&all_messages) as u64;
+        let active_char_counts: Vec<usize> = active.iter().map(message_char_count).collect();
+        let mut remaining_suffix_chars = vec![0usize; active_char_counts.len() + 1];
+        for index in (0..active_char_counts.len()).rev() {
+            remaining_suffix_chars[index] =
+                remaining_suffix_chars[index + 1].saturating_add(active_char_counts[index]);
+        }
+        let mut turns_to_keep = RECENT_TURNS_TO_KEEP.min(active.len().saturating_sub(1));
+        let cutoff = loop {
+            let candidate =
+                safe_compaction_cutoff(active, active.len().saturating_sub(turns_to_keep));
+            if candidate > 0
+                && remaining_suffix_chars[candidate] / CHARS_PER_TOKEN <= self.token_budget
+            {
+                break candidate;
+            }
+            if turns_to_keep <= MIN_TURNS_TO_KEEP {
+                break safe_compaction_cutoff(
+                    active,
+                    active.len().saturating_sub(MIN_TURNS_TO_KEEP),
+                );
+            }
+            turns_to_keep = (turns_to_keep / 2).max(MIN_TURNS_TO_KEEP);
+        };
+        if cutoff == 0 {
+            return Err("Cannot compact - would split tool call/result pairs".to_string());
+        }
+
+        let source = self
+            .capture_lcm_source(
+                session,
+                cutoff,
+                "jcode-emergency-v1".to_string(),
+                "jcode".to_string(),
+                "local:emergency".to_string(),
+                crate::config::config().compaction.model.clone(),
+                pre_tokens,
+                trigger.to_string(),
+            )
+            .map_err(|error| error.to_string())?;
+        let summary_text = build_emergency_summary_text(
+            if session.context_frontier.is_none() {
+                self.active_summary
+                    .as_ref()
+                    .map(|summary| summary.text.as_str())
+            } else {
+                None
+            },
+            cutoff,
+            pre_tokens,
+            self.token_budget,
+            &active[..cutoff],
+        );
+        if let Some(task) = self.pending_task.take() {
+            task.abort();
+        }
+        self.pending_lcm_source = None;
+        self.pending_cutoff = 0;
+        self.pending_source_fingerprint = None;
+        self.pending_trigger = None;
+        self.prepared_lcm_context = None;
+
+        let result = CompactionResult {
+            summary_text,
+            atomic_parent_summaries: Vec::new(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: cutoff,
+            duration_ms: 0,
+            summarized_messages: cutoff,
+        };
+        let mut prepared =
+            Self::prepare_lcm_context(source, result).map_err(|error| error.to_string())?;
+        prepared.messages_dropped = Some(cutoff);
+        self.prepared_lcm_context = Some(prepared);
+        self.commit_prepared_lcm(session)
+            .map_err(|error| error.to_string())?;
+        Ok(cutoff)
+    }
+
+    pub fn force_lcm_compact_with(
+        &mut self,
+        session: &crate::session::Session,
+        provider: Arc<dyn Provider>,
+    ) -> std::result::Result<(), String> {
+        if self.pending_task.is_some() || self.prepared_lcm_context.is_some() {
+            return Err("Compaction already in progress".to_string());
+        }
+        let all_messages = session.messages_for_provider_uncached();
+        let active = self.active_messages(&all_messages);
+        if active.len() <= RECENT_TURNS_TO_KEEP {
+            return Err(format!(
+                "Not enough messages to compact (need more than {}, have {})",
+                RECENT_TURNS_TO_KEEP,
+                active.len()
+            ));
+        }
+        if self.context_usage_with(&all_messages) < MANUAL_COMPACT_MIN_THRESHOLD {
+            return Err(format!(
+                "Context usage too low ({:.1}%) - nothing to compact",
+                self.context_usage_with(&all_messages) * 100.0
+            ));
+        }
+        let cutoff =
+            safe_compaction_cutoff(active, active.len().saturating_sub(RECENT_TURNS_TO_KEEP));
+        if cutoff == 0 {
+            return Err("Cannot compact - would split tool call/result pairs".to_string());
+        }
+        self.start_lcm_job(
+            session,
+            provider,
+            &all_messages,
+            cutoff,
+            "manual".to_string(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Ensure context fits before an API call.
@@ -1097,6 +2580,9 @@ impl CompactionManager {
         all_messages: &[Message],
         provider: Arc<dyn Provider>,
     ) -> Result<(), String> {
+        if self.engine == crate::config::CompactionEngine::Lcm {
+            return Err("LCM owns context; use force_lcm_compact_with".to_string());
+        }
         if self.pending_task.is_some() {
             return Err("Compaction already in progress".to_string());
         }
@@ -1161,6 +2647,9 @@ impl CompactionManager {
     /// Check if background compaction is done and apply it, updating rolling
     /// token-estimate state from the provided full message list.
     pub fn check_and_apply_compaction_with(&mut self, all_messages: &[Message]) {
+        if self.engine == crate::config::CompactionEngine::Lcm {
+            return;
+        }
         self.clamp_compacted_count_to_messages(all_messages, "check_and_apply_start");
         let task = match self.pending_task.take() {
             Some(task) => task,
@@ -1240,19 +2729,34 @@ impl CompactionManager {
                 self.discard_oversized_openai_native_compaction();
                 self.observed_input_tokens = None;
                 let post_tokens = self.effective_token_count_with(all_messages) as u64;
+                let ownership = if self
+                    .active_summary
+                    .as_ref()
+                    .and_then(|summary| summary.openai_encrypted_content.as_ref())
+                    .is_some()
+                {
+                    "native"
+                } else {
+                    "rolling"
+                };
+                let summary_chars = self
+                    .active_summary
+                    .as_ref()
+                    .map(|summary| summary.text.len());
+                let active_messages = self.active_messages_count();
                 self.last_compaction = Some(CompactionEvent {
                     trigger: trigger.clone(),
+                    engine: Some("rolling".to_string()),
+                    ownership: Some(ownership.to_string()),
                     pre_tokens: Some(pre_tokens),
                     post_tokens: Some(post_tokens),
                     tokens_saved: Some(pre_tokens.saturating_sub(post_tokens)),
                     duration_ms: Some(result.duration_ms),
                     messages_dropped: None,
                     messages_compacted: Some(result.summarized_messages),
-                    summary_chars: self
-                        .active_summary
-                        .as_ref()
-                        .map(|summary| summary.text.len()),
-                    active_messages: Some(self.active_messages_count()),
+                    summary_chars,
+                    active_messages: Some(active_messages),
+                    ..CompactionEvent::default()
                 });
                 crate::logging::info(&format!(
                     "[TIMING] compaction_complete: trigger={}, duration={}ms, pre_tokens={}, post_tokens={}, tokens_saved={}, messages_compacted={}, summary_chars={}, active_messages={}",
@@ -1356,7 +2860,33 @@ impl CompactionManager {
 
     /// Check if compaction is in progress
     pub fn is_compacting(&self) -> bool {
-        self.pending_task.is_some()
+        self.pending_task.is_some() || self.prepared_lcm_context.is_some()
+    }
+
+    pub fn engine(&self) -> crate::config::CompactionEngine {
+        self.engine.clone()
+    }
+
+    /// Synchronize a long-lived manager with the authoritative runtime policy.
+    /// Changing engines invalidates every pending result because rolling and LCM
+    /// candidates have different ownership and publication contracts.
+    pub fn synchronize_engine(&mut self, engine: crate::config::CompactionEngine) -> bool {
+        if self.engine == engine {
+            return false;
+        }
+        self.cancel_pending_work();
+        if engine == crate::config::CompactionEngine::Lcm {
+            // A rolling/native projection may be encrypted, lossy, or tied to
+            // another provider. The first LCM leaf must therefore summarize the
+            // canonical raw prefix from message zero rather than claiming that
+            // an opaque legacy projection proves source it never exposed.
+            self.compacted_count = 0;
+            self.active_summary = None;
+            self.active_chars.invalidate();
+            self.observed_input_tokens = None;
+        }
+        self.engine = engine;
+        true
     }
 
     /// Get the active compaction mode
@@ -1469,6 +2999,9 @@ impl CompactionManager {
     /// exceed the token budget, progressively keeps fewer turns down to
     /// `MIN_TURNS_TO_KEEP`.
     pub fn hard_compact_with(&mut self, all_messages: &[Message]) -> Result<usize, String> {
+        if self.engine == crate::config::CompactionEngine::Lcm {
+            return Err("LCM owns context; use hard_lcm_compact_with".to_string());
+        }
         if self.clamp_compacted_count_to_messages(all_messages, "hard_compact_start") {
             self.log_compaction_state("hard_compact_clamped", "hard_compact", all_messages);
         }
@@ -1564,6 +3097,9 @@ impl CompactionManager {
         let post_tokens = self.effective_token_count_with(all_messages) as u64;
         self.last_compaction = Some(CompactionEvent {
             trigger: "hard_compact".to_string(),
+            engine: Some("rolling".to_string()),
+            ownership: Some("rolling".to_string()),
+            fallback_reason: Some("critical_local_emergency".to_string()),
             pre_tokens: Some(pre_tokens),
             post_tokens: Some(post_tokens),
             tokens_saved: Some(pre_tokens.saturating_sub(post_tokens)),
@@ -1575,6 +3111,7 @@ impl CompactionManager {
                 .as_ref()
                 .map(|summary| summary.text.len()),
             active_messages: Some(self.active_messages_count()),
+            ..CompactionEvent::default()
         });
         self.log_compaction_outcome(CompactionOutcomeLog {
             trigger: "hard_compact",
@@ -1699,6 +3236,450 @@ impl Default for CompactionManager {
     }
 }
 
+static LCM_SAFE_PROMPT_CHARS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LCM_SCHEDULER: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
+// Background hierarchy/leaf work may use at most three slots. Critical context
+// recovery and user-waiting transfers can therefore always enter the shared
+// FIFO scheduler without waiting behind a newly admitted background job.
+static LCM_BACKGROUND_SCHEDULER: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(3)));
+#[cfg(not(test))]
+const LCM_PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(test)]
+const LCM_PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(not(test))]
+const LCM_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(test)]
+const LCM_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LcmJobPriority {
+    Background,
+    Critical,
+}
+
+impl LcmJobPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+struct LcmSchedulerPermit {
+    _shared: tokio::sync::OwnedSemaphorePermit,
+    _background: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+async fn acquire_lcm_scheduler(priority: LcmJobPriority) -> Result<LcmSchedulerPermit> {
+    acquire_lcm_scheduler_from(
+        Arc::clone(&LCM_SCHEDULER),
+        Arc::clone(&LCM_BACKGROUND_SCHEDULER),
+        priority,
+        LCM_QUEUE_TIMEOUT,
+    )
+    .await
+}
+
+async fn acquire_lcm_scheduler_from(
+    shared_scheduler: Arc<tokio::sync::Semaphore>,
+    background_scheduler: Arc<tokio::sync::Semaphore>,
+    priority: LcmJobPriority,
+    queue_timeout: std::time::Duration,
+) -> Result<LcmSchedulerPermit> {
+    tokio::time::timeout(queue_timeout, async move {
+        let background = if priority == LcmJobPriority::Background {
+            Some(
+                background_scheduler
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("LCM background scheduler is closed"))?,
+            )
+        } else {
+            None
+        };
+        let shared = shared_scheduler
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("LCM scheduler is closed"))?;
+        Ok(LcmSchedulerPermit {
+            _shared: shared,
+            _background: background,
+        })
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "LCM {} scheduler queue timed out after {} ms",
+            priority.as_str(),
+            queue_timeout.as_millis()
+        )
+    })?
+}
+
+const LCM_SUMMARY_SYSTEM_PROMPT: &str = r#"You are the Jcode LCM context compactor.
+Return only stable Markdown with these sections: Objective and user intent; Explicit constraints and prohibited actions; Decisions and rationale; Repository state and exact paths/symbols/branches/commits; Changes actually completed; Commands and tests with actual outcomes; Failures, diagnosis, and unresolved blockers; Open questions and next steps; Retrieval anchors and source range.
+Separate observed facts from plans or assumptions. Preserve newer corrections and mark superseded decisions. Every non-placeholder content line must be `- [source] ` followed by one exact, contiguous excerpt copied verbatim from the observed source. Do not paraphrase or combine excerpts. Use `None observed.` when a section has no useful excerpt. Never claim an edit, commit, command, or test happened unless an exact source excerpt says it did. Do not include chain-of-thought, credentials, tokens, or raw tool blobs. Do not invent missing details."#;
+
+const LCM_REQUIRED_SECTIONS: [&str; 9] = [
+    "Objective and user intent",
+    "Explicit constraints and prohibited actions",
+    "Decisions and rationale",
+    "Repository state and exact paths/symbols/branches/commits",
+    "Changes actually completed",
+    "Commands and tests with actual outcomes",
+    "Failures, diagnosis, and unresolved blockers",
+    "Open questions and next steps",
+    "Retrieval anchors and source range",
+];
+
+fn compactor_safe_messages(messages: &[Message]) -> Vec<Message> {
+    let mut safe_messages = messages.to_vec();
+    for message in &mut safe_messages {
+        for block in &mut message.content {
+            match block {
+                ContentBlock::ToolUse { input, .. } => {
+                    *input = serde_json::json!({
+                        "payload": "omitted from compactor context; use conversation_search for canonical details"
+                    });
+                }
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let status = match is_error {
+                        Some(true) => "error",
+                        Some(false) => "success",
+                        None => "unknown",
+                    };
+                    *content = format!(
+                        "[tool result payload omitted from compactor context; status={status}; use conversation_search for canonical details]"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    safe_messages
+}
+
+fn lcm_safe_source_text(messages: &[Message], existing_summary: Option<&Summary>) -> String {
+    let safe_messages = compactor_safe_messages(messages);
+    crate::message::redact_secrets(&build_compaction_conversation_text(
+        &safe_messages,
+        existing_summary,
+    ))
+}
+
+fn build_lcm_compaction_prompt(
+    messages: &[Message],
+    existing_summary: Option<&Summary>,
+    max_prompt_chars: usize,
+) -> String {
+    let mut source = lcm_safe_source_text(messages, existing_summary);
+    const INSTRUCTION: &str = "Select only exact source excerpts according to the section schema in the system instruction. Prefix every excerpt with `- [source] ` and use every required heading even when its value is `None observed.`.";
+    const OMISSION: &str =
+        "\n\n... [middle source omitted from this chunk; use canonical retrieval anchors] ...\n\n";
+    let overhead = INSTRUCTION.len() + OMISSION.len() + 9;
+    if source.len().saturating_add(overhead) > max_prompt_chars && max_prompt_chars > overhead {
+        let budget = max_prompt_chars - overhead;
+        let head_budget = budget / 2;
+        let tail_budget = budget.saturating_sub(head_budget);
+        let head = jcode_compaction_core::truncate_str_boundary(&source, head_budget);
+        let mut tail_start = source.len().saturating_sub(tail_budget);
+        while tail_start < source.len() && !source.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        source = format!("{head}{OMISSION}{}", &source[tail_start..]);
+    }
+    format!("{source}\n\n---\n\n{INSTRUCTION}")
+}
+
+fn lcm_output_has_required_sections(summary: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    LCM_REQUIRED_SECTIONS
+        .iter()
+        .all(|section| lower.contains(&format!("# {}", section.to_ascii_lowercase())))
+}
+
+fn lcm_output_is_grounded(summary: &str, source: &str) -> bool {
+    summary.lines().all(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return true;
+        }
+        if line.starts_with('#') {
+            let heading = line.trim_start_matches('#').trim();
+            return LCM_REQUIRED_SECTIONS
+                .iter()
+                .any(|required| heading.eq_ignore_ascii_case(required));
+        }
+        let content = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line)
+            .trim();
+        if content.eq_ignore_ascii_case("none observed.")
+            || content.eq_ignore_ascii_case("none observed")
+        {
+            return true;
+        }
+        content.strip_prefix("[source] ").is_some_and(|excerpt| {
+            let excerpt = excerpt.trim();
+            !excerpt.is_empty()
+                && source
+                    .lines()
+                    .any(|source_line| source_line.trim() == excerpt)
+        })
+    })
+}
+
+fn is_lcm_context_limit_error(error: &anyhow::Error) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    (lower.contains("context")
+        && (lower.contains("limit")
+            || lower.contains("length")
+            || lower.contains("window")
+            || lower.contains("too long")))
+        || lower.contains("too many tokens")
+        || lower.contains("prompt is too long")
+        || lower.contains("prompt too long")
+        || lower.contains("input is too long")
+        || lower.contains("maximum token")
+        || lower.contains("max token")
+}
+
+fn lcm_prompt_budget(
+    provider: &dyn Provider,
+    route_identity: Option<&str>,
+) -> (String, usize, usize) {
+    let context_tokens = provider.context_window().max(4_096);
+    let output_reserve = (context_tokens / 8).clamp(1_024, 8_192);
+    let safety_reserve = (context_tokens / 10).max(1_024);
+    let prompt_chars = context_tokens
+        .saturating_sub(output_reserve)
+        .saturating_sub(safety_reserve)
+        .max(1_024)
+        .saturating_mul(CHARS_PER_TOKEN);
+    let route_key = route_identity
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}:{}", provider.name(), provider.model()));
+    let cached = LCM_SAFE_PROMPT_CHARS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&route_key)
+        .copied();
+    (
+        route_key,
+        cached.map_or(prompt_chars, |safe| safe.min(prompt_chars)),
+        output_reserve.saturating_mul(CHARS_PER_TOKEN),
+    )
+}
+
+fn lcm_output_is_concise(summary: &str, source_chars: usize, output_budget_chars: usize) -> bool {
+    let length = summary.trim().len();
+    length > 0 && length <= output_budget_chars && (length < source_chars || length <= 1_024)
+}
+
+fn lcm_message_chunks(messages: Vec<Message>, max_chars: usize) -> Vec<Vec<Message>> {
+    // A boundary after message `n - 1` is unsafe when a tool call is on its
+    // left and the corresponding result is on its right. This preserves exact
+    // IDs and ordering for parallel calls without forcing unrelated turns into
+    // the same chunk. Oversized individual transactions remain intact and rely
+    // on the bounded prompt renderer's per-result truncation.
+    let mut tool_calls = HashMap::new();
+    let mut resolved_tool_calls = std::collections::HashSet::new();
+    let mut unsafe_boundaries = vec![false; messages.len() + 1];
+    for (index, message) in messages.iter().enumerate() {
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    tool_calls.entry(id.clone()).or_insert(index);
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    if let Some(call_index) = tool_calls.get(tool_use_id).copied() {
+                        resolved_tool_calls.insert(tool_use_id.clone());
+                        let transaction_end = if messages
+                            .get(index + 1)
+                            .is_some_and(|next| next.role == Role::Assistant)
+                        {
+                            index + 1
+                        } else {
+                            index
+                        };
+                        for boundary in call_index.saturating_add(1)..=transaction_end {
+                            unsafe_boundaries[boundary] = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (tool_use_id, call_index) in &tool_calls {
+        if !resolved_tool_calls.contains(tool_use_id) && call_index + 1 < messages.len() {
+            unsafe_boundaries[call_index + 1] = true;
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars: usize = 0;
+    for (index, message) in messages.into_iter().enumerate() {
+        let chars = message_char_count(&message);
+        if !current.is_empty()
+            && current_chars.saturating_add(chars) > max_chars
+            && !unsafe_boundaries[index]
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars = current_chars.saturating_add(chars);
+        current.push(message);
+        if current_chars >= max_chars && !unsafe_boundaries[index + 1] {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+async fn complete_lcm_bounded(
+    provider: &Arc<dyn Provider>,
+    messages: &[Message],
+    existing_summary: Option<&Summary>,
+    max_prompt_chars: usize,
+    output_budget_chars: usize,
+) -> Result<String> {
+    let source_chars = messages.iter().map(message_char_count).sum::<usize>()
+        + existing_summary
+            .map(summary_payload_char_count)
+            .unwrap_or(0);
+    let canonical_source = lcm_safe_source_text(messages, existing_summary);
+    let prompt = build_lcm_compaction_prompt(messages, existing_summary, max_prompt_chars);
+    let summary = tokio::time::timeout(
+        LCM_PROVIDER_TIMEOUT,
+        provider.complete_simple(&prompt, LCM_SUMMARY_SYSTEM_PROMPT),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("LCM compactor provider call timed out"))??;
+    let summary = crate::message::redact_secrets(&summary);
+    if lcm_output_is_concise(&summary, source_chars, output_budget_chars)
+        && lcm_output_has_required_sections(&summary)
+        && lcm_output_is_grounded(&summary, &canonical_source)
+    {
+        return Ok(summary.trim().to_string());
+    }
+    let target_chars = output_budget_chars
+        .min(source_chars.saturating_sub(1))
+        .max(128);
+    let rewrite_prompt = format!(
+        "Rewrite the following candidate into at most {target_chars} characters. Use all nine exact required Markdown headings from the system instruction. Every retained content line must be `- [source] ` plus one exact contiguous excerpt from the original observed source; otherwise replace it with `None observed.`. Remove unsupported completion claims and secrets. Return only the rewrite.\n\n{summary}"
+    );
+    let rewritten = tokio::time::timeout(
+        LCM_PROVIDER_TIMEOUT,
+        provider.complete_simple(&rewrite_prompt, LCM_SUMMARY_SYSTEM_PROMPT),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("LCM compactor rewrite timed out"))??;
+    let rewritten = crate::message::redact_secrets(&rewritten);
+    if !lcm_output_is_concise(&rewritten, source_chars, output_budget_chars)
+        || !lcm_output_has_required_sections(&rewritten)
+        || !lcm_output_is_grounded(&rewritten, &canonical_source)
+    {
+        anyhow::bail!(
+            "LCM compactor output remained invalid, unsupported, or oversized after one rewrite"
+        );
+    }
+    Ok(rewritten.trim().to_string())
+}
+
+async fn summarize_lcm_source_with_budget(
+    provider: &Arc<dyn Provider>,
+    messages: Vec<Message>,
+    existing_summary: Option<Summary>,
+    max_prompt_chars: usize,
+    output_budget_chars: usize,
+) -> Result<String> {
+    let chunk_chars = (max_prompt_chars * 3 / 4).max(1_024);
+    let source_chars = messages.iter().map(message_char_count).sum::<usize>()
+        + existing_summary
+            .as_ref()
+            .map(summary_payload_char_count)
+            .unwrap_or(0);
+    if source_chars <= chunk_chars {
+        return complete_lcm_bounded(
+            provider,
+            &messages,
+            existing_summary.as_ref(),
+            max_prompt_chars,
+            output_budget_chars,
+        )
+        .await;
+    }
+
+    let mut summaries = Vec::new();
+    for (index, chunk) in lcm_message_chunks(messages, chunk_chars)
+        .into_iter()
+        .enumerate()
+    {
+        summaries.push(
+            complete_lcm_bounded(
+                provider,
+                &chunk,
+                (index == 0).then_some(existing_summary.as_ref()).flatten(),
+                max_prompt_chars,
+                output_budget_chars,
+            )
+            .await?,
+        );
+    }
+    if summaries.is_empty()
+        && let Some(existing) = existing_summary
+    {
+        summaries.push(existing.text);
+    }
+
+    while summaries.len() > 1 {
+        let summary_messages = summaries
+            .into_iter()
+            .enumerate()
+            .map(|(index, summary)| Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("[chronological LCM chunk {}]\n{summary}", index + 1),
+                    cache_control: None,
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            })
+            .collect::<Vec<_>>();
+        let groups = lcm_message_chunks(summary_messages, chunk_chars);
+        let mut reduced = Vec::with_capacity(groups.len());
+        for group in groups {
+            reduced.push(
+                complete_lcm_bounded(
+                    provider,
+                    &group,
+                    None,
+                    max_prompt_chars,
+                    output_budget_chars,
+                )
+                .await?,
+            );
+        }
+        summaries = reduced;
+    }
+    summaries
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("LCM source did not contain summarizable context"))
+}
+
 /// Generate summary using the provider
 async fn generate_compaction_artifact(
     provider: Arc<dyn Provider>,
@@ -1750,6 +3731,7 @@ async fn generate_compaction_artifact(
         } else {
             return Ok(CompactionResult {
                 summary_text: native.summary_text.unwrap_or_default(),
+                atomic_parent_summaries: Vec::new(),
                 openai_encrypted_content: native.openai_encrypted_content,
                 covers_up_to_turn: messages.len(),
                 duration_ms: start.elapsed().as_millis() as u64,
@@ -1759,7 +3741,12 @@ async fn generate_compaction_artifact(
     }
 
     let max_prompt_chars = provider.context_window().saturating_sub(4000) * CHARS_PER_TOKEN;
-    let prompt = build_compaction_prompt(&messages, existing_summary.as_ref(), max_prompt_chars);
+    let safe_messages = compactor_safe_messages(&messages);
+    let prompt = crate::message::redact_secrets(&build_compaction_prompt(
+        &safe_messages,
+        existing_summary.as_ref(),
+        max_prompt_chars,
+    ));
 
     // Generate summary using simple completion
     let summary = provider
@@ -1768,9 +3755,73 @@ async fn generate_compaction_artifact(
             "You are a helpful assistant that summarizes conversations.",
         )
         .await?;
+    let summary = crate::message::redact_secrets(&summary);
 
     Ok(CompactionResult {
         summary_text: summary,
+        atomic_parent_summaries: Vec::new(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: messages.len(),
+        duration_ms: start.elapsed().as_millis() as u64,
+        summarized_messages: messages.len(),
+    })
+}
+
+/// Generate a portable LCM leaf. Provider-native encrypted compaction is
+/// intentionally not consulted because graph nodes must remain replayable on
+/// every provider route.
+async fn generate_lcm_compaction_artifact(
+    provider: Arc<dyn Provider>,
+    messages: Vec<Message>,
+    existing_summary: Option<Summary>,
+    route_identity: Option<String>,
+    priority: LcmJobPriority,
+) -> Result<CompactionResult> {
+    let start = Instant::now();
+    let queued_at = Instant::now();
+    let permit = acquire_lcm_scheduler(priority).await?;
+    let queue_ms = queued_at.elapsed().as_millis() as u64;
+    crate::logging::event_info(
+        "LCM_SCHEDULER",
+        vec![
+            ("provider", provider.name().to_string()),
+            ("model", provider.model()),
+            ("priority", priority.as_str().to_string()),
+            ("queue_ms", queue_ms.to_string()),
+        ],
+    );
+    let (route_key, mut max_prompt_chars, output_budget_chars) =
+        lcm_prompt_budget(provider.as_ref(), route_identity.as_deref());
+    let mut attempts = 0;
+    let summary = loop {
+        match summarize_lcm_source_with_budget(
+            &provider,
+            messages.clone(),
+            existing_summary.clone(),
+            max_prompt_chars,
+            output_budget_chars,
+        )
+        .await
+        {
+            Ok(summary) => break summary,
+            Err(error) if attempts < 2 && is_lcm_context_limit_error(&error) => {
+                attempts += 1;
+                max_prompt_chars = (max_prompt_chars / 2).max(1_024);
+                LCM_SAFE_PROMPT_CHARS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(route_key.clone(), max_prompt_chars);
+                crate::logging::warn(&format!(
+                    "LCM compactor route {route_key} exceeded its declared context; retrying with {max_prompt_chars} prompt chars"
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    drop(permit);
+    Ok(CompactionResult {
+        summary_text: summary.trim().to_string(),
+        atomic_parent_summaries: Vec::new(),
         openai_encrypted_content: None,
         covers_up_to_turn: messages.len(),
         duration_ms: start.elapsed().as_millis() as u64,
@@ -1782,6 +3833,7 @@ pub async fn build_transfer_compaction_state(
     provider: Arc<dyn Provider>,
     messages: Vec<Message>,
     existing_state: Option<crate::session::StoredCompactionState>,
+    engine: crate::config::CompactionEngine,
 ) -> Result<Option<crate::session::StoredCompactionState>> {
     let existing_summary = existing_state.as_ref().map(|state| Summary {
         text: state.summary_text.clone(),
@@ -1801,7 +3853,18 @@ pub async fn build_transfer_compaction_state(
         .as_ref()
         .map(|state| state.original_turn_count.max(state.covers_up_to_turn))
         .unwrap_or(0);
-    let result = generate_compaction_artifact(provider, messages.clone(), existing_summary).await?;
+    let result = if engine == crate::config::CompactionEngine::Lcm {
+        generate_lcm_compaction_artifact(
+            provider,
+            messages.clone(),
+            existing_summary,
+            None,
+            LcmJobPriority::Critical,
+        )
+        .await?
+    } else {
+        generate_compaction_artifact(provider, messages.clone(), existing_summary).await?
+    };
     let total_turns = prior_turns + messages.len();
 
     Ok(Some(crate::session::StoredCompactionState {

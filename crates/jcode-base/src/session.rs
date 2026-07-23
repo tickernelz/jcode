@@ -205,6 +205,14 @@ pub struct Session {
     memory_profile_dirty: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContextGraphState {
+    context_nodes: Vec<StoredContextNode>,
+    context_frontier: Option<StoredContextFrontier>,
+    last_context_op_id: Option<String>,
+    last_context_op_sha256: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionStartupStub {
     id: String,
@@ -294,6 +302,178 @@ fn context_transaction_sha256(transaction: &ContextGraphTransaction) -> anyhow::
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn stored_messages_sha256(messages: &[StoredMessage]) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(messages)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn imported_context_root_id(
+    source_session_id: &str,
+    source_sha256: &str,
+    summary_text: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    // Imported roots are self-contained derived projections. Their identity is
+    // bound to the canonical source and portable summary, not to the first
+    // transfer child, so an exact-transcript split can inherit them unchanged.
+    digest.update(b"jcode-lcm-import-v2");
+    digest.update(source_session_id.as_bytes());
+    digest.update(source_sha256.as_bytes());
+    digest.update(summary_text.as_bytes());
+    format!("lcm-{:x}", digest.finalize())
+}
+
+fn validate_context_node_source_proofs(
+    current_session_id: &str,
+    messages: &[StoredMessage],
+    nodes: &[StoredContextNode],
+) -> Result<(), String> {
+    for node in nodes {
+        if let Some(summary_sha256) = node.summary_sha256.as_deref() {
+            let actual = format!("{:x}", Sha256::digest(node.summary_text.as_bytes()));
+            if summary_sha256 != actual {
+                return Err(format!(
+                    "context node {} portable summary proof is invalid",
+                    node.id
+                ));
+            }
+        }
+        if node.level == 0 {
+            if node.source_message_ids.is_empty() {
+                if node.source_session_id != current_session_id {
+                    continue;
+                }
+                return Err(format!("context leaf {} has no canonical source", node.id));
+            }
+            let source = node
+                .source_message_ids
+                .iter()
+                .map(|id| {
+                    messages
+                        .iter()
+                        .find(|message| message.id == *id)
+                        .ok_or_else(|| {
+                            format!("context leaf {} references missing message {id}", node.id)
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>();
+            if node.source_session_id != current_session_id && source.is_err() {
+                // Imported roots deliberately prove a canonical ancestor
+                // transcript that is not duplicated into the transfer child.
+                // Their hash and lineage remain available for authorized
+                // ancestor lookup, while the text projection is self-contained.
+                let expected_id = imported_context_root_id(
+                    &node.source_session_id,
+                    &node.source_sha256,
+                    &node.summary_text,
+                );
+                if node.id != expected_id {
+                    return Err(format!(
+                        "imported context root {} has an invalid portable proof",
+                        node.id
+                    ));
+                }
+                continue;
+            }
+            let source = source?;
+            let sha256 = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&source)
+                        .map_err(|error| format!("context leaf hashing failed: {error}"))?
+                )
+            );
+            if sha256 != node.source_sha256 {
+                return Err(format!("context leaf {} source proof is invalid", node.id));
+            }
+            continue;
+        }
+
+        let children = node
+            .child_node_ids
+            .iter()
+            .map(|id| {
+                nodes.iter().find(|child| child.id == *id).ok_or_else(|| {
+                    format!("context parent {} references missing child {id}", node.id)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sha256 = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&children)
+                    .map_err(|error| format!("context parent hashing failed: {error}"))?
+            )
+        );
+        if sha256 != node.source_sha256 {
+            return Err(format!(
+                "context parent {} source proof is invalid",
+                node.id
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let expected_source_ids = children
+            .iter()
+            .flat_map(|child| child.source_message_ids.iter().cloned())
+            .filter(|id| seen.insert(id.clone()))
+            .collect::<Vec<_>>();
+        if node.source_message_ids != expected_source_ids {
+            return Err(format!(
+                "context parent {} raw source coverage is invalid",
+                node.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_context_frontier_coverage(
+    messages: &[StoredMessage],
+    nodes: &[StoredContextNode],
+    frontier: &StoredContextFrontier,
+) -> Result<(), String> {
+    let positions = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id.as_str(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let by_id = nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut expected = 0;
+    for id in &frontier.active_node_ids {
+        let mut covered = by_id[id.as_str()]
+            .source_message_ids
+            .iter()
+            .filter_map(|message_id| positions.get(message_id.as_str()).copied())
+            .collect::<Vec<_>>();
+        if covered.is_empty() {
+            continue; // self-contained imported ancestor root
+        }
+        covered.sort_unstable();
+        covered.dedup();
+        if covered[0] != expected
+            || covered
+                .iter()
+                .enumerate()
+                .any(|(offset, position)| *position != expected + offset)
+        {
+            return Err(format!(
+                "context frontier node {id} is out of order, overlapping, or non-contiguous"
+            ));
+        }
+        expected += covered.len();
+    }
+    if expected != frontier.covered_message_count {
+        return Err(format!(
+            "context frontier covers {expected} canonical messages but declares {}",
+            frontier.covered_message_count
+        ));
+    }
+    Ok(())
+}
+
 pub fn derive_session_provider_key(provider_name: &str) -> Option<String> {
     let normalized_name = provider_name.trim().to_ascii_lowercase();
     if normalized_name == "jcode" {
@@ -337,6 +517,293 @@ pub fn derive_session_provider_key(provider_name: &str) -> Option<String> {
 }
 
 impl Session {
+    pub fn context_graph_state(&self) -> ContextGraphState {
+        ContextGraphState {
+            context_nodes: self.context_nodes.clone(),
+            context_frontier: self.context_frontier.clone(),
+            last_context_op_id: self.last_context_op_id.clone(),
+            last_context_op_sha256: self.last_context_op_sha256.clone(),
+        }
+    }
+
+    pub fn restore_context_graph_state(&mut self, state: ContextGraphState) {
+        self.context_nodes = state.context_nodes;
+        self.context_frontier = state.context_frontier;
+        self.last_context_op_id = state.last_context_op_id;
+        self.last_context_op_sha256 = state.last_context_op_sha256;
+        self.persist_state.pending_context_transaction = None;
+        self.persist_state.context_nodes_len = usize::MAX;
+    }
+
+    pub fn clear_context_graph_state(&mut self) {
+        self.context_nodes.clear();
+        self.context_frontier = None;
+        self.last_context_op_id = None;
+        self.last_context_op_sha256 = None;
+        self.persist_state.pending_context_transaction = None;
+        self.persist_state.context_nodes_len = usize::MAX;
+    }
+
+    /// Retain the maximal chronological graph prefix fully covered by the first
+    /// `new_len` canonical messages. Parents that straddle the rewind boundary
+    /// are expanded into their immutable children before the invalid suffix is
+    /// dropped. Call this before truncating `messages`.
+    pub fn retain_context_graph_prefix(&mut self, new_len: usize) -> anyhow::Result<()> {
+        let Some(old_frontier) = self.context_frontier.clone() else {
+            self.compaction = None;
+            return Ok(());
+        };
+        if new_len >= old_frontier.covered_message_count {
+            return Ok(());
+        }
+        let positions = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (message.id.clone(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let nodes_by_id = self
+            .context_nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        fn retain_node(
+            id: &str,
+            new_len: usize,
+            current_session_id: &str,
+            positions: &std::collections::HashMap<String, usize>,
+            nodes: &std::collections::HashMap<String, StoredContextNode>,
+            selected: &mut Vec<String>,
+        ) -> bool {
+            let node = &nodes[id];
+            let local_positions = node
+                .source_message_ids
+                .iter()
+                .filter_map(|message_id| positions.get(message_id.as_str()).copied())
+                .collect::<Vec<_>>();
+            let imported =
+                node.source_session_id != current_session_id && local_positions.is_empty();
+            if imported
+                || (!local_positions.is_empty()
+                    && local_positions.iter().all(|position| *position < new_len))
+            {
+                selected.push(node.id.clone());
+                return true;
+            }
+            if node.child_node_ids.is_empty() {
+                return false;
+            }
+            for child_id in &node.child_node_ids {
+                if !retain_node(
+                    child_id,
+                    new_len,
+                    current_session_id,
+                    positions,
+                    nodes,
+                    selected,
+                ) {
+                    return false;
+                }
+            }
+            false
+        }
+
+        let mut selected = Vec::new();
+        for id in &old_frontier.active_node_ids {
+            if !retain_node(
+                id,
+                new_len,
+                &self.id,
+                &positions,
+                &nodes_by_id,
+                &mut selected,
+            ) {
+                break;
+            }
+        }
+        if selected.is_empty() {
+            self.compaction = None;
+            self.clear_context_graph_state();
+            return Ok(());
+        }
+
+        let mut reachable = std::collections::HashSet::new();
+        fn mark_reachable(
+            id: &str,
+            nodes: &std::collections::HashMap<String, StoredContextNode>,
+            reachable: &mut std::collections::HashSet<String>,
+        ) {
+            if !reachable.insert(id.to_string()) {
+                return;
+            }
+            for child in &nodes[id].child_node_ids {
+                mark_reachable(child, nodes, reachable);
+            }
+        }
+        for id in &selected {
+            mark_reachable(id, &nodes_by_id, &mut reachable);
+        }
+        self.context_nodes
+            .retain(|node| reachable.contains(&node.id));
+        let covered = selected
+            .iter()
+            .filter_map(|id| nodes_by_id.get(id.as_str()))
+            .flat_map(|node| node.source_message_ids.iter())
+            .filter_map(|message_id| positions.get(message_id.as_str()).copied())
+            .max()
+            .map_or(0, |position| position + 1)
+            .min(new_len);
+        let projection_text = selected
+            .iter()
+            .filter_map(|id| nodes_by_id.get(id.as_str()))
+            .enumerate()
+            .map(|(index, node)| format!("[LCM context node {}]\n{}", index + 1, node.summary_text))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.context_frontier = Some(StoredContextFrontier {
+            schema_version: 1,
+            generation: old_frontier.generation.saturating_add(1),
+            active_node_ids: selected,
+            covered_message_count: covered,
+            covered_through_message_id: covered
+                .checked_sub(1)
+                .map(|index| self.messages[index].id.clone()),
+            source_prefix_sha256: if covered == 0 {
+                old_frontier.source_prefix_sha256
+            } else {
+                stored_messages_sha256(&self.messages[..covered])?
+            },
+            next_node_sequence: old_frontier.next_node_sequence,
+        });
+        self.compaction = Some(StoredCompactionState {
+            summary_text: projection_text,
+            openai_encrypted_content: None,
+            covers_up_to_turn: covered,
+            original_turn_count: covered,
+            compacted_count: covered,
+        });
+        self.last_context_op_id = None;
+        self.last_context_op_sha256 = None;
+        self.persist_state.pending_context_transaction = None;
+        self.persist_state.context_nodes_len = usize::MAX;
+        Ok(())
+    }
+
+    /// Inherit rebuildable LCM graph state when a lifecycle operation copies the
+    /// complete canonical transcript into a new child session. Immutable node
+    /// identities retain their original source-session namespace; the child only
+    /// receives nodes whose proofs validate against its copied transcript.
+    pub fn inherit_context_graph_from(&mut self, parent: &Session) -> anyhow::Result<()> {
+        let Some(parent_frontier) = parent.context_frontier.as_ref() else {
+            self.clear_context_graph_state();
+            return Ok(());
+        };
+        if self.messages.len() != parent.messages.len()
+            || stored_messages_sha256(&self.messages)? != stored_messages_sha256(&parent.messages)?
+        {
+            anyhow::bail!("LCM graph inheritance requires an exact canonical transcript copy");
+        }
+
+        let nodes = parent.context_nodes.clone();
+        let frontier = parent_frontier.clone();
+        validate_context_graph(&nodes, Some(&frontier)).map_err(anyhow::Error::msg)?;
+        validate_context_node_source_proofs(&self.id, &self.messages, &nodes)
+            .map_err(anyhow::Error::msg)?;
+        validate_context_frontier_coverage(&self.messages, &nodes, &frontier)
+            .map_err(anyhow::Error::msg)?;
+        self.context_nodes = nodes;
+        self.context_frontier = Some(frontier);
+        self.last_context_op_id = None;
+        self.last_context_op_sha256 = None;
+        self.persist_state.pending_context_transaction = None;
+        self.persist_state.context_nodes_len = usize::MAX;
+        Ok(())
+    }
+
+    /// Install a self-contained transfer summary while retaining an auditable
+    /// proof and lineage back to the canonical parent transcript. Transfer
+    /// children intentionally do not duplicate parent raw messages.
+    pub fn install_imported_context_root(
+        &mut self,
+        parent: &Session,
+        compaction: StoredCompactionState,
+    ) -> anyhow::Result<()> {
+        if !self.messages.is_empty() {
+            anyhow::bail!("LCM imported root requires an empty child transcript");
+        }
+        if self.parent_id.as_deref() != Some(parent.id.as_str()) {
+            anyhow::bail!("LCM imported root source must be the child's recorded parent");
+        }
+        if compaction.summary_text.trim().is_empty()
+            || compaction.openai_encrypted_content.is_some()
+        {
+            anyhow::bail!("LCM imported root requires a portable text summary");
+        }
+        let source_sha256 = stored_messages_sha256(&parent.messages)?;
+        let imported_summary = format!(
+            "{}\n\n## Retrieval anchor\nUse `conversation_search` against recorded ancestor session `{}` when exact canonical parent details are needed.",
+            compaction.summary_text.trim(),
+            parent.id
+        );
+        let node_id = imported_context_root_id(&parent.id, &source_sha256, &imported_summary);
+        let node = StoredContextNode {
+            id: node_id.clone(),
+            schema_version: 1,
+            level: 0,
+            source_session_id: parent.id.clone(),
+            source_message_ids: parent
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect(),
+            source_sha256: source_sha256.clone(),
+            child_node_ids: Vec::new(),
+            summary_text: imported_summary.clone(),
+            summary_sha256: Some(format!("{:x}", Sha256::digest(imported_summary.as_bytes()))),
+            estimated_tokens: ((imported_summary.len() + 3) / 4).max(1) as u64,
+            summarizer_model: parent
+                .model
+                .clone()
+                .unwrap_or_else(|| "inherited".to_string()),
+            summarizer_provider: parent
+                .provider_key
+                .clone()
+                .unwrap_or_else(|| "inherited".to_string()),
+            summarizer_route:
+                crate::provider::MultiProvider::model_switch_request_for_session_route(
+                    parent.model.as_deref().unwrap_or("inherited"),
+                    parent.provider_key.as_deref(),
+                    parent.route_api_method.as_deref(),
+                ),
+            prompt_schema_version: 1,
+            created_at: Utc::now(),
+        };
+        let frontier = StoredContextFrontier {
+            schema_version: 1,
+            generation: 1,
+            active_node_ids: vec![node_id],
+            covered_message_count: 0,
+            covered_through_message_id: None,
+            source_prefix_sha256: source_sha256,
+            next_node_sequence: 2,
+        };
+        validate_context_graph(std::slice::from_ref(&node), Some(&frontier))
+            .map_err(anyhow::Error::msg)?;
+        validate_context_node_source_proofs(&self.id, &self.messages, std::slice::from_ref(&node))
+            .map_err(anyhow::Error::msg)?;
+        validate_context_frontier_coverage(&self.messages, std::slice::from_ref(&node), &frontier)
+            .map_err(anyhow::Error::msg)?;
+        self.compaction = Some(compaction);
+        self.context_nodes = vec![node];
+        self.context_frontier = Some(frontier);
+        self.last_context_op_id = None;
+        self.last_context_op_sha256 = None;
+        self.persist_state.pending_context_transaction = None;
+        self.persist_state.context_nodes_len = usize::MAX;
+        Ok(())
+    }
+
     fn session_from_startup_stub(stub: SessionStartupStub) -> Self {
         let mut session = Self::create_with_id(stub.id, stub.parent_id, stub.title);
         session.custom_title = stub.custom_title;
@@ -549,6 +1016,11 @@ impl Session {
             memory_injections_len: self.memory_injections.len(),
             replay_events_len: self.replay_events.len(),
             context_nodes_len: self.context_nodes.len(),
+            context_generation: self
+                .context_frontier
+                .as_ref()
+                .map_or(0, |frontier| frontier.generation),
+            context_op_id: self.last_context_op_id.clone(),
             messages_mode: PersistVectorMode::Clean,
             env_snapshots_mode: PersistVectorMode::Clean,
             memory_injections_mode: PersistVectorMode::Clean,
@@ -601,6 +1073,184 @@ impl Session {
         {
             anyhow::bail!("invalid context transaction identity or SHA-256 proof");
         }
+        if transaction
+            .append_context_nodes
+            .iter()
+            .all(|node| node.level == 0)
+        {
+            let covered = transaction.frontier.covered_message_count;
+            if covered == 0 || covered > self.messages.len() {
+                anyhow::bail!("context transaction covers an invalid message prefix");
+            }
+            let source_start = self
+                .context_frontier
+                .as_ref()
+                .map_or(0, |frontier| frontier.covered_message_count)
+                .min(covered);
+            let source = &self.messages[source_start..covered];
+            let source_prefix = &self.messages[..covered];
+            if source.is_empty() {
+                anyhow::bail!("context transaction has an empty leaf source");
+            }
+            let source_ids: Vec<String> = source.iter().map(|message| message.id.clone()).collect();
+            let source_sha256 = stored_messages_sha256(source)?;
+            let source_prefix_sha256 = stored_messages_sha256(source_prefix)?;
+            if transaction.input_proof.source_message_ids != source_ids
+                || transaction.input_proof.source_sha256 != source_sha256
+                || transaction.frontier.source_prefix_sha256 != source_prefix_sha256
+                || transaction.frontier.covered_through_message_id.as_deref()
+                    != source_prefix.last().map(|message| message.id.as_str())
+                || transaction.append_context_nodes.iter().any(|node| {
+                    node.source_message_ids != source_ids || node.source_sha256 != source_sha256
+                })
+            {
+                anyhow::bail!("context transaction source proof does not match canonical history");
+            }
+        } else if transaction.append_context_nodes.len() >= 2
+            && transaction.append_context_nodes[0].level == 0
+            && transaction.append_context_nodes[1..]
+                .iter()
+                .all(|node| node.level > 0)
+        {
+            const FANOUT: usize = 4;
+            let current_frontier = self.context_frontier.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("atomic hierarchy carry requires an existing frontier")
+            })?;
+            let leaf = &transaction.append_context_nodes[0];
+            let covered = transaction.frontier.covered_message_count;
+            let source_start = current_frontier.covered_message_count;
+            if covered <= source_start || covered > self.messages.len() {
+                anyhow::bail!("atomic leaf-parent transaction covers an invalid message delta");
+            }
+            let source = &self.messages[source_start..covered];
+            let source_prefix = &self.messages[..covered];
+            let source_ids = source
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>();
+            let source_sha256 = stored_messages_sha256(source)?;
+            if transaction.input_proof.source_message_ids != source_ids
+                || transaction.input_proof.source_sha256 != source_sha256
+                || leaf.source_message_ids != source_ids
+                || leaf.source_sha256 != source_sha256
+                || transaction.frontier.source_prefix_sha256
+                    != stored_messages_sha256(source_prefix)?
+                || transaction.frontier.covered_through_message_id.as_deref()
+                    != source_prefix.last().map(|message| message.id.as_str())
+            {
+                anyhow::bail!("atomic leaf-parent canonical source proof is invalid");
+            }
+            let mut expected_frontier = current_frontier.active_node_ids.clone();
+            let mut carried_id = leaf.id.clone();
+            for (parent_offset, parent) in transaction.append_context_nodes[1..].iter().enumerate()
+            {
+                if expected_frontier.len() < FANOUT - 1 {
+                    anyhow::bail!(
+                        "atomic hierarchy carry lacks three active prior level-{} children",
+                        parent.level.saturating_sub(1)
+                    );
+                }
+                let retained = expected_frontier.len() - (FANOUT - 1);
+                let mut expected_child_ids = expected_frontier[retained..].to_vec();
+                expected_child_ids.push(carried_id.clone());
+                if parent.child_node_ids != expected_child_ids {
+                    anyhow::bail!(
+                        "atomic hierarchy parent children are not the adjacent frontier suffix"
+                    );
+                }
+                let available_new_nodes = &transaction.append_context_nodes[..=parent_offset];
+                let children = expected_child_ids
+                    .iter()
+                    .map(|child_id| {
+                        self.context_nodes
+                            .iter()
+                            .chain(available_new_nodes.iter())
+                            .find(|node| node.id == *child_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("context child node {child_id} is missing")
+                            })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                if children
+                    .iter()
+                    .any(|child| child.level != children[0].level)
+                    || parent.level != children[0].level.saturating_add(1)
+                {
+                    anyhow::bail!("atomic parent must directly exceed four equal-level children");
+                }
+                let children_sha256 =
+                    format!("{:x}", Sha256::digest(serde_json::to_vec(&children)?));
+                let mut seen = std::collections::HashSet::new();
+                let expected_source_ids = children
+                    .iter()
+                    .flat_map(|child| child.source_message_ids.iter().cloned())
+                    .filter(|id| seen.insert(id.clone()))
+                    .collect::<Vec<_>>();
+                if parent.source_sha256 != children_sha256
+                    || parent.source_message_ids != expected_source_ids
+                {
+                    anyhow::bail!("atomic parent source proof does not match its children");
+                }
+                expected_frontier.truncate(retained);
+                carried_id = parent.id.clone();
+            }
+            expected_frontier.push(carried_id);
+            if transaction.frontier.active_node_ids != expected_frontier {
+                anyhow::bail!("atomic hierarchy root was not installed as the frontier suffix");
+            }
+        } else {
+            let current_frontier = self.context_frontier.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("hierarchical transaction requires an existing frontier")
+            })?;
+            if transaction.frontier.covered_message_count != current_frontier.covered_message_count
+                || transaction.frontier.covered_through_message_id
+                    != current_frontier.covered_through_message_id
+                || transaction.frontier.source_prefix_sha256
+                    != current_frontier.source_prefix_sha256
+            {
+                anyhow::bail!("hierarchical transaction cannot change canonical source coverage");
+            }
+            if transaction.append_context_nodes.len() != 1 {
+                anyhow::bail!(
+                    "hierarchical context transactions must append exactly one parent node"
+                );
+            }
+            let parent = &transaction.append_context_nodes[0];
+            if parent.level == 0 || parent.child_node_ids.is_empty() {
+                anyhow::bail!("hierarchical context node must reference child nodes");
+            }
+            let children = parent
+                .child_node_ids
+                .iter()
+                .map(|child_id| {
+                    self.context_nodes
+                        .iter()
+                        .find(|node| node.id == *child_id)
+                        .ok_or_else(|| anyhow::anyhow!("context child node {child_id} is missing"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if children.iter().any(|child| child.level >= parent.level) {
+                anyhow::bail!("context parent level must exceed every child level");
+            }
+            if transaction.input_proof.source_message_ids != parent.child_node_ids {
+                anyhow::bail!("hierarchical input proof does not match child node order");
+            }
+            let children_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&children)?));
+            if transaction.input_proof.source_sha256 != children_sha256
+                || parent.source_sha256 != children_sha256
+            {
+                anyhow::bail!("hierarchical input proof hash does not match child nodes");
+            }
+            let mut seen = std::collections::HashSet::new();
+            let expected_source_ids = children
+                .iter()
+                .flat_map(|child| child.source_message_ids.iter().cloned())
+                .filter(|id| seen.insert(id.clone()))
+                .collect::<Vec<_>>();
+            if parent.source_message_ids != expected_source_ids {
+                anyhow::bail!("context parent raw source coverage does not match children");
+            }
+        }
         if persist && self.persist_state.pending_context_transaction.is_some() {
             anyhow::bail!("a context transaction is already pending persistence");
         }
@@ -613,13 +1263,11 @@ impl Session {
                 None => candidate.push(node.clone()),
             }
         }
-        if candidate
-            .iter()
-            .any(|node| node.source_session_id != self.id)
-        {
-            anyhow::bail!("context graph contains a node from another session");
-        }
         validate_context_graph(&candidate, Some(&transaction.frontier))
+            .map_err(anyhow::Error::msg)?;
+        validate_context_node_source_proofs(&self.id, &self.messages, &candidate)
+            .map_err(anyhow::Error::msg)?;
+        validate_context_frontier_coverage(&self.messages, &candidate, &transaction.frontier)
             .map_err(anyhow::Error::msg)?;
 
         self.context_nodes = candidate;
@@ -644,14 +1292,65 @@ impl Session {
     }
 
     fn discard_invalid_context_graph(&mut self) {
-        let validation = if self
-            .context_nodes
-            .iter()
-            .any(|node| node.source_session_id != self.id)
-        {
-            Err("context graph contains a node from another session".to_string())
+        let validation = if let Some(frontier) = self.context_frontier.as_ref() {
+            let covered = frontier.covered_message_count;
+            if covered == 0 && frontier.covered_through_message_id.is_none() {
+                validate_context_graph(&self.context_nodes, Some(frontier)).and_then(|()| {
+                    validate_context_node_source_proofs(
+                        &self.id,
+                        &self.messages,
+                        &self.context_nodes,
+                    )
+                    .and_then(|()| {
+                        validate_context_frontier_coverage(
+                            &self.messages,
+                            &self.context_nodes,
+                            frontier,
+                        )
+                    })
+                })
+            } else if covered > self.messages.len() {
+                Err("context frontier covers an invalid message prefix".to_string())
+            } else {
+                let source = &self.messages[..covered];
+                match stored_messages_sha256(source) {
+                    Ok(sha256)
+                        if sha256 == frontier.source_prefix_sha256
+                            && frontier.covered_through_message_id.as_deref()
+                                == source.last().map(|message| message.id.as_str()) =>
+                    {
+                        validate_context_graph(&self.context_nodes, Some(frontier)).and_then(|()| {
+                            validate_context_node_source_proofs(
+                                &self.id,
+                                &self.messages,
+                                &self.context_nodes,
+                            )
+                            .and_then(|()| {
+                                validate_context_frontier_coverage(
+                                    &self.messages,
+                                    &self.context_nodes,
+                                    frontier,
+                                )
+                            })
+                        })
+                    }
+                    Ok(_) => Err(
+                        "context frontier source proof does not match canonical history"
+                            .to_string(),
+                    ),
+                    Err(error) => Err(format!("context frontier source hashing failed: {error}")),
+                }
+            }
         } else {
-            validate_context_graph(&self.context_nodes, self.context_frontier.as_ref())
+            validate_context_graph(&self.context_nodes, self.context_frontier.as_ref()).and_then(
+                |()| {
+                    validate_context_node_source_proofs(
+                        &self.id,
+                        &self.messages,
+                        &self.context_nodes,
+                    )
+                },
+            )
         };
         if let Err(err) = validation {
             crate::logging::warn(&format!(
@@ -1084,7 +1783,7 @@ impl Session {
             return false;
         }
 
-        let Some(message) = self.messages.iter_mut().find(|message| {
+        let Some(message_index) = self.messages.iter().position(|message| {
             message.content.iter().any(|block| match block {
                 ContentBlock::Text { text, .. } => text.starts_with(SESSION_CONTEXT_PREFIX),
                 _ => false,
@@ -1096,7 +1795,8 @@ impl Session {
         let context =
             crate::prompt::build_session_context(self.working_dir.as_deref().map(Path::new));
         let wrapped = format!("<system-reminder>\n{}\n</system-reminder>", context.trim());
-        for block in &mut message.content {
+        let message_id = self.messages[message_index].id.clone();
+        for block in &mut self.messages[message_index].content {
             if let ContentBlock::Text { text, .. } = block
                 && text.starts_with(SESSION_CONTEXT_PREFIX)
             {
@@ -1104,6 +1804,14 @@ impl Session {
                     return false;
                 }
                 *text = wrapped;
+                if self.context_nodes.iter().any(|node| {
+                    node.source_message_ids
+                        .iter()
+                        .any(|source_id| source_id == &message_id)
+                }) {
+                    self.compaction = None;
+                    self.clear_context_graph_state();
+                }
                 self.mark_memory_profile_dirty();
                 self.mark_messages_full_dirty();
                 return true;
@@ -1318,6 +2026,14 @@ request in this new forked session, using the inherited conversation only as con
                 }
             }
         }
+        // The graph is rebuildable derived state and can duplicate credentials
+        // from raw history in model-written prose. Exporting it adds no recovery
+        // value, so omit it rather than relying on secret-pattern coverage.
+        redacted.context_nodes.clear();
+        redacted.context_frontier = None;
+        redacted.last_context_op_id = None;
+        redacted.last_context_op_sha256 = None;
+        redacted.persist_state.pending_context_transaction = None;
         redacted
     }
 
@@ -1412,18 +2128,29 @@ request in this new forked session, using the inherited conversation only as con
 
     pub fn insert_message(&mut self, index: usize, message: StoredMessage) {
         self.messages.insert(index, message);
+        self.compaction = None;
+        self.clear_context_graph_state();
         self.mark_memory_profile_dirty();
         self.mark_messages_full_dirty();
     }
 
     pub fn replace_messages(&mut self, messages: Vec<StoredMessage>) {
         self.messages = messages;
+        self.compaction = None;
+        self.clear_context_graph_state();
         self.mark_memory_profile_dirty();
         self.mark_messages_full_dirty();
     }
 
     pub fn truncate_messages(&mut self, len: usize) {
         if len < self.messages.len() {
+            if let Err(error) = self.retain_context_graph_prefix(len) {
+                crate::logging::warn(&format!(
+                    "Failed to retain valid LCM transcript prefix; falling back to raw history: {error}"
+                ));
+                self.compaction = None;
+                self.clear_context_graph_state();
+            }
             self.messages.truncate(len);
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
@@ -1448,6 +2175,8 @@ request in this new forked session, using the inherited conversation only as con
             target_total_chars,
         );
         if stripped > 0 {
+            self.compaction = None;
+            self.clear_context_graph_state();
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
         }
@@ -1675,6 +2404,7 @@ request in this new forked session, using the inherited conversation only as con
     pub fn strip_transcript_for_remote_client(&mut self) {
         self.messages.clear();
         self.compaction = None;
+        self.clear_context_graph_state();
         self.env_snapshots.clear();
         self.memory_injections.clear();
         self.replay_events.clear();
@@ -1686,14 +2416,28 @@ request in this new forked session, using the inherited conversation only as con
     /// Remove all ToolUse content blocks from a specific message.
     /// Used when tool calls are discarded (e.g. due to truncated output / max_tokens).
     pub fn remove_tool_use_blocks(&mut self, message_id: &str) {
+        let mut changed = false;
         for msg in &mut self.messages {
             if msg.id == *message_id {
+                let old_len = msg.content.len();
                 msg.content
                     .retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
-                self.mark_memory_profile_dirty();
-                self.mark_messages_full_dirty();
+                changed = msg.content.len() != old_len;
                 break;
             }
+        }
+        if changed {
+            let invalidates_graph = self.context_nodes.iter().any(|node| {
+                node.source_message_ids
+                    .iter()
+                    .any(|source_id| source_id == message_id)
+            });
+            if invalidates_graph {
+                self.compaction = None;
+                self.clear_context_graph_state();
+            }
+            self.mark_memory_profile_dirty();
+            self.mark_messages_full_dirty();
         }
     }
 }

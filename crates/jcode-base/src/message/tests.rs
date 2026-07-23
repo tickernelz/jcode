@@ -318,6 +318,26 @@ fn redact_secrets_leaves_normal_output_unchanged() {
 }
 
 #[test]
+fn redact_secrets_covers_database_and_generic_credentials() {
+    let input = concat!(
+        "AWS_SESSION_TOKEN=temporary-session-token-value\n",
+        "credential=opaque-credential-value\n",
+        "DATABASE_URL=postgres://user:database-password@example.test/db\n",
+        "redis://default:redis-password@example.test/0\n",
+    );
+    let output = redact_secrets(input);
+    for secret in [
+        "temporary-session-token-value",
+        "opaque-credential-value",
+        "database-password",
+        "redis-password",
+    ] {
+        assert!(!output.contains(secret), "secret survived: {secret}");
+    }
+    assert!(output.matches("[REDACTED_SECRET]").count() >= 4);
+}
+
+#[test]
 fn format_timestamp_is_stable_utc_rfc3339() -> Result<()> {
     let ts = chrono::DateTime::parse_from_rfc3339("2025-03-15T02:24:13.250Z")?.with_timezone(&Utc);
     assert_eq!(Message::format_timestamp(&ts), "2025-03-15T02:24:13.250Z");

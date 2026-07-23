@@ -8,7 +8,7 @@
 - Initiative: `jcode-native-lcm-context-engine`
 - Branch: `feat/native-lcm-context-engine`
 - Baseline commit: `6e443c82e456a2e51015e5555a5fcb52f439d410`
-- Current phase: **Phase 3, opt-in depth-zero LCM**
+- Current phase: **Phase 3/4 hardening, opt-in LCM plus lifecycle and hierarchy**
 - Overall status: **in progress**
 - Last updated: **2026-07-23**
 
@@ -17,10 +17,10 @@
 | 0. Baseline and correctness prerequisites | Complete | Stable prefix fingerprint; reset/restore/rewind cancel stale work; undo restores exact durable compaction state |
 | 1. Minimal control plane | Complete | `rolling|lcm` engine config; route-preserving compaction model; local and authoritative remote `/agents compaction` plus `/agents lcm` |
 | 2. Durable graph persistence | Complete | Versioned graph transaction; staged durable commit-before-publication; sequenced/watermarked journal recovery; fault and legacy tests |
-| 3. Opt-in depth-zero LCM | In progress | Implementation started only after Phase 0–2 focused gates passed |
-| 4. Lifecycle and hierarchy | Pending | |
-| 5. Canary and validation gates | Pending | |
-| 6. Default promotion | Pending | |
+| 3. Opt-in depth-zero LCM | In progress | Native Rust leaf generation, adaptive compactor ceiling, typed inherited routes, provider-independent graph, structured output validation, critical fallback chain, and focused safety tests implemented; full provider/fault/quality gates remain |
+| 4. Lifecycle and hierarchy | In progress | Immutable fanout-4 hierarchy, recursive same-generation carry, rewind/reload validation, transfer engine snapshot, export stripping, retrieval anchors, and lifecycle guards implemented; full lifecycle and swarm certification remain |
+| 5. Canary and validation gates | Blocked | No real provider matrix, external quality comparison, cache/journal benchmark, fault campaign, canary, or rollback evidence yet |
+| 6. Default promotion | Blocked | `rolling` remains default; synthetic planted-fact control is not promotion evidence |
 
 ## Progress log
 
@@ -40,11 +40,28 @@
 - Runtime graph publication now clones and validates a candidate, durably checkpoints it, and only then swaps it into the live session. Write failure leaves live graph state unchanged.
 - Remaining filesystem caveat is explicit: Unix durable snapshots fsync the file and attempt parent-directory fsync, but the existing storage helper ignores directory-sync errors; non-Unix replacement retains the existing brief missing-primary limitation.
 
+### 2026-07-23: Phase 3/4 native LCM implementation and hardening
+
+- LCM now uses the canonical raw session journal as source and publishes rebuildable derived graph state through prepare, validate, durable persist, then live publish. Frontier coverage is revalidated on load, recovery, inheritance, imported roots, and candidate commit.
+- Graph nodes are immutable and digest-bound. Fanout-4 parent proof preserves ordered children, raw coverage union, chronological antichain frontier, rewind expansion, and reload validation. A new leaf now recursively carries through every full hierarchy suffix in one graph generation, rather than only creating a level-1 parent.
+- Imported roots are deterministically bound to recorded source identity, parent transcript hash, and portable summary, but not to the first transfer-child ID, so exact-transcript split descendants can inherit and reload them unchanged. Export strips all derived context graph state so model-written summaries cannot leak through exported sessions.
+- Switching from rolling/provider-native to LCM clears opaque or encrypted manager projection and rebuilds from canonical raw history. OpenAI provider-native auto-compaction is suppressed while LCM owns compaction. Rolling and provider-native paths remain available when LCM is not selected.
+- Compactor routing now activates inherited routes with typed runtime identity, covering named OpenAI-compatible profiles, OpenAI OAuth/API-key routes, Gemini Code Assist OAuth, and OpenRouter provider preference. Explicit `compaction.model` remains a full route-spec config boundary. The stale-candidate fingerprint includes config/provider profiles, exact session route fields, exact active account labels, and monotonic auth generation. Critical active-route fallback is also bound to the selected-model policy snapshot.
+- LCM has one unambiguous nine-section system schema. The legacy rolling instruction is no longer appended. Opaque tool inputs/results are structurally omitted before rolling or LCM model-written compaction, while tool IDs/names and success/error/unknown status remain explicit evidence. Remaining canonical source is secret-redacted before crossing the provider boundary. Every persisted provider-written LCM content line must be an exact contiguous excerpt from that safe source, so invented credentials and semantic-equivalent unsupported completion claims fail closed rather than relying on a bounded phrase list; one rewrite is allowed before failure.
+- Critical recovery is bounded and ordered: selected compactor route, active session route, internally consistent first-generation textual legacy summary, then deterministic local emergency compaction. Telemetry records the complete fallback path. Encrypted, iterative, inconsistent, or out-of-range legacy projections are rejected.
+- Tool calls/results retain exact call IDs, redacted inputs, result IDs and status, head/tail oversized-result evidence, parallel-call grouping, and consuming assistant response. `conversation_search` can search tool inputs, execute inclusive durable message-ID anchors, and retrieve bounded redacted canonical payload continuations by character offset.
+- The process-wide LCM scheduler is capped at four jobs with background admission capped at three, reserving one slot for critical or user-waiting work. Queue wait and provider execution are independently timeout-bounded, cancellation releases both permits, and critical synchronous waits use Tokio `block_in_place` so spawned compactor futures are not starved. Adaptive prompt ceilings are keyed by captured exact route identity.
+- Server compaction events expose optional engine, ownership, configured/effective route, fallback path, leaf/parent/frontier counts, maximum level, graph generation, and exact recovery counts. Context-limit auto-recovery now forwards the committed detailed event instead of replacing it with empty synthetic telemetry. The completion bus edge retries briefly until the Tokio task result is visible. Old payload/client shapes remain compatible through optional fields and unknown-field tolerance.
+- Local and server transfer paths capture one immutable engine decision and pass it through route selection, artifact generation, and child installation. LCM remains mutually exclusive with rolling/provider-native assembly.
+- All session writers now share a per-session cross-process Unix `flock`; graph publication and ordinary saves compare the durable journal sequence and graph generation/operation before writing. Concurrent loaded writers fail closed instead of silently discarding a committed transcript or graph generation, while deliberate rewind generation advances remain valid.
+- A deterministic 30-trace planted-fact scorecard exists only as a synthetic regression control. It is not evidence that LCM is better than Hermes or ready to become default.
+
 ## Decisions and deviations
 
 Record any approved or evidence-driven deviation here before changing the plan below.
 
-- None.
+- Phase 4 hierarchy/lifecycle implementation began before Phase 3 received external provider and quality certification because the durability and lifecycle seams had to be exercised together. This does not relax any canary or promotion gate.
+- Context-limit classification accepts common provider phrases that omit the word `context` (for example `too many tokens` and `prompt is too long`) while still excluding unrelated failures.
 
 ## Verification log
 
@@ -68,6 +85,19 @@ Record any approved or evidence-driven deviation here before changing the plan b
 - `jcode-session-types`: 10 passed, including duplicate, missing-child, and cycle graph rejection.
 - Focused compaction same-length divergence, Agent rewind/undo, config, protocol, remote-authority, reconnect, and picker tests passed in worker runs and were rerun after integration.
 - A combined full-library attempt reached 1,011 `jcode-app-core` tests and reproduced the baseline `tool::batch::batch_tests::test_schema_only_requires_tool` failure. A separate parallel `jcode-base` run exposed five environment/order-sensitive unrelated tests; those paths were untouched and remain outside the LCM focused gate. Final Phase 5 certification must compare fresh isolated runs against the detached baseline.
+
+### 2026-07-23: Phase 3/4 hardening gates
+
+- `cargo fmt --all` and combined `cargo check --tests` passed for the final affected set: `jcode-compaction-core`, `jcode-base`, `jcode-provider-gemini-runtime`, `jcode-app-core`, and `jcode-tui`; the final `--check` and diff gate are repeated immediately before commit.
+- All 27 focused `lcm_` tests passed, including adaptive provider ceilings, exact typed route/account policy, opaque tool-payload exclusion, extractive source grounding for arbitrary provider output and completion claims, selected/active/timeout/legacy/local critical fallback, iterative legacy rejection, scheduler capacity/reservation/cancellation/queue timeout, failed/missing/orphan tool evidence, fourth-leaf atomic publication, recursive level-2 carry plus rewind/reload, restart ownership, durability failure, and planted-fact control.
+- Full serial compaction suite: 63 passed. The normal parallel compaction run is intentionally not used as certification because test-only `JCODE_HOME`/config sandboxes race process-global config; the serial rerun was green.
+- `jcode-session-types`: 10 passed. `jcode-compaction-core`: 18 passed. Session persistence/recovery: 67 passed, including stale concurrent-writer rejection, transferred-root split/reload, and graph-safe covered-message edits/direct transcript truncation. Unix writers use `flock`; the Windows path now uses `LockFileEx`/`UnlockFileEx` and was isolated-target type-checked. Conversation retrieval: 8 passed, including deterministic ordinary-content `response_offset` pagination and explicit next-message anchors after the 50-message cap. Full shared message/redaction suite: 50 passed. Gemini runtime: 30 passed, including typed Code Assist OAuth pinning and fork isolation.
+- Server completion-edge test passed. Protocol old-server and old-client compaction compatibility tests passed. OpenAI LCM/provider-native exclusivity test passed.
+- Focused TUI results passed: remote compaction telemetry 2, authoritative compaction model/reconnect 4, `/agents lcm` alias 1, rewind/undo 5, local/remote transfer 3, explicit transfer-install snapshot 1, and exact OpenRouter provider-pin persistence 1. Focused Agent rewind and native-compaction coexistence regressions passed. Conversation recovery-telemetry mapping and Gemini typed-route focused tests also passed.
+- Entire `jcode-base` serial library run executed 1,162 tests: 1,157 passed and five unrelated existing environment/catalog/config tests failed (`openrouter_like_status_is_provider_specific`, `config_env_fingerprint_tracks_every_apply_env_override_var`, two OpenCode catalog-route tests, and localhost OpenAI-compatible profile configuration). No failed assertion concerns LCM behavior, though `config.rs` is touched only to re-export `CompactionEngine`. These are not counted as green certification and must still be baseline-compared in Phase 5.
+- The synthetic 30-trace control recovered 150/150 planted facts with a 0.497 character ratio after full-line extractive grounding. This remains synthetic regression evidence only.
+- Independent read-only audits found concrete graph-CAS, route/auth, scheduler, stale-fallback, restart, prompt-secret, output-grounding, imported-split, retrieval-continuation, transfer-snapshot, recovery-telemetry, cross-platform writer-lock, and canonical-transcript mutation defects. Those findings were fixed and covered by focused regressions. The targeted post-fix re-audit found no remaining concrete correctness/security blocker in its four final areas.
+- **Promotion remains blocked:** no objective real-provider route/account matrix, external Hermes-versus-LCM quality corpus, real token/latency/cache-hit/journal-amplification benchmark, comprehensive fault injection, scheduler fairness/queue-p95 evidence, real Windows compile/runtime contention run, multi-hop/multibyte retrieval campaign, canary deployment, rollback drill, or production observation window exists yet.
 
 ---
 

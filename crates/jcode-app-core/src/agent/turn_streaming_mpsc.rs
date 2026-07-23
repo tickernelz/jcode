@@ -1,5 +1,29 @@
 use super::*;
 
+fn server_event_for_compaction(event: &CompactionEvent) -> ServerEvent {
+    ServerEvent::Compaction {
+        trigger: event.trigger.clone(),
+        engine: event.engine.clone(),
+        ownership: event.ownership.clone(),
+        configured_route: event.configured_route.clone(),
+        effective_route: event.effective_route.clone(),
+        fallback_reason: event.fallback_reason.clone(),
+        leaf_count: event.leaf_count,
+        parent_count: event.parent_count,
+        frontier_size: event.frontier_size,
+        max_node_level: event.max_node_level,
+        graph_generation: event.graph_generation,
+        pre_tokens: event.pre_tokens,
+        post_tokens: event.post_tokens,
+        tokens_saved: event.tokens_saved,
+        duration_ms: event.duration_ms,
+        messages_dropped: event.messages_dropped,
+        messages_compacted: event.messages_compacted,
+        summary_chars: event.summary_chars,
+        active_messages: event.active_messages,
+    }
+}
+
 /// Largest byte index `<= index` that is a UTF-8 char boundary in `text`.
 /// Equivalent to the unstable `str::floor_char_boundary`, reimplemented so the
 /// incremental marker scan can clamp its scan-window start onto a valid
@@ -117,17 +141,7 @@ impl Agent {
                         .map(|t| format!(" {} tokens", t))
                         .unwrap_or_default()
                 ));
-                let _ = event_tx.send(ServerEvent::Compaction {
-                    trigger: event.trigger.clone(),
-                    pre_tokens: event.pre_tokens,
-                    post_tokens: event.post_tokens,
-                    tokens_saved: event.tokens_saved,
-                    duration_ms: event.duration_ms,
-                    messages_dropped: None,
-                    messages_compacted: event.messages_compacted,
-                    summary_chars: event.summary_chars,
-                    active_messages: event.active_messages,
-                });
+                let _ = event_tx.send(server_event_for_compaction(&event));
             }
 
             let tools = self.tool_definitions().await;
@@ -249,7 +263,9 @@ impl Agent {
                             match result {
                                 Ok(stream) => break stream,
                                 Err(e) => {
-                                    if self.try_auto_compact_after_context_limit(&e.to_string()) {
+                                    if let Some(compaction_event) =
+                                        self.try_auto_compact_after_context_limit(&e.to_string())
+                                    {
                                         context_limit_retries += 1;
                                         if context_limit_retries > Self::MAX_CONTEXT_LIMIT_RETRIES {
                                             logging::warn(
@@ -260,17 +276,8 @@ impl Agent {
                                                 Self::MAX_CONTEXT_LIMIT_RETRIES
                                             ));
                                         }
-                                        let _ = event_tx.send(ServerEvent::Compaction {
-                                            trigger: "auto_recovery".to_string(),
-                                            pre_tokens: None,
-                                            post_tokens: None,
-                                            tokens_saved: None,
-                                            duration_ms: None,
-                                            messages_dropped: None,
-                                            messages_compacted: None,
-                                            summary_chars: None,
-                                            active_messages: None,
-                                        });
+                                        let _ = event_tx
+                                            .send(server_event_for_compaction(&compaction_event));
                                         continue;
                                     }
                                     return Err(e);
@@ -403,7 +410,9 @@ impl Agent {
                     Ok(event) => event,
                     Err(e) => {
                         let err_str = e.to_string();
-                        if self.try_auto_compact_after_context_limit(&err_str) {
+                        if let Some(compaction_event) =
+                            self.try_auto_compact_after_context_limit(&err_str)
+                        {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
                                 self,
@@ -429,17 +438,7 @@ impl Agent {
                                 ));
                             }
                             retry_after_compaction = true;
-                            let _ = event_tx.send(ServerEvent::Compaction {
-                                trigger: "auto_recovery".to_string(),
-                                pre_tokens: None,
-                                post_tokens: None,
-                                tokens_saved: None,
-                                duration_ms: None,
-                                messages_dropped: None,
-                                messages_compacted: None,
-                                summary_chars: None,
-                                active_messages: None,
-                            });
+                            let _ = event_tx.send(server_event_for_compaction(&compaction_event));
                             break;
                         }
                         log_agent_provider_stream_lifecycle(
@@ -802,6 +801,14 @@ impl Agent {
                         openai_encrypted_content,
                         ..
                     } => {
+                        if crate::config::config().compaction.engine
+                            == crate::config::CompactionEngine::Lcm
+                        {
+                            logging::warn(
+                                "Ignoring provider-native compaction event because LCM owns context",
+                            );
+                            continue;
+                        }
                         if let Some(encrypted_content) = openai_encrypted_content {
                             openai_native_compaction
                                 .get_or_insert((encrypted_content, self.session.messages.len()));
@@ -846,7 +853,9 @@ impl Agent {
                         message,
                         retry_after_secs,
                     } => {
-                        if self.try_auto_compact_after_context_limit(&message) {
+                        if let Some(compaction_event) =
+                            self.try_auto_compact_after_context_limit(&message)
+                        {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
                                 self,
@@ -872,17 +881,7 @@ impl Agent {
                                 ));
                             }
                             retry_after_compaction = true;
-                            let _ = event_tx.send(ServerEvent::Compaction {
-                                trigger: "auto_recovery".to_string(),
-                                pre_tokens: None,
-                                post_tokens: None,
-                                tokens_saved: None,
-                                duration_ms: None,
-                                messages_dropped: None,
-                                messages_compacted: None,
-                                summary_chars: None,
-                                active_messages: None,
-                            });
+                            let _ = event_tx.send(server_event_for_compaction(&compaction_event));
                             break;
                         }
                         log_agent_provider_stream_lifecycle(
@@ -1095,6 +1094,20 @@ impl Agent {
                 // append-only baseline before seeing the compacted signature.
                 let _ = event_tx.send(ServerEvent::Compaction {
                     trigger: "openai_native".to_string(),
+                    engine: Some("rolling".to_string()),
+                    ownership: Some("provider_native".to_string()),
+                    configured_route: None,
+                    effective_route: Some(format!(
+                        "{}:{}",
+                        self.provider.name(),
+                        self.provider.model()
+                    )),
+                    fallback_reason: None,
+                    leaf_count: None,
+                    parent_count: None,
+                    frontier_size: None,
+                    max_node_level: None,
+                    graph_generation: None,
                     pre_tokens: usage_input,
                     post_tokens: None,
                     tokens_saved: None,
@@ -1615,6 +1628,41 @@ mod tests {
 
         assert!(is_error);
         assert!(message.contains("interrupted by server reload"));
+    }
+
+    #[test]
+    fn auto_recovery_compaction_event_preserves_lcm_details() {
+        let event = CompactionEvent {
+            trigger: "critical_local_emergency_chain".to_string(),
+            engine: Some("lcm".to_string()),
+            effective_route: Some("local:emergency".to_string()),
+            fallback_reason: Some("selected>a>active>b>local".to_string()),
+            graph_generation: Some(7),
+            messages_compacted: Some(12),
+            messages_dropped: Some(12),
+            ..CompactionEvent::default()
+        };
+        let ServerEvent::Compaction {
+            engine,
+            effective_route,
+            fallback_reason,
+            graph_generation,
+            messages_compacted,
+            messages_dropped,
+            ..
+        } = server_event_for_compaction(&event)
+        else {
+            panic!("expected compaction event")
+        };
+        assert_eq!(engine.as_deref(), Some("lcm"));
+        assert_eq!(effective_route.as_deref(), Some("local:emergency"));
+        assert_eq!(
+            fallback_reason.as_deref(),
+            Some("selected>a>active>b>local")
+        );
+        assert_eq!(graph_generation, Some(7));
+        assert_eq!(messages_compacted, Some(12));
+        assert_eq!(messages_dropped, Some(12));
     }
 
     /// Reference O(n) full scan, preserving the original precedence: the

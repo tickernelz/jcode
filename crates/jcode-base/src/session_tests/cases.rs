@@ -17,6 +17,7 @@ fn context_transaction(session_id: &str, op_id: &str) -> ContextGraphTransaction
             source_sha256: "a".repeat(64),
             child_node_ids: Vec::new(),
             summary_text: format!("summary-{op_id}"),
+            summary_sha256: None,
             estimated_tokens: 4,
             summarizer_model: "model".to_string(),
             summarizer_provider: "provider".to_string(),
@@ -42,6 +43,98 @@ fn context_transaction(session_id: &str, op_id: &str) -> ContextGraphTransaction
     }
 }
 
+fn seed_context_source(session: &mut Session) {
+    session.messages.push(StoredMessage {
+        id: "message-1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "canonical source".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+}
+
+fn canonical_context_transaction(session: &Session, op_id: &str) -> ContextGraphTransaction {
+    use sha2::{Digest, Sha256};
+    let mut transaction = context_transaction(&session.id, op_id);
+    let source_start = session
+        .context_frontier
+        .as_ref()
+        .map_or(0, |frontier| frontier.covered_message_count);
+    let source = &session.messages[source_start..];
+    let source_ids: Vec<String> = source.iter().map(|message| message.id.clone()).collect();
+    let source_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(source).unwrap()));
+    let prefix_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&session.messages).unwrap())
+    );
+    transaction.append_context_nodes[0].source_message_ids = source_ids.clone();
+    transaction.append_context_nodes[0].source_sha256 = source_sha256.clone();
+    transaction.frontier.covered_message_count = session.messages.len();
+    transaction.frontier.covered_through_message_id =
+        session.messages.last().map(|message| message.id.clone());
+    transaction.frontier.source_prefix_sha256 = prefix_sha256;
+    if let Some(frontier) = session.context_frontier.as_ref() {
+        let new_node_id = transaction.append_context_nodes[0].id.clone();
+        transaction.frontier.active_node_ids = frontier.active_node_ids.clone();
+        transaction.frontier.active_node_ids.push(new_node_id);
+    }
+    transaction.input_proof.source_message_ids = source_ids;
+    transaction.input_proof.source_sha256 = source_sha256;
+    transaction
+}
+
+#[test]
+fn transcript_mutations_preserve_or_invalidate_context_graph_proofs() -> Result<()> {
+    let mut session = Session::create_with_id("context_graph_mutation".to_string(), None, None);
+    seed_context_source(&mut session);
+    session.messages[0].content.push(ContentBlock::ToolUse {
+        id: "covered-tool".to_string(),
+        name: "bash".to_string(),
+        input: serde_json::json!({"command": "true"}),
+        thought_signature: None,
+    });
+    session.apply_context_graph_transaction(canonical_context_transaction(&session, "first"))?;
+    session.compaction = Some(StoredCompactionState {
+        summary_text: "derived projection".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    });
+
+    let tail_id = session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "tail-tool".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "true"}),
+            thought_signature: None,
+        }],
+    );
+    session.remove_tool_use_blocks(&tail_id);
+    assert!(session.context_frontier.is_some());
+    assert!(session.compaction.is_some());
+
+    session.remove_tool_use_blocks("message-1");
+    assert!(session.context_nodes.is_empty());
+    assert!(session.context_frontier.is_none());
+    assert!(session.compaction.is_none());
+
+    let mut truncated = Session::create_with_id("context_graph_truncate".to_string(), None, None);
+    seed_context_source(&mut truncated);
+    truncated
+        .apply_context_graph_transaction(canonical_context_transaction(&truncated, "second"))?;
+    truncated.truncate_messages(0);
+    assert!(truncated.context_nodes.is_empty());
+    assert!(truncated.context_frontier.is_none());
+    Ok(())
+}
+
 #[test]
 fn context_graph_snapshot_and_journal_store_nodes_once() -> Result<()> {
     let _env_lock = lock_env();
@@ -49,18 +142,30 @@ fn context_graph_snapshot_and_journal_store_nodes_once() -> Result<()> {
     let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
     let id = "context_graph_once";
     let mut session = Session::create_with_id(id.to_string(), None, None);
-    session.apply_context_graph_transaction(context_transaction(id, "first"))?;
+    seed_context_source(&mut session);
+    session.apply_context_graph_transaction(canonical_context_transaction(&session, "first"))?;
     session.save()?;
 
     let snapshot = std::fs::read_to_string(session_path(id)?)?;
     assert_eq!(snapshot.matches("summary-first").count(), 1);
     assert_eq!(snapshot.matches("node-first").count(), 2); // node id plus frontier reference
 
-    let mut second = context_transaction(id, "second");
+    session.messages.push(StoredMessage {
+        id: "message-2".to_string(),
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "second canonical source".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let mut second = canonical_context_transaction(&session, "second");
     second.base_generation = 1;
     second.generation = 2;
     second.frontier.generation = 2;
-    second.frontier.active_node_ids = vec!["node-second".to_string()];
     session.apply_context_graph_transaction(second)?;
     session.save()?;
     let journal = std::fs::read_to_string(session_journal_path(id)?)?;
@@ -80,8 +185,9 @@ fn context_graph_replay_is_op_id_idempotent() -> Result<()> {
     let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
     let id = "context_graph_idempotent";
     let mut session = Session::create_with_id(id.to_string(), None, None);
+    seed_context_source(&mut session);
     session.save()?;
-    session.apply_context_graph_transaction(context_transaction(id, "once"))?;
+    session.apply_context_graph_transaction(canonical_context_transaction(&session, "once"))?;
     session.save()?;
 
     let path = session_journal_path(id)?;
@@ -97,11 +203,12 @@ fn context_graph_replay_is_op_id_idempotent() -> Result<()> {
 fn context_graph_rejects_conflicting_op_id_reuse() -> Result<()> {
     let id = "context_graph_conflicting_op";
     let mut session = Session::create_with_id(id.to_string(), None, None);
-    let original = context_transaction(id, "same-op");
+    seed_context_source(&mut session);
+    let original = canonical_context_transaction(&session, "same-op");
     assert!(session.apply_context_graph_transaction(original.clone())?);
     assert!(!session.apply_context_graph_transaction(original)?);
 
-    let mut conflicting = context_transaction(id, "same-op");
+    let mut conflicting = canonical_context_transaction(&session, "same-op");
     conflicting.append_context_nodes[0].summary_text = "different".into();
     let err = session
         .apply_context_graph_transaction(conflicting)
@@ -121,8 +228,9 @@ fn context_graph_commit_is_idempotent_after_reload() -> Result<()> {
     let home = tempfile::tempdir()?;
     let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
     let id = "context_graph_retry_after_reload";
-    let transaction = context_transaction(id, "durable-retry");
     let mut session = Session::create_with_id(id.to_string(), None, None);
+    seed_context_source(&mut session);
+    let transaction = canonical_context_transaction(&session, "durable-retry");
     assert!(session.commit_context_graph_transaction(transaction.clone())?);
 
     let mut loaded = Session::load(id)?;
@@ -139,13 +247,15 @@ fn context_graph_commit_failure_does_not_publish_candidate() -> Result<()> {
     let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
     let id = "context_graph_failed_commit";
     let mut session = Session::create_with_id(id.to_string(), None, None);
+    seed_context_source(&mut session);
+    let transaction = canonical_context_transaction(&session, "must-not-publish");
 
     // Make the expected sessions directory a regular file so the durable
     // snapshot write fails before publication.
     std::fs::write(home.path().join("sessions"), b"not a directory")?;
     assert!(
         session
-            .commit_context_graph_transaction(context_transaction(id, "must-not-publish"))
+            .commit_context_graph_transaction(transaction)
             .is_err()
     );
     assert!(session.context_nodes.is_empty());
@@ -156,10 +266,112 @@ fn context_graph_commit_failure_does_not_publish_candidate() -> Result<()> {
 }
 
 #[test]
+fn context_graph_inheritance_preserves_origin_identity_and_remains_reloadable() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let mut parent = Session::create_with_id("context_graph_parent".to_string(), None, None);
+    seed_context_source(&mut parent);
+    parent.commit_context_graph_transaction(canonical_context_transaction(&parent, "parent"))?;
+    let parent_node_id = parent.context_nodes[0].id.clone();
+
+    let mut child = Session::create_with_id(
+        "context_graph_child".to_string(),
+        Some(parent.id.clone()),
+        None,
+    );
+    child.replace_messages(parent.messages.clone());
+    child.inherit_context_graph_from(&parent)?;
+    child.save()?;
+
+    assert_eq!(child.context_nodes[0].id, parent_node_id);
+    assert_eq!(child.context_nodes[0].source_session_id, parent.id);
+    assert_eq!(
+        child
+            .context_frontier
+            .as_ref()
+            .unwrap()
+            .source_prefix_sha256,
+        parent
+            .context_frontier
+            .as_ref()
+            .unwrap()
+            .source_prefix_sha256
+    );
+    let loaded = Session::load(&child.id)?;
+    assert_eq!(loaded.context_nodes, child.context_nodes);
+    assert!(loaded.context_frontier.is_some());
+    Ok(())
+}
+
+#[test]
+fn imported_context_root_is_self_contained_durable_and_parent_proven() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let mut parent = Session::create_with_id("import_parent".to_string(), None, None);
+    seed_context_source(&mut parent);
+    parent.save()?;
+    let mut child =
+        Session::create_with_id("import_child".to_string(), Some(parent.id.clone()), None);
+    let state = StoredCompactionState {
+        summary_text: "portable imported parent context".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 0,
+    };
+    child.install_imported_context_root(&parent, state.clone())?;
+    let exported = child.redacted_for_export();
+    assert!(exported.context_nodes.is_empty());
+    assert!(exported.context_frontier.is_none());
+    child.save()?;
+
+    assert!(child.messages.is_empty());
+    assert_eq!(child.compaction, Some(state));
+    assert_eq!(child.context_nodes[0].source_session_id, parent.id);
+    assert_eq!(
+        child
+            .context_frontier
+            .as_ref()
+            .unwrap()
+            .covered_message_count,
+        0
+    );
+    let loaded = Session::load(&child.id)?;
+    assert_eq!(loaded.context_nodes, child.context_nodes);
+    assert_eq!(loaded.parent_id, Some(parent.id));
+
+    let mut split = Session::create_with_id(
+        "import_split_child".to_string(),
+        Some(child.id.clone()),
+        None,
+    );
+    split.replace_messages(child.messages.clone());
+    split.compaction = child.compaction.clone();
+    split.inherit_context_graph_from(&child)?;
+    split.save()?;
+    let reloaded_split = Session::load(&split.id)?;
+    assert_eq!(reloaded_split.context_nodes, child.context_nodes);
+    assert_eq!(reloaded_split.context_frontier, child.context_frontier);
+
+    let path = session_path(&child.id)?;
+    let mut snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    snapshot["context_nodes"][0]["summary_text"] =
+        serde_json::Value::String("tampered imported parent context".to_string());
+    std::fs::write(&path, serde_json::to_vec_pretty(&snapshot)?)?;
+    let repaired = Session::load(&child.id)?;
+    assert!(repaired.context_nodes.is_empty());
+    assert!(repaired.context_frontier.is_none());
+    Ok(())
+}
+
+#[test]
 fn context_graph_rejects_generation_mismatch() {
     let id = "context_graph_generation";
     let mut session = Session::create_with_id(id.to_string(), None, None);
-    let mut transaction = context_transaction(id, "bad-generation");
+    seed_context_source(&mut session);
+    let mut transaction = canonical_context_transaction(&session, "bad-generation");
     transaction.base_generation = 1;
     assert!(
         session
@@ -173,14 +385,58 @@ fn context_graph_rejects_generation_mismatch() {
 }
 
 #[test]
+fn context_graph_commit_rejects_stale_concurrent_writer() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let mut original = Session::create_with_id("context_graph_cas".to_string(), None, None);
+    seed_context_source(&mut original);
+    original.save()?;
+
+    let mut first = Session::load(&original.id)?;
+    let mut stale = Session::load(&original.id)?;
+    let mut locally_advanced = Session::load(&original.id)?;
+    let first_transaction = canonical_context_transaction(&first, "first-writer");
+    let stale_transaction = canonical_context_transaction(&stale, "stale-writer");
+    let local_transaction = canonical_context_transaction(&locally_advanced, "local-writer");
+    assert!(locally_advanced.apply_context_graph_transaction(local_transaction)?);
+    assert!(first.commit_context_graph_transaction(first_transaction)?);
+    let error = stale
+        .commit_context_graph_transaction(stale_transaction)
+        .expect_err("stale graph writer must not overwrite the committed generation");
+    assert!(error.to_string().contains("stale session writer rejected"));
+    let error = locally_advanced
+        .save()
+        .expect_err("locally advanced stale writer must not overwrite durable graph state");
+    assert!(error.to_string().contains("stale session writer rejected"));
+
+    let reloaded = Session::load(&original.id)?;
+    assert_eq!(
+        reloaded
+            .context_frontier
+            .as_ref()
+            .map(|frontier| frontier.generation),
+        Some(1)
+    );
+    assert_eq!(reloaded.context_nodes.len(), 1);
+    assert!(
+        reloaded.context_nodes[0]
+            .summary_text
+            .contains("first-writer")
+    );
+    Ok(())
+}
+
+#[test]
 fn torn_context_transaction_replay_keeps_old_frontier() -> Result<()> {
     let _env_lock = lock_env();
     let home = tempfile::tempdir()?;
     let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
     let id = "context_graph_torn";
     let mut session = Session::create_with_id(id.to_string(), None, None);
+    seed_context_source(&mut session);
     session.save()?;
-    session.apply_context_graph_transaction(context_transaction(id, "torn"))?;
+    session.apply_context_graph_transaction(canonical_context_transaction(&session, "torn"))?;
     session.save()?;
 
     let path = session_journal_path(id)?;

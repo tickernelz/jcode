@@ -97,7 +97,10 @@ impl Agent {
         let resolved_model = self.provider.model();
         self.session.provider_key = Some(selection.runtime_key.stable_id());
         self.session.route_api_method = Some(selection.api_method.clone());
-        self.session.model = Some(resolved_model.clone());
+        self.session.model = Some(crate::provider::persisted_session_model_for_route(
+            selection,
+            &resolved_model,
+        ));
         let event = crate::provider::ProviderStateEvent::selected_model(source, resolved_model);
         self.provider_runtime_state.apply(event);
         self.persist_session_best_effort("route selection");

@@ -1,6 +1,50 @@
 use super::*;
 use jcode_base::message::{ContentBlock, Message, Role};
 
+#[test]
+fn typed_code_assist_route_pins_oauth_mode() {
+    let provider = GeminiProvider::new();
+    provider
+        .set_route_selection(&RouteSelection {
+            model: "gemini-2.5-pro".to_string(),
+            runtime_key: RuntimeKey::CodeAssistOAuth,
+            api_method: "code-assist-oauth".to_string(),
+            provider_label: "Gemini".to_string(),
+            detail: String::new(),
+        })
+        .unwrap();
+    assert!(matches!(provider.auth_mode(), GeminiAuthMode::Oauth));
+}
+
+#[test]
+fn typed_auth_preference_is_isolated_across_provider_fork() {
+    let provider = GeminiProvider::new();
+    provider
+        .set_route_selection(&RouteSelection {
+            model: "gemini-2.5-pro".to_string(),
+            runtime_key: RuntimeKey::Gemini,
+            api_method: "gemini-api-key".to_string(),
+            provider_label: "Gemini".to_string(),
+            detail: String::new(),
+        })
+        .unwrap();
+    let fork = provider.fork();
+    fork.set_route_selection(&RouteSelection {
+        model: "gemini-2.5-flash".to_string(),
+        runtime_key: RuntimeKey::CodeAssistOAuth,
+        api_method: "code-assist-oauth".to_string(),
+        provider_label: "Gemini".to_string(),
+        detail: String::new(),
+    })
+    .unwrap();
+    assert!(matches!(
+        *provider.auth_preference.read().unwrap(),
+        GeminiAuthPreference::ApiKey
+    ));
+    assert_eq!(provider.model(), "gemini-2.5-pro");
+    assert_eq!(fork.model(), "gemini-2.5-flash");
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -598,7 +642,7 @@ fn auth_mode_prefers_api_key_when_present() {
     let _force = EnvVarGuard::unset("JCODE_GEMINI_FORCE_OAUTH");
     let _key = EnvVarGuard::set_value("GEMINI_API_KEY", "test-developer-key");
 
-    match GeminiProvider::auth_mode() {
+    match GeminiProvider::new().auth_mode() {
         GeminiAuthMode::ApiKey(key) => assert_eq!(key, "test-developer-key"),
         GeminiAuthMode::Oauth => panic!("expected API-key auth mode when GEMINI_API_KEY is set"),
     }
@@ -613,7 +657,10 @@ fn auth_mode_force_oauth_overrides_api_key() {
     let _key = EnvVarGuard::set_value("GEMINI_API_KEY", "test-developer-key");
     let _force = EnvVarGuard::set_value("JCODE_GEMINI_FORCE_OAUTH", "1");
 
-    assert!(matches!(GeminiProvider::auth_mode(), GeminiAuthMode::Oauth));
+    assert!(matches!(
+        GeminiProvider::new().auth_mode(),
+        GeminiAuthMode::Oauth
+    ));
 }
 
 #[test]
@@ -625,7 +672,10 @@ fn auth_mode_defaults_to_oauth_without_api_key() {
     let _google = EnvVarGuard::unset("GOOGLE_API_KEY");
     let _force = EnvVarGuard::unset("JCODE_GEMINI_FORCE_OAUTH");
 
-    assert!(matches!(GeminiProvider::auth_mode(), GeminiAuthMode::Oauth));
+    assert!(matches!(
+        GeminiProvider::new().auth_mode(),
+        GeminiAuthMode::Oauth
+    ));
 }
 
 #[test]

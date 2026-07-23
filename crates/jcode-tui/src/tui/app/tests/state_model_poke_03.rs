@@ -1651,6 +1651,11 @@ fn test_local_model_picker_openrouter_bare_openai_route_uses_openai_catalog_pref
         set_model_calls.lock().unwrap().as_slice(),
         ["openai/gpt-5.4@OpenAI"]
     );
+    assert_eq!(
+        app.session.model.as_deref(),
+        Some("openai/gpt-5.4@OpenAI"),
+        "session persistence must retain the exact OpenRouter provider pin"
+    );
 }
 
 #[test]

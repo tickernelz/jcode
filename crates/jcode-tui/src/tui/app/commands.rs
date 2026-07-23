@@ -401,14 +401,23 @@ pub(super) fn create_transfer_session_from_parent(
     parent_session_id: &str,
     parent: &crate::session::Session,
     compaction: Option<crate::session::StoredCompactionState>,
+    engine: crate::config::CompactionEngine,
 ) -> anyhow::Result<(String, String)> {
     let todos = crate::todo::load_todos(parent_session_id).unwrap_or_default();
     let mut child = crate::session::Session::create(Some(parent_session_id.to_string()), None);
     child.messages.clear();
-    child.compaction = compaction;
+    if engine == crate::config::CompactionEngine::Lcm {
+        if let Some(state) = compaction {
+            child.install_imported_context_root(parent, state)?;
+        }
+    } else {
+        child.compaction = compaction;
+    }
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
     child.provider_key = parent.provider_key.clone();
+    child.route_api_method = parent.route_api_method.clone();
+    child.reasoning_effort = parent.reasoning_effort.clone();
     child.subagent_model = parent.subagent_model.clone();
     child.improve_mode = parent.improve_mode;
     child.autoreview_enabled = parent.autoreview_enabled;
@@ -426,14 +435,25 @@ async fn prepare_transfer_session_local(
     parent: crate::session::Session,
     provider: std::sync::Arc<dyn crate::provider::Provider>,
 ) -> anyhow::Result<super::PreparedTransferSession> {
+    let transfer_engine = crate::config::config().compaction.engine.clone();
+    let provider = if transfer_engine == crate::config::CompactionEngine::Lcm {
+        crate::compaction::CompactionManager::portable_provider_for_session(&parent, provider)?
+    } else {
+        provider
+    };
     let compaction = crate::compaction::build_transfer_compaction_state(
         provider,
         transfer_active_messages(&parent),
         parent.compaction.clone(),
+        transfer_engine.clone(),
     )
     .await?;
-    let (session_id, session_name) =
-        create_transfer_session_from_parent(parent.id.as_str(), &parent, compaction)?;
+    let (session_id, session_name) = create_transfer_session_from_parent(
+        parent.id.as_str(),
+        &parent,
+        compaction,
+        transfer_engine,
+    )?;
     Ok(super::PreparedTransferSession {
         session_id,
         session_name,
@@ -1989,6 +2009,8 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
         app.session.replace_messages(snapshot.messages);
         app.session.compaction = snapshot.compaction;
+        app.session
+            .restore_context_graph_state(snapshot.context_graph);
         app.provider_session_id = snapshot.provider_session_id;
         app.session.provider_session_id = snapshot.session_provider_session_id;
         app.session.updated_at = chrono::Utc::now();
@@ -2066,12 +2088,20 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
                 app.rewind_undo_snapshot = Some(LocalRewindUndoSnapshot {
                     messages: app.session.messages.clone(),
                     compaction: app.session.compaction.clone(),
+                    context_graph: app.session.context_graph_state(),
                     provider_session_id: app.provider_session_id.clone(),
                     session_provider_session_id: app.session.provider_session_id.clone(),
                     visible_message_count: visible_count,
                 });
-                app.session.truncate_messages(targets[n - 1] + 1);
-                app.session.compaction = None;
+                let stored_len = targets[n - 1] + 1;
+                if let Err(error) = app.session.retain_context_graph_prefix(stored_len) {
+                    crate::logging::warn(&format!(
+                        "Failed to retain valid LCM rewind prefix; falling back to raw history: {error}"
+                    ));
+                    app.session.compaction = None;
+                    app.session.clear_context_graph_state();
+                }
+                app.session.truncate_messages(stored_len);
                 let provider_messages = app.session.messages_for_provider_uncached();
                 app.replace_provider_messages(provider_messages);
                 app.session.updated_at = chrono::Utc::now();
@@ -3225,7 +3255,9 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/compact" {
-        if !app.provider.supports_compaction() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if !lcm_configured && !app.provider.supports_compaction() {
             app.push_display_message(DisplayMessage::system(
                 "Manual compaction is not available for this provider.".to_string(),
             ));
@@ -3256,7 +3288,12 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
                     }
                 );
 
-                match manager.force_compact_with(&provider_messages, app.provider.clone()) {
+                let start = if manager.engine() == crate::config::CompactionEngine::Lcm {
+                    manager.force_lcm_compact_with(&app.session, app.provider.clone())
+                } else {
+                    manager.force_compact_with(&provider_messages, app.provider.clone())
+                };
+                match start {
                     Ok(()) => {
                         app.set_status_notice(App::format_compaction_progress_notice(
                             std::time::Duration::ZERO,

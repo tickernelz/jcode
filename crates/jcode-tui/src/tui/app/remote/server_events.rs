@@ -2658,6 +2658,16 @@ pub(in crate::tui::app) fn handle_server_event(
         }
         ServerEvent::Compaction {
             trigger,
+            engine,
+            ownership,
+            configured_route,
+            effective_route,
+            fallback_reason,
+            leaf_count,
+            parent_count,
+            frontier_size,
+            max_node_level,
+            graph_generation,
             pre_tokens,
             post_tokens,
             tokens_saved,
@@ -2669,6 +2679,16 @@ pub(in crate::tui::app) fn handle_server_event(
         } => {
             app.handle_compaction_event(crate::compaction::CompactionEvent {
                 trigger,
+                engine,
+                ownership,
+                configured_route,
+                effective_route,
+                fallback_reason,
+                leaf_count,
+                parent_count,
+                frontier_size,
+                max_node_level,
+                graph_generation,
                 pre_tokens,
                 post_tokens,
                 tokens_saved,

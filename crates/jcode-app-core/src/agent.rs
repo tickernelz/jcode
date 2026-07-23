@@ -174,6 +174,7 @@ pub struct TokenUsage {
 struct RewindUndoSnapshot {
     messages: Vec<StoredMessage>,
     compaction: Option<crate::session::StoredCompactionState>,
+    context_graph: crate::session::ContextGraphState,
     provider_session_id: Option<String>,
     session_provider_session_id: Option<String>,
     visible_message_count: usize,
@@ -642,10 +643,62 @@ impl Agent {
     }
 
     fn messages_for_provider(&mut self) -> (Vec<Message>, Option<CompactionEvent>) {
-        if self.provider.supports_compaction() || self.session.compaction.is_some() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if lcm_configured
+            || self.provider.supports_compaction()
+            || self.session.compaction.is_some()
+        {
             let compaction = self.registry.compaction();
             match compaction.try_write() {
                 Ok(mut manager) => {
+                    let configured_engine = crate::config::config().compaction.engine.clone();
+                    if manager.synchronize_engine(configured_engine) {
+                        // The legacy projection remains a safe bootstrap. The old
+                        // derived graph belongs to a different engine epoch and
+                        // must not be extended after a live policy switch.
+                        self.session.clear_context_graph_state();
+                        self.note_compaction_applied();
+                        self.persist_session_best_effort("compaction engine switch");
+                    }
+                    if manager.engine() == crate::config::CompactionEngine::Lcm {
+                        let (mut messages, mut event) = match manager
+                            .materialize_lcm_context(&mut self.session)
+                        {
+                            Ok(materialized) => materialized,
+                            Err(error) => {
+                                logging::error(&format!(
+                                    "LCM durable commit failed; retaining prior provider context: {error}"
+                                ));
+                                let all_messages = self.session.provider_messages();
+                                (manager.messages_for_api_with(all_messages), None)
+                            }
+                        };
+                        let action = manager
+                            .ensure_lcm_context_fits(&mut self.session, self.provider.clone());
+                        match action {
+                            crate::compaction::CompactionAction::BackgroundStarted { trigger } => {
+                                logging::info(&format!(
+                                    "Background LCM compaction started ({trigger})"
+                                ));
+                            }
+                            crate::compaction::CompactionAction::HardCompacted(_) => {
+                                if let Ok((committed, _)) =
+                                    manager.materialize_lcm_context(&mut self.session)
+                                {
+                                    messages = committed;
+                                }
+                                event = event.or_else(|| manager.take_compaction_event());
+                            }
+                            crate::compaction::CompactionAction::None => {}
+                        }
+                        if event.is_some() {
+                            self.note_compaction_applied();
+                        }
+                        // The materialized vector precedes any newly-started job
+                        // and is therefore always the last durably committed view.
+                        return (messages, event);
+                    }
                     let discarded_oversized_native =
                         manager.discard_oversized_openai_native_compaction();
                     let messages = {

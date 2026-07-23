@@ -9,41 +9,65 @@ impl Agent {
     }
 
     pub fn poll_compaction_completion_event(&mut self) -> Option<CompactionEvent> {
-        let provider_messages = self.session.messages_for_provider();
         let compaction = self.registry.compaction();
-        let event = match compaction.try_write() {
+        let (event, lcm) = match compaction.try_write() {
             Ok(mut manager) => {
-                let event = manager.poll_compaction_event_with(&provider_messages);
-                if event.is_some() {
-                    self.sync_session_compaction_state_from_manager(&manager);
+                if manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
+                    self.session.clear_context_graph_state();
+                    self.note_compaction_applied();
+                    self.persist_session_best_effort("compaction engine switch");
                 }
-                event
+                if manager.engine() == crate::config::CompactionEngine::Lcm {
+                    match manager.materialize_lcm_context(&mut self.session) {
+                        Ok((_, event)) => (event, true),
+                        Err(error) => {
+                            logging::error(&format!("LCM durable commit failed: {error}"));
+                            (None, true)
+                        }
+                    }
+                } else {
+                    let provider_messages = self.session.messages_for_provider();
+                    let event = manager.poll_compaction_event_with(&provider_messages);
+                    if event.is_some() {
+                        self.sync_session_compaction_state_from_manager(&manager);
+                    }
+                    (event, false)
+                }
             }
             Err(_) => return None,
         };
 
         if event.is_some() {
             self.note_compaction_applied();
-            self.persist_session_best_effort("compaction completion");
+            if !lcm {
+                self.persist_session_best_effort("compaction completion");
+            }
         }
 
         event
     }
 
     pub fn request_manual_compaction(&mut self) -> (String, bool) {
-        if !self.provider.supports_compaction() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if !lcm_configured && !self.provider.supports_compaction() {
             return (
                 "Manual compaction is not available for this provider.".to_string(),
                 false,
             );
         }
 
-        let provider = self.provider.fork();
+        let provider = self.provider.clone();
         let messages = self.session.messages_for_provider();
         let compaction = self.registry.compaction();
 
         match compaction.try_write() {
             Ok(mut manager) => {
+                if manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
+                    self.session.clear_context_graph_state();
+                    self.note_compaction_applied();
+                    self.persist_session_best_effort("compaction engine switch");
+                }
                 let stats = manager.stats_with(&messages);
                 let status_msg = format!(
                     "**Context Status:**\n\
@@ -65,7 +89,12 @@ impl Agent {
                     }
                 );
 
-                match manager.force_compact_with(&messages, provider) {
+                let start = if manager.engine() == crate::config::CompactionEngine::Lcm {
+                    manager.force_lcm_compact_with(&self.session, provider)
+                } else {
+                    manager.force_compact_with(&messages, provider)
+                };
+                match start {
                     Ok(()) => (
                         format!(
                             "{}\n\n📦 **Compacting context** (manual) — summarizing older messages in the background to stay within the context window.\n\
@@ -107,11 +136,19 @@ impl Agent {
     ///
     /// Performs a synchronous hard compaction and resets provider session state,
     /// allowing the caller to retry the same turn immediately.
-    pub(super) fn try_auto_compact_after_context_limit(&mut self, error: &str) -> bool {
+    pub(super) fn try_auto_compact_after_context_limit(
+        &mut self,
+        error: &str,
+    ) -> Option<CompactionEvent> {
         if crate::provider::openai_request::is_openai_encrypted_content_too_large_error(error)
             && self.try_recover_oversized_openai_native_compaction()
         {
-            return true;
+            return Some(CompactionEvent {
+                trigger: "auto_recovery_native".to_string(),
+                engine: Some("provider-native".to_string()),
+                ownership: Some("provider".to_string()),
+                ..CompactionEvent::default()
+            });
         }
         // A provider HTTP 413 ("request too large") is a *byte-size* failure
         // driven by inline base64 images, not a token-context overflow. Token
@@ -119,42 +156,65 @@ impl Agent {
         // would not shrink the payload and the retry would 413 again. Strip
         // oversized images first.
         if self.try_recover_after_payload_too_large(error) {
-            return true;
+            return Some(CompactionEvent {
+                trigger: "auto_recovery_payload".to_string(),
+                engine: Some("payload-truncation".to_string()),
+                ownership: Some("jcode".to_string()),
+                ..CompactionEvent::default()
+            });
         }
         if !Self::is_context_limit_error(error) {
-            return false;
+            return None;
         }
-        if !self.provider.supports_compaction() {
-            return false;
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if !lcm_configured && !self.provider.supports_compaction() {
+            return None;
         }
 
         let context_limit = self.provider.context_window() as u64;
         let compaction = self.registry.compaction();
 
-        let (dropped, usage_pct) = match compaction.try_write() {
+        let (dropped, usage_pct, compaction_event) = match compaction.try_write() {
             Ok(mut manager) => {
-                let (dropped, usage_pct) = {
-                    let all_messages = self.session.provider_messages();
-                    manager.update_observed_input_tokens(context_limit);
-                    let usage_pct = manager.context_usage_with(all_messages) * 100.0;
-                    let dropped = match manager.hard_compact_with(all_messages) {
+                if manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
+                    self.session.clear_context_graph_state();
+                    self.note_compaction_applied();
+                    self.persist_session_best_effort("compaction engine switch");
+                }
+                manager.update_observed_input_tokens(context_limit);
+                let all_messages = self.session.messages_for_provider_uncached();
+                let usage_pct = manager.context_usage_with(&all_messages) * 100.0;
+                let dropped = if manager.engine() == crate::config::CompactionEngine::Lcm {
+                    match manager.hard_lcm_compact_with(&mut self.session) {
+                        Ok(dropped) => dropped,
+                        Err(reason) => {
+                            logging::warn(&format!(
+                                "Context-limit auto-recovery failed: hard LCM failed ({reason})"
+                            ));
+                            return None;
+                        }
+                    }
+                } else {
+                    let dropped = match manager.hard_compact_with(&all_messages) {
                         Ok(dropped) => dropped,
                         Err(reason) => {
                             logging::warn(&format!(
                                 "Context-limit auto-recovery failed: hard compact failed ({})",
                                 reason
                             ));
-                            return false;
+                            return None;
                         }
                     };
-                    (dropped, usage_pct)
+                    self.sync_session_compaction_state_from_manager(&manager);
+                    dropped
                 };
-                self.sync_session_compaction_state_from_manager(&manager);
-                (dropped, usage_pct)
+                let event = manager.take_compaction_event();
+                (dropped, usage_pct, event)
             }
             Err(_) => {
                 logging::warn("Context-limit auto-recovery skipped: compaction manager lock busy");
-                return false;
+                return None;
             }
         };
 
@@ -179,7 +239,21 @@ impl Agent {
             .force_attribution(),
         );
 
-        true
+        Some(compaction_event.unwrap_or_else(|| {
+            CompactionEvent {
+                trigger: "auto_recovery".to_string(),
+                engine: Some(
+                    crate::config::config()
+                        .compaction
+                        .engine
+                        .as_str()
+                        .to_string(),
+                ),
+                ownership: Some("jcode".to_string()),
+                messages_dropped: Some(dropped),
+                ..CompactionEvent::default()
+            }
+        }))
     }
 
     /// Best-effort recovery after a provider HTTP 413 "request too large" error.

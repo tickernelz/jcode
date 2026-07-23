@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use jcode_base::auth::gemini as gemini_auth;
 use jcode_message_types::{ConnectionPhase, Message, StreamEvent, ToolDefinition};
-use jcode_provider_core::{EventStream, Provider};
+use jcode_provider_core::{EventStream, Provider, RouteSelection, RuntimeKey};
 pub use jcode_provider_gemini::{
     AVAILABLE_MODELS, CODE_ASSIST_API_VERSION, CODE_ASSIST_ENDPOINT, ClientMetadata,
     CodeAssistGenerateRequest, CodeAssistGenerateResponse, DEFAULT_MODEL, GEMINI_API_ENDPOINT,
@@ -44,6 +44,7 @@ pub struct GeminiProvider {
     model: Arc<RwLock<String>>,
     state: Arc<Mutex<Option<GeminiRuntimeState>>>,
     fetched_models: Arc<RwLock<Vec<String>>>,
+    auth_preference: Arc<RwLock<GeminiAuthPreference>>,
 }
 
 /// How the Gemini provider authenticates to Google.
@@ -55,6 +56,14 @@ enum GeminiAuthMode {
     /// Official Gemini Developer API key (Google AI Studio), sent as
     /// `x-goog-api-key` to `generativelanguage.googleapis.com`.
     ApiKey(String),
+}
+
+#[derive(Clone, Copy, Default)]
+enum GeminiAuthPreference {
+    #[default]
+    Auto,
+    Oauth,
+    ApiKey,
 }
 
 impl GeminiProvider {
@@ -104,6 +113,7 @@ impl GeminiProvider {
             model: Arc::new(RwLock::new(model)),
             state: Arc::new(Mutex::new(None)),
             fetched_models: Arc::new(RwLock::new(Vec::new())),
+            auth_preference: Arc::new(RwLock::new(GeminiAuthPreference::Auto)),
         };
         provider.seed_cached_catalog();
         provider
@@ -137,7 +147,14 @@ impl GeminiProvider {
     /// the key's own (often higher) quota, while OAuth uses the free
     /// cloudcode-pa tier. Set `JCODE_GEMINI_FORCE_OAUTH=1` to pin OAuth even when
     /// a key is present.
-    fn auth_mode() -> GeminiAuthMode {
+    fn auth_mode(&self) -> GeminiAuthMode {
+        let preference = *self
+            .auth_preference
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(preference, GeminiAuthPreference::Oauth) {
+            return GeminiAuthMode::Oauth;
+        }
         let force_oauth = std::env::var("JCODE_GEMINI_FORCE_OAUTH")
             .map(|value| {
                 let value = value.trim();
@@ -147,13 +164,18 @@ impl GeminiProvider {
         if !force_oauth && let Some(api_key) = gemini_auth::api_key() {
             return GeminiAuthMode::ApiKey(api_key);
         }
+        if matches!(preference, GeminiAuthPreference::ApiKey) {
+            jcode_base::logging::warn(
+                "Typed Gemini API-key route selected, but no Gemini API key is available",
+            );
+        }
         GeminiAuthMode::Oauth
     }
 
     async fn ensure_state(&self) -> Result<GeminiRuntimeState> {
         // The Developer API key path is stateless: there is no Code Assist
         // project/onboarding handshake, so synthesize a lightweight session.
-        if let GeminiAuthMode::ApiKey(_) = Self::auth_mode() {
+        if let GeminiAuthMode::ApiKey(_) = self.auth_mode() {
             let mut guard = self.state.lock().await;
             if let Some(state) = guard.clone() {
                 return Ok(state);
@@ -265,7 +287,7 @@ impl GeminiProvider {
     }
 
     async fn refresh_available_models(&self) -> Result<Vec<String>> {
-        if let GeminiAuthMode::ApiKey(api_key) = Self::auth_mode() {
+        if let GeminiAuthMode::ApiKey(api_key) = self.auth_mode() {
             return self.refresh_available_models_api_key(&api_key).await;
         }
         let project_id_env = google_cloud_project_from_env();
@@ -577,7 +599,7 @@ impl GeminiProvider {
             ],
         );
 
-        match Self::auth_mode() {
+        match self.auth_mode() {
             GeminiAuthMode::ApiKey(api_key) => {
                 // The Developer API consumes the inner generateContent body
                 // directly (no Code Assist envelope) and returns the response
@@ -648,6 +670,7 @@ impl Provider for GeminiProvider {
                     model: provider.model.clone(),
                     state: state_cache.clone(),
                     fetched_models: provider.fetched_models.clone(),
+                    auth_preference: provider.auth_preference.clone(),
                 };
                 match provider.ensure_state().await {
                     Ok(state) => state,
@@ -954,6 +977,25 @@ impl Provider for GeminiProvider {
         Ok(())
     }
 
+    fn set_route_selection(&self, selection: &RouteSelection) -> Result<()> {
+        let preference = match selection.runtime_key {
+            RuntimeKey::CodeAssistOAuth => GeminiAuthPreference::Oauth,
+            RuntimeKey::Gemini => GeminiAuthPreference::ApiKey,
+            _ => {
+                anyhow::bail!(
+                    "Gemini runtime cannot apply route kind {}",
+                    selection.runtime_key.stable_id()
+                )
+            }
+        };
+        self.set_model(&selection.model)?;
+        *self
+            .auth_preference
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = preference;
+        Ok(())
+    }
+
     fn available_models(&self) -> Vec<&'static str> {
         AVAILABLE_MODELS.to_vec()
     }
@@ -1009,6 +1051,12 @@ impl Provider for GeminiProvider {
             model: Arc::new(RwLock::new(self.model())),
             state: self.state.clone(),
             fetched_models: self.fetched_models.clone(),
+            auth_preference: Arc::new(RwLock::new(
+                *self
+                    .auth_preference
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )),
         })
     }
 
@@ -1025,6 +1073,7 @@ impl Clone for GeminiProvider {
             model: self.model.clone(),
             state: self.state.clone(),
             fetched_models: self.fetched_models.clone(),
+            auth_preference: self.auth_preference.clone(),
         }
     }
 }

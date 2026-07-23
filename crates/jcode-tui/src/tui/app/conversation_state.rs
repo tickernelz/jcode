@@ -121,6 +121,35 @@ impl App {
                 crate::message::Message::format_duration(duration_ms)
             ));
         }
+        if let Some(engine) = event.engine.as_deref() {
+            let ownership = event
+                .ownership
+                .as_deref()
+                .map(|owner| format!(" via {owner}"))
+                .unwrap_or_default();
+            details.push(format!("engine {engine}{ownership}"));
+        }
+        if let Some(route) = event.effective_route.as_deref() {
+            details.push(format!("route {route}"));
+        }
+        if let Some(reason) = event.fallback_reason.as_deref() {
+            details.push(format!("fallback {reason}"));
+        }
+        if let Some(frontier_size) = event.frontier_size {
+            let mut graph = format!("frontier {frontier_size}");
+            if let (Some(leaves), Some(parents)) = (event.leaf_count, event.parent_count) {
+                let leaf_noun = if leaves == 1 { "leaf" } else { "leaves" };
+                let parent_noun = if parents == 1 { "parent" } else { "parents" };
+                graph.push_str(&format!(" ({leaves} {leaf_noun}, {parents} {parent_noun})"));
+            }
+            if let Some(level) = event.max_node_level {
+                graph.push_str(&format!(", level {level}"));
+            }
+            if let Some(generation) = event.graph_generation {
+                graph.push_str(&format!(", generation {generation}"));
+            }
+            details.push(graph);
+        }
         if let Some(tokens) = event.pre_tokens {
             details.push(format!(
                 "before ~{} tokens",
@@ -205,7 +234,9 @@ impl App {
             self.ensure_provider_messages_hydrated();
             self.messages.push(message.clone());
         }
-        if self.is_remote || !self.provider.uses_jcode_compaction() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if self.is_remote || (!self.provider.uses_jcode_compaction() && !lcm_configured) {
             return;
         }
         let compaction = self.registry.compaction();
@@ -237,8 +268,12 @@ impl App {
     }
 
     pub(super) fn reseed_compaction_from_provider_messages(&mut self) {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
         if self.is_remote
-            || (!self.provider.uses_jcode_compaction() && self.session.compaction.is_none())
+            || (!self.provider.uses_jcode_compaction()
+                && self.session.compaction.is_none()
+                && !lcm_configured)
         {
             return;
         }
@@ -272,6 +307,24 @@ impl App {
                 ));
             }
         }
+    }
+
+    pub(super) fn synchronize_compaction_engine(
+        &mut self,
+        manager: &mut crate::compaction::CompactionManager,
+    ) -> bool {
+        if !manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
+            return false;
+        }
+        self.session.clear_context_graph_state();
+        self.invalidate_kv_cache_after_compaction();
+        if let Err(error) = self.session.save() {
+            crate::logging::error(&format!(
+                "Failed to persist compaction engine switch for session {}: {error}",
+                self.session.id
+            ));
+        }
+        true
     }
 
     pub(super) fn apply_openai_native_compaction(
@@ -325,12 +378,51 @@ impl App {
             return (self.messages.clone(), None);
         }
         let base_messages = self.materialized_provider_messages();
-        if !self.provider.supports_compaction() && self.session.compaction.is_none() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if !lcm_configured
+            && !self.provider.supports_compaction()
+            && self.session.compaction.is_none()
+        {
             return (base_messages, None);
         }
         let compaction = self.registry.compaction();
         match compaction.try_write() {
             Ok(mut manager) => {
+                self.synchronize_compaction_engine(&mut manager);
+                if manager.engine() == crate::config::CompactionEngine::Lcm {
+                    let (mut messages, mut event) = match manager
+                        .materialize_lcm_context(&mut self.session)
+                    {
+                        Ok(materialized) => materialized,
+                        Err(error) => {
+                            crate::logging::error(&format!(
+                                "LCM durable commit failed; retaining prior provider context: {error}"
+                            ));
+                            (manager.messages_for_api_with(&base_messages), None)
+                        }
+                    };
+                    let action =
+                        manager.ensure_lcm_context_fits(&mut self.session, self.provider.clone());
+                    match action {
+                        crate::compaction::CompactionAction::BackgroundStarted { trigger } => {
+                            self.push_display_message(DisplayMessage::system(
+                                Self::format_compaction_started_message(&trigger),
+                            ));
+                            self.set_status_notice("Compacting context");
+                        }
+                        crate::compaction::CompactionAction::HardCompacted(_) => {
+                            if let Ok((committed, _)) =
+                                manager.materialize_lcm_context(&mut self.session)
+                            {
+                                messages = committed;
+                            }
+                            event = event.or_else(|| manager.take_compaction_event());
+                        }
+                        crate::compaction::CompactionAction::None => {}
+                    }
+                    return (messages, event);
+                }
                 let discarded_oversized_native =
                     manager.discard_oversized_openai_native_compaction();
                 if self.provider.uses_jcode_compaction() {
@@ -358,17 +450,38 @@ impl App {
     }
 
     pub(super) fn poll_compaction_completion(&mut self) -> bool {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
         if self.is_remote
-            || (!self.provider.supports_compaction() && self.session.compaction.is_none())
+            || (!lcm_configured
+                && !self.provider.supports_compaction()
+                && self.session.compaction.is_none())
         {
             return false;
         }
-        let provider_messages = self.materialized_provider_messages();
         let compaction = self.registry.compaction();
-        if let Ok(mut manager) = compaction.try_write()
-            && let Some(event) = manager.poll_compaction_event_with(&provider_messages)
-        {
-            self.sync_session_compaction_state_from_manager(&manager);
+        let event = if let Ok(mut manager) = compaction.try_write() {
+            self.synchronize_compaction_engine(&mut manager);
+            if manager.engine() == crate::config::CompactionEngine::Lcm {
+                match manager.materialize_lcm_context(&mut self.session) {
+                    Ok((_, event)) => event,
+                    Err(error) => {
+                        crate::logging::error(&format!("LCM durable commit failed: {error}"));
+                        None
+                    }
+                }
+            } else {
+                let provider_messages = self.materialized_provider_messages();
+                let event = manager.poll_compaction_event_with(&provider_messages);
+                if event.is_some() {
+                    self.sync_session_compaction_state_from_manager(&manager);
+                }
+                event
+            }
+        } else {
+            None
+        };
+        if let Some(event) = event {
             self.handle_compaction_event(event);
             return true;
         }
@@ -393,7 +506,7 @@ impl App {
         self.push_display_message(DisplayMessage::system(message));
     }
 
-    fn invalidate_kv_cache_after_compaction(&mut self) {
+    pub(super) fn invalidate_kv_cache_after_compaction(&mut self) {
         // Compaction intentionally replaces the provider-facing transcript
         // (typically hundreds of messages become summary + recent tail). The
         // previous request is therefore not a valid append-only cache baseline.

@@ -253,6 +253,10 @@ pub struct StoredContextNode {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub child_node_ids: Vec<String>,
     pub summary_text: String,
+    /// Integrity proof for the portable summary text. `None` is accepted only
+    /// for graph nodes written by binaries predating this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_sha256: Option<String>,
     pub estimated_tokens: u64,
     pub summarizer_model: String,
     pub summarizer_provider: String,
@@ -317,6 +321,10 @@ pub fn validate_context_graph(
             || node.source_session_id.is_empty()
             || node.source_message_ids.is_empty()
             || !is_lower_sha256(&node.source_sha256)
+            || node
+                .summary_sha256
+                .as_deref()
+                .is_some_and(|hash| !is_lower_sha256(hash))
             || node.summary_text.trim().is_empty()
             || node.estimated_tokens == 0
             || node.summarizer_model.is_empty()
@@ -387,8 +395,9 @@ pub fn validate_context_graph(
         if frontier.schema_version != 1
             || frontier.generation == 0
             || frontier.active_node_ids.is_empty()
-            || frontier.covered_message_count == 0
-            || frontier.covered_through_message_id.is_none()
+            || (frontier.covered_message_count == 0
+                && frontier.covered_through_message_id.is_some())
+            || (frontier.covered_message_count > 0 && frontier.covered_through_message_id.is_none())
             || !is_lower_sha256(&frontier.source_prefix_sha256)
             || frontier.next_node_sequence == 0
         {
@@ -404,6 +413,25 @@ pub fn validate_context_graph(
             if !by_id.contains_key(id.as_str()) {
                 return Err(format!("context frontier references missing node {id}"));
             }
+        }
+        fn reject_active_descendant(
+            root: &str,
+            current: &str,
+            nodes: &HashMap<&str, &StoredContextNode>,
+            active: &HashSet<&str>,
+        ) -> Result<(), String> {
+            for child in &nodes[current].child_node_ids {
+                if active.contains(child.as_str()) {
+                    return Err(format!(
+                        "context frontier contains ancestor {root} and descendant {child}"
+                    ));
+                }
+                reject_active_descendant(root, child, nodes, active)?;
+            }
+            Ok(())
+        }
+        for id in &frontier.active_node_ids {
+            reject_active_descendant(id, id, &by_id, &unique_active)?;
         }
     }
     Ok(())
@@ -1248,6 +1276,7 @@ mod context_graph_tests {
             source_sha256: "a".repeat(64),
             child_node_ids: children.iter().map(|id| (*id).to_string()).collect(),
             summary_text: id.to_string(),
+            summary_sha256: None,
             estimated_tokens: 1,
             summarizer_model: "model".to_string(),
             summarizer_provider: "provider".to_string(),

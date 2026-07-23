@@ -87,6 +87,26 @@ fn required_subscribe_working_dir(working_dir: Option<&str>) -> std::result::Res
     Ok(working_dir)
 }
 
+#[cfg(test)]
+mod compaction_completion_edge_tests {
+    use super::poll_completion_after_worker_edge;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retries_until_join_handle_visibility_catches_up() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let event = poll_completion_after_worker_edge(move || {
+            let poll = observed.fetch_add(1, Ordering::SeqCst);
+            async move { (poll == 2).then_some("durable-candidate") }
+        })
+        .await;
+        assert_eq!(event, Some("durable-candidate"));
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+}
+
 fn initial_subscribe_working_dir(request: &Request) -> std::result::Result<String, String> {
     match request {
         Request::Subscribe { working_dir, .. } => {
@@ -254,6 +274,16 @@ fn server_reload_starting() -> bool {
 fn compaction_server_event(event: crate::compaction::CompactionEvent) -> ServerEvent {
     ServerEvent::Compaction {
         trigger: event.trigger,
+        engine: event.engine,
+        ownership: event.ownership,
+        configured_route: event.configured_route,
+        effective_route: event.effective_route,
+        fallback_reason: event.fallback_reason,
+        leaf_count: event.leaf_count,
+        parent_count: event.parent_count,
+        frontier_size: event.frontier_size,
+        max_node_level: event.max_node_level,
+        graph_generation: event.graph_generation,
         pre_tokens: event.pre_tokens,
         post_tokens: event.post_tokens,
         tokens_saved: event.tokens_saved,
@@ -270,6 +300,20 @@ async fn poll_agent_compaction_completion(agent: Arc<Mutex<Agent>>) -> Option<Se
     agent_guard
         .poll_compaction_completion_event()
         .map(compaction_server_event)
+}
+
+async fn poll_completion_after_worker_edge<F, Fut, T>(mut poll: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    for _ in 0..20 {
+        if let Some(value) = poll().await {
+            return Some(value);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    None
 }
 
 async fn refresh_session_control_handle(
@@ -858,7 +902,15 @@ pub(super) async fn handle_client(
                         let agent = Arc::clone(&agent);
                         let tx = client_event_tx.clone();
                         tokio::spawn(async move {
-                            if let Some(event) = poll_agent_compaction_completion(agent).await {
+                            // The bus event is emitted at the end of the worker
+                            // future, just before Tokio marks its JoinHandle as
+                            // finished. Bridge that tiny edge-trigger race so a
+                            // durable candidate never waits for another request.
+                            if let Some(event) = poll_completion_after_worker_edge(|| {
+                                poll_agent_compaction_completion(Arc::clone(&agent))
+                            })
+                            .await
+                            {
                                 let _ = tx.send(event);
                             }
                         });

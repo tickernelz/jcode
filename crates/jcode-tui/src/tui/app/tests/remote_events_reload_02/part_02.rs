@@ -273,6 +273,16 @@ fn test_handle_server_event_compaction_shows_completion_message_in_remote_mode()
     app.handle_server_event(
         crate::protocol::ServerEvent::Compaction {
             trigger: "semantic".to_string(),
+            engine: Some("lcm".to_string()),
+            ownership: Some("jcode_lcm".to_string()),
+            configured_route: Some("openai-api:gpt-5.5".to_string()),
+            effective_route: Some("openai:gpt-5.5:responses".to_string()),
+            fallback_reason: None,
+            leaf_count: Some(3),
+            parent_count: Some(1),
+            frontier_size: Some(2),
+            max_node_level: Some(1),
+            graph_generation: Some(7),
             pre_tokens: Some(12_345),
             post_tokens: Some(4_321),
             tokens_saved: Some(8_024),
@@ -297,7 +307,7 @@ fn test_handle_server_event_compaction_shows_completion_message_in_remote_mode()
     assert_eq!(last.role, "system");
     assert_eq!(
         last.content,
-        "📦 Context compacted (semantic) - older messages were summarized to stay within the context window.\n\nTook 1.5s · before ~12,345 tokens · now ~4,321 tokens (2.2% of window) · saved ~8,024 tokens · summarized 24 messages · summary 987 chars · kept 10 recent messages live"
+        "📦 Context compacted (semantic) - older messages were summarized to stay within the context window.\n\nTook 1.5s · engine lcm via jcode_lcm · route openai:gpt-5.5:responses · frontier 2 (3 leaves, 1 parent), level 1, generation 7 · before ~12,345 tokens · now ~4,321 tokens (2.2% of window) · saved ~8,024 tokens · summarized 24 messages · summary 987 chars · kept 10 recent messages live"
     );
 }
 

@@ -972,6 +972,36 @@ pub enum ServerEvent {
     Compaction {
         /// What triggered it: "background", "hard_compact", "auto_recovery"
         trigger: String,
+        /// Context engine which owned this operation (`rolling` or `lcm`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        /// Concrete compactor ownership path, including provider-native.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ownership: Option<String>,
+        /// Explicit route requested by configuration, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_route: Option<String>,
+        /// Exact provider/model/API route used by the compactor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_route: Option<String>,
+        /// Why the preferred compaction path could not be used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_reason: Option<String>,
+        /// Number of immutable leaf nodes retained in the graph.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leaf_count: Option<usize>,
+        /// Number of immutable parent nodes retained in the graph.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_count: Option<usize>,
+        /// Number of active antichain nodes used for context assembly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frontier_size: Option<usize>,
+        /// Highest hierarchy level currently retained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_node_level: Option<u32>,
+        /// Durable graph generation published by this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_generation: Option<u64>,
         /// Token count before compaction
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_tokens: Option<u64>,

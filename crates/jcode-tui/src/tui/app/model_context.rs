@@ -853,12 +853,34 @@ impl App {
     }
 
     pub(super) fn auto_recover_context_limit(&mut self) -> Option<String> {
-        if self.is_remote || !self.provider.supports_compaction() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if self.is_remote || (!lcm_configured && !self.provider.supports_compaction()) {
             return None;
         }
         let compaction = self.registry.compaction();
         let mut manager = compaction.try_write().ok()?;
+        self.synchronize_compaction_engine(&mut manager);
         let mut provider_messages = self.materialized_provider_messages();
+
+        if manager.engine() == crate::config::CompactionEngine::Lcm {
+            let observed_tokens = self
+                .current_stream_context_tokens()
+                .unwrap_or(self.context_limit);
+            manager.update_observed_input_tokens(observed_tokens);
+            return match manager.hard_lcm_compact_with(&mut self.session) {
+                Ok(dropped) => {
+                    self.invalidate_kv_cache_after_compaction();
+                    Some(format!(
+                        "⚡ Emergency LCM compaction summarized {dropped} old messages. You can continue."
+                    ))
+                }
+                Err(error) => {
+                    crate::logging::error(&format!("[auto_recover] hard LCM failed: {error}"));
+                    None
+                }
+            };
+        }
 
         let usage = manager.context_usage_with(&provider_messages);
         if usage > 1.5 {
@@ -1008,7 +1030,9 @@ impl App {
         terminal: &mut DefaultTerminal,
         event_stream: &mut EventStream,
     ) -> bool {
-        if self.is_remote || !self.provider.supports_compaction() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if self.is_remote || (!lcm_configured && !self.provider.supports_compaction()) {
             return false;
         }
 
@@ -1020,42 +1044,63 @@ impl App {
         let compaction = self.registry.compaction();
         let compact_started = match compaction.try_write() {
             Ok(mut manager) => {
+                self.synchronize_compaction_engine(&mut manager);
                 let mut provider_messages = self.materialized_provider_messages();
                 manager.update_observed_input_tokens(self.context_limit);
-                let usage = manager.context_usage_with(&provider_messages);
-                if usage > 1.5 {
-                    let recovery = manager.recover_within_budget(&mut provider_messages);
-                    if recovery.did_anything() {
-                        self.messages = provider_messages;
-                        self.sync_session_compaction_state_from_manager(&manager);
-                        drop(manager);
-                        self.reset_state_for_compaction_retry();
-
-                        self.push_display_message(DisplayMessage::system(format!(
-                            "{} Retrying...",
-                            recovery.summary_line(usage)
-                        )));
-                        return self.run_compaction_retry_turn(terminal, event_stream).await;
+                if manager.engine() == crate::config::CompactionEngine::Lcm {
+                    match manager.hard_lcm_compact_with(&mut self.session) {
+                        Ok(_) => {
+                            drop(manager);
+                            self.reset_state_for_compaction_retry();
+                            self.push_display_message(DisplayMessage::system(
+                                "✓ Context compacted by LCM (emergency). Retrying...".to_string(),
+                            ));
+                            return self.run_compaction_retry_turn(terminal, event_stream).await;
+                        }
+                        Err(error) => {
+                            crate::logging::error(&format!(
+                                "[context_retry] hard LCM failed: {error}"
+                            ));
+                            false
+                        }
                     }
-                    false
                 } else {
-                    match manager.force_compact_with(&provider_messages, self.provider.clone()) {
-                        Ok(()) => true,
-                        Err(_) => match manager.hard_compact_with(&provider_messages) {
-                            Ok(_) => {
-                                self.sync_session_compaction_state_from_manager(&manager);
-                                drop(manager);
-                                self.reset_state_for_compaction_retry();
+                    let usage = manager.context_usage_with(&provider_messages);
+                    if usage > 1.5 {
+                        let recovery = manager.recover_within_budget(&mut provider_messages);
+                        if recovery.did_anything() {
+                            self.messages = provider_messages;
+                            self.sync_session_compaction_state_from_manager(&manager);
+                            drop(manager);
+                            self.reset_state_for_compaction_retry();
 
-                                self.push_display_message(DisplayMessage::system(
-                                    "✓ Context compacted (emergency). Retrying...".to_string(),
-                                ));
-                                return self
-                                    .run_compaction_retry_turn(terminal, event_stream)
-                                    .await;
-                            }
-                            Err(_) => false,
-                        },
+                            self.push_display_message(DisplayMessage::system(format!(
+                                "{} Retrying...",
+                                recovery.summary_line(usage)
+                            )));
+                            return self.run_compaction_retry_turn(terminal, event_stream).await;
+                        }
+                        false
+                    } else {
+                        match manager.force_compact_with(&provider_messages, self.provider.clone())
+                        {
+                            Ok(()) => true,
+                            Err(_) => match manager.hard_compact_with(&provider_messages) {
+                                Ok(_) => {
+                                    self.sync_session_compaction_state_from_manager(&manager);
+                                    drop(manager);
+                                    self.reset_state_for_compaction_retry();
+
+                                    self.push_display_message(DisplayMessage::system(
+                                        "✓ Context compacted (emergency). Retrying...".to_string(),
+                                    ));
+                                    return self
+                                        .run_compaction_retry_turn(terminal, event_stream)
+                                        .await;
+                                }
+                                Err(_) => false,
+                            },
+                        }
                     }
                 }
             }
@@ -1084,9 +1129,21 @@ impl App {
 
             let compaction = self.registry.compaction();
             let done = if let Ok(mut manager) = compaction.try_write() {
-                let provider_messages = self.materialized_provider_messages();
-                if let Some(event) = manager.poll_compaction_event_with(&provider_messages) {
-                    self.sync_session_compaction_state_from_manager(&manager);
+                self.synchronize_compaction_engine(&mut manager);
+                let event = if manager.engine() == crate::config::CompactionEngine::Lcm {
+                    manager
+                        .materialize_lcm_context(&mut self.session)
+                        .ok()
+                        .and_then(|(_, event)| event)
+                } else {
+                    let provider_messages = self.materialized_provider_messages();
+                    let event = manager.poll_compaction_event_with(&provider_messages);
+                    if event.is_some() {
+                        self.sync_session_compaction_state_from_manager(&manager);
+                    }
+                    event
+                };
+                if let Some(event) = event {
                     self.handle_compaction_event(event);
                     true
                 } else {
@@ -1333,19 +1390,44 @@ impl App {
             actions.push("Reset provider session resume state.".to_string());
         }
 
-        if !self.is_remote && self.provider.supports_compaction() {
+        let lcm_configured =
+            crate::config::config().compaction.engine == crate::config::CompactionEngine::Lcm;
+        if !self.is_remote && (lcm_configured || self.provider.supports_compaction()) {
             let observed_tokens = self
                 .current_stream_context_tokens()
                 .or_else(|| context_error.then_some(self.context_limit));
             let compaction = self.registry.compaction();
             match compaction.try_write() {
                 Ok(mut manager) => {
+                    self.synchronize_compaction_engine(&mut manager);
                     let mut provider_messages = self.materialized_provider_messages();
                     if let Some(tokens) = observed_tokens {
                         manager.update_observed_input_tokens(tokens);
                     }
                     let usage = manager.context_usage_with(&provider_messages);
-                    if usage > 1.5 {
+                    if manager.engine() == crate::config::CompactionEngine::Lcm {
+                        let result = if usage >= crate::compaction::CRITICAL_THRESHOLD
+                            || context_error
+                        {
+                            manager
+                                .hard_lcm_compact_with(&mut self.session)
+                                .map(|dropped| {
+                                    format!(
+                                        "Emergency LCM compaction summarized {dropped} old messages."
+                                    )
+                                })
+                        } else {
+                            manager
+                                .force_lcm_compact_with(&self.session, self.provider.clone())
+                                .map(|()| "Started background LCM compaction.".to_string())
+                        };
+                        match result {
+                            Ok(action) => actions.push(action),
+                            Err(error) => {
+                                notes.push(format!("LCM compaction not started: {error}"))
+                            }
+                        }
+                    } else if usage > 1.5 {
                         let recovery = manager.recover_within_budget(&mut provider_messages);
                         match recovery.dropped {
                             Some(dropped) if dropped > 0 => {

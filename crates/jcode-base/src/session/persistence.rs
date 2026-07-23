@@ -1,6 +1,12 @@
 use anyhow::Result;
 use chrono::Utc;
+#[cfg(any(unix, windows))]
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::time::Instant;
 
@@ -18,6 +24,83 @@ struct JournalReplayStats {
     entries: usize,
     skipped_lines: usize,
     salvaged_entries: usize,
+}
+
+#[cfg(unix)]
+struct SessionWriterLock(std::fs::File);
+
+#[cfg(unix)]
+impl SessionWriterLock {
+    fn acquire(snapshot_path: &Path) -> Result<Self> {
+        let lock_path = snapshot_path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self(file))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionWriterLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(windows)]
+struct SessionWriterLock(std::fs::File);
+
+#[cfg(windows)]
+impl SessionWriterLock {
+    fn acquire(snapshot_path: &Path) -> Result<Self> {
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let lock_path = snapshot_path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self(file))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SessionWriterLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let _ = unsafe { UnlockFileEx(self.0.as_raw_handle() as _, 0, 1, 0, &mut overlapped) };
+    }
 }
 
 impl JournalReplayStats {
@@ -155,6 +238,31 @@ fn replay_journal_lines(
 }
 
 impl Session {
+    fn verify_writer_base_is_current(&self, snapshot_path: &Path) -> Result<()> {
+        if !snapshot_path.exists() {
+            return Ok(());
+        }
+        let durable = Session::load(&self.id)?;
+        let durable_generation = durable
+            .context_frontier
+            .as_ref()
+            .map_or(0, |frontier| frontier.generation);
+        let writer_generation = self.persist_state.context_generation;
+        let stale_graph = durable_generation != writer_generation
+            || durable.last_context_op_id != self.persist_state.context_op_id;
+        if durable.journal_sequence != self.journal_sequence || stale_graph {
+            anyhow::bail!(
+                "stale session writer rejected for {} (durable journal/generation {}/{}, writer {}/{})",
+                self.id,
+                durable.journal_sequence,
+                durable_generation,
+                self.journal_sequence,
+                writer_generation
+            );
+        }
+        Ok(())
+    }
+
     /// Validate and durably checkpoint a context graph transaction before the
     /// live session can observe it. A failed write leaves `self` byte-for-byte
     /// unchanged from the caller's perspective.
@@ -162,13 +270,35 @@ impl Session {
         &mut self,
         transaction: ContextGraphTransaction,
     ) -> Result<bool> {
+        self.commit_context_graph_transaction_with_compaction(transaction, None)
+    }
+
+    /// Commit an LCM graph transaction and its legacy/provider projection in
+    /// the same durable snapshot. Provider context must never observe one
+    /// without the other.
+    pub fn commit_context_graph_transaction_with_compaction(
+        &mut self,
+        transaction: ContextGraphTransaction,
+        compaction: Option<super::StoredCompactionState>,
+    ) -> Result<bool> {
+        if let Some(state) = compaction.as_ref()
+            && (state.compacted_count != transaction.frontier.covered_message_count
+                || state.openai_encrypted_content.is_some())
+        {
+            anyhow::bail!("LCM projection does not match graph frontier");
+        }
+        let snapshot_path = session_path(&self.id)?;
+        let _writer_lock = SessionWriterLock::acquire(&snapshot_path)?;
+        self.verify_writer_base_is_current(&snapshot_path)?;
         let mut candidate = self.clone();
         if !candidate.apply_context_transaction_inner(&transaction, false)? {
             return Ok(false);
         }
+        if let Some(state) = compaction {
+            candidate.compaction = Some(state);
+        }
 
         candidate.updated_at = Utc::now();
-        let snapshot_path = session_path(&candidate.id)?;
         let journal_path = session_journal_path_from_snapshot(&snapshot_path);
         candidate.checkpoint_snapshot(&snapshot_path, &journal_path)?;
         *self = candidate;
@@ -379,6 +509,8 @@ impl Session {
     pub fn save(&mut self) -> Result<()> {
         self.updated_at = Utc::now();
         let path = session_path(&self.id)?;
+        let _writer_lock = SessionWriterLock::acquire(&path)?;
+        self.verify_writer_base_is_current(&path)?;
         let journal_path = session_journal_path_from_snapshot(&path);
         let start = std::time::Instant::now();
         let snapshot_bytes_before = file_len_or_zero(&path);

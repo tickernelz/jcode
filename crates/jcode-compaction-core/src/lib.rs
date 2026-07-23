@@ -94,9 +94,19 @@ pub struct Summary {
 }
 
 /// Event emitted when compaction is applied
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompactionEvent {
     pub trigger: String,
+    pub engine: Option<String>,
+    pub ownership: Option<String>,
+    pub configured_route: Option<String>,
+    pub effective_route: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub leaf_count: Option<usize>,
+    pub parent_count: Option<usize>,
+    pub frontier_size: Option<usize>,
+    pub max_node_level: Option<u32>,
+    pub graph_generation: Option<u64>,
     pub pre_tokens: Option<u64>,
     pub post_tokens: Option<u64>,
     pub tokens_saved: Option<u64>,
@@ -174,16 +184,43 @@ pub fn build_compaction_conversation_text(
                     conversation_text.push_str(text);
                     conversation_text.push('\n');
                 }
-                ContentBlock::ToolUse { name, input, .. } => {
-                    conversation_text.push_str(&format!("[Tool: {} - {}]\n", name, input));
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    conversation_text
+                        .push_str(&format!("[Tool call: id={id} name={name} input={input}]\n"));
                 }
-                ContentBlock::ToolResult { content, .. } => {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let status = match is_error {
+                        Some(true) => "error",
+                        Some(false) => "success",
+                        None => "unknown",
+                    };
                     let truncated = if content.len() > 500 {
-                        format!("{}... (truncated)", truncate_str_boundary(content, 500))
+                        let head = truncate_str_boundary(content, 250);
+                        let mut tail_start = content.len().saturating_sub(250);
+                        while tail_start < content.len() && !content.is_char_boundary(tail_start) {
+                            tail_start += 1;
+                        }
+                        let omitted = content
+                            .len()
+                            .saturating_sub(head.len())
+                            .saturating_sub(content.len().saturating_sub(tail_start));
+                        format!(
+                            "{head}... [{omitted} bytes omitted; retrieve canonical source for exact content] ...{}",
+                            &content[tail_start..]
+                        )
                     } else {
                         content.clone()
                     };
-                    conversation_text.push_str(&format!("[Result: {}]\n", truncated));
+                    conversation_text.push_str(&format!(
+                        "[Tool result: tool_use_id={tool_use_id} status={status} content={truncated}]\n"
+                    ));
                 }
                 ContentBlock::Reasoning { .. }
                 | ContentBlock::ReasoningTrace { .. }

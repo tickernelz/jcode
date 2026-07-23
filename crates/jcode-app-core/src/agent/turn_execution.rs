@@ -202,12 +202,19 @@ impl Agent {
         self.rewind_undo_snapshot = Some(RewindUndoSnapshot {
             messages: self.session.messages.clone(),
             compaction: self.session.compaction.clone(),
+            context_graph: self.session.context_graph_state(),
             provider_session_id: self.provider_session_id.clone(),
             session_provider_session_id: self.session.provider_session_id.clone(),
             visible_message_count: message_count,
         });
+        if let Err(error) = self.session.retain_context_graph_prefix(stored_len) {
+            logging::warn(&format!(
+                "Failed to retain valid LCM rewind prefix; falling back to raw history: {error}"
+            ));
+            self.session.compaction = None;
+            self.session.clear_context_graph_state();
+        }
         self.session.truncate_messages(stored_len);
-        self.session.compaction = None;
         self.session.updated_at = chrono::Utc::now();
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -228,6 +235,8 @@ impl Agent {
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
         self.session.replace_messages(snapshot.messages);
         self.session.compaction = snapshot.compaction;
+        self.session
+            .restore_context_graph_state(snapshot.context_graph);
         self.provider_session_id = snapshot.provider_session_id;
         self.session.provider_session_id = snapshot.session_provider_session_id;
         self.session.updated_at = chrono::Utc::now();

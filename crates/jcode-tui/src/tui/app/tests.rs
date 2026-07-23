@@ -607,6 +607,7 @@ fn compaction_invalidates_kv_cache_baseline_and_stale_completion_cannot_restore_
         messages_compacted: Some(173),
         summary_chars: Some(10_000),
         active_messages: Some(3),
+        ..Default::default()
     });
     assert_ne!(app.kv_cache.cache_generation, old_generation);
     assert!(app.kv_cache.kv_cache_baseline.is_none());

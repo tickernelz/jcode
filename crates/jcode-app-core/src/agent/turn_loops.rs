@@ -114,7 +114,10 @@ impl Agent {
             {
                 Ok(stream) => stream,
                 Err(e) => {
-                    if self.try_auto_compact_after_context_limit(&e.to_string()) {
+                    if self
+                        .try_auto_compact_after_context_limit(&e.to_string())
+                        .is_some()
+                    {
                         context_limit_retries += 1;
                         if context_limit_retries > Self::MAX_CONTEXT_LIMIT_RETRIES {
                             logging::warn(
@@ -189,7 +192,10 @@ impl Agent {
                     Ok(event) => event,
                     Err(e) => {
                         let err_str = e.to_string();
-                        if self.try_auto_compact_after_context_limit(&err_str) {
+                        if self
+                            .try_auto_compact_after_context_limit(&err_str)
+                            .is_some()
+                        {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
                                 self,
@@ -519,6 +525,14 @@ impl Agent {
                         pre_tokens,
                         openai_encrypted_content,
                     } => {
+                        if crate::config::config().compaction.engine
+                            == crate::config::CompactionEngine::Lcm
+                        {
+                            logging::warn(
+                                "Ignoring provider-native compaction event because LCM owns context",
+                            );
+                            continue;
+                        }
                         if let Some(encrypted_content) = openai_encrypted_content {
                             openai_native_compaction
                                 .get_or_insert((encrypted_content, self.session.messages.len()));
@@ -575,7 +589,10 @@ impl Agent {
                         if trace {
                             eprintln!("[trace] stream_error {}", message);
                         }
-                        if self.try_auto_compact_after_context_limit(&message) {
+                        if self
+                            .try_auto_compact_after_context_limit(&message)
+                            .is_some()
+                        {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
                                 self,
