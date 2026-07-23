@@ -1988,6 +1988,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         let current_count = app.session.rewind_target_count();
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
         app.session.replace_messages(snapshot.messages);
+        app.session.compaction = snapshot.compaction;
         app.provider_session_id = snapshot.provider_session_id;
         app.session.provider_session_id = snapshot.session_provider_session_id;
         app.session.updated_at = chrono::Utc::now();
@@ -2064,11 +2065,13 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
                 let removed = visible_count - n;
                 app.rewind_undo_snapshot = Some(LocalRewindUndoSnapshot {
                     messages: app.session.messages.clone(),
+                    compaction: app.session.compaction.clone(),
                     provider_session_id: app.provider_session_id.clone(),
                     session_provider_session_id: app.session.provider_session_id.clone(),
                     visible_message_count: visible_count,
                 });
                 app.session.truncate_messages(targets[n - 1] + 1);
+                app.session.compaction = None;
                 let provider_messages = app.session.messages_for_provider_uncached();
                 app.replace_provider_messages(provider_messages);
                 app.session.updated_at = chrono::Utc::now();
@@ -2927,6 +2930,7 @@ fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
         }
         "memory" | "memories" | "sidecar" => Some(crate::tui::AgentModelTarget::Memory),
         "ambient" => Some(crate::tui::AgentModelTarget::Ambient),
+        "compaction" | "lcm" => Some(crate::tui::AgentModelTarget::Compaction),
         _ => None,
     }
 }
@@ -3041,7 +3045,7 @@ pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
 
     let Some(target) = parse_agents_target(rest) else {
         app.push_display_message(DisplayMessage::error(
-            "Usage: /agents or /agents <swarm|review|judge|memory|ambient>".to_string(),
+            "Usage: /agents or /agents <swarm|review|judge|memory|ambient|compaction>".to_string(),
         ));
         return true;
     };

@@ -111,10 +111,19 @@ fn test_rewind_undo_restores_truncated_messages() {
     }
     app.provider_session_id = Some("provider-session".to_string());
     app.session.provider_session_id = Some("provider-session".to_string());
+    let compaction = crate::session::StoredCompactionState {
+        summary_text: "exact pre-rewind summary".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    app.session.compaction = Some(compaction.clone());
 
     app.input = "/rewind 1".to_string();
     app.submit_input();
     assert_eq!(app.session.visible_conversation_message_count(), 1);
+    assert!(app.session.compaction.is_none());
     assert!(
         app.display_messages()
             .last()
@@ -128,6 +137,7 @@ fn test_rewind_undo_restores_truncated_messages() {
 
     assert_eq!(app.session.visible_conversation_message_count(), 3);
     assert_eq!(app.messages.len(), 3);
+    assert_eq!(app.session.compaction, Some(compaction));
     assert_eq!(app.provider_session_id.as_deref(), Some("provider-session"));
     assert_eq!(
         app.session.provider_session_id.as_deref(),

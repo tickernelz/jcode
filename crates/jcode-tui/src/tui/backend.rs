@@ -786,6 +786,16 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Set or clear the server-global compaction model route spec.
+    pub async fn set_compaction_model(&mut self, model: Option<String>) -> Result<()> {
+        let request = Request::SetCompactionModel {
+            id: self.next_request_id,
+            model,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await
+    }
+
     /// Set or clear the custom session display title on the server.
     pub async fn rename_session(&mut self, title: Option<String>) -> Result<()> {
         let request = Request::RenameSession {
@@ -1565,6 +1575,40 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<Request>(&line).expect("clear request should deserialize"),
             Request::Clear { id: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_compaction_model_sends_authoritative_choose_and_clear_requests() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+
+        remote
+            .set_compaction_model(Some("openai-api:gpt-5.5".to_string()))
+            .await
+            .expect("choose request should send");
+        remote
+            .set_compaction_model(None)
+            .await
+            .expect("clear request should send");
+
+        let mut choose = String::new();
+        reader.read_line(&mut choose).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&choose).unwrap(),
+            Request::SetCompactionModel { id: 1, model: Some(model) }
+                if model == "openai-api:gpt-5.5"
+        ));
+        let mut clear = String::new();
+        reader.read_line(&mut clear).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&clear).unwrap(),
+            Request::SetCompactionModel { id: 2, model: None }
         ));
     }
 

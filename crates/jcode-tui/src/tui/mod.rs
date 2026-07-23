@@ -1067,6 +1067,7 @@ pub enum AgentModelTarget {
     Judge,
     Memory,
     Ambient,
+    Compaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

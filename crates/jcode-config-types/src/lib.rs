@@ -39,6 +39,38 @@ impl CompactionMode {
     }
 }
 
+/// Context engine used to materialize compacted history.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactionEngine {
+    #[default]
+    Rolling,
+    Lcm,
+}
+
+impl CompactionEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rolling => "rolling",
+            Self::Lcm => "lcm",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "rolling" => Some(Self::Rolling),
+            "lcm" => Some(Self::Lcm),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Session picker Enter action: "current-terminal" (default) or "new-terminal".
 /// Ctrl+Enter performs the alternate action.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -343,6 +375,10 @@ impl CrossProviderFailoverMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompactionConfig {
+    /// Context engine: rolling (default) or lcm.
+    pub engine: CompactionEngine,
+    /// Optional full route spec for compaction. Unset inherits the active session route.
+    pub model: Option<String>,
     /// Compaction mode: reactive (default), proactive, or semantic
     pub mode: CompactionMode,
 
@@ -377,6 +413,8 @@ pub struct CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
+            engine: CompactionEngine::default(),
+            model: None,
             mode: CompactionMode::Reactive,
             lookahead_turns: 15,
             ewma_alpha: 0.3,
@@ -1633,4 +1671,32 @@ pub struct LaunchHotkeysConfig {
     /// Set true once auto-import has populated `entries`, so we only bake the
     /// per-repo mapping a single time and never clobber later user edits.
     pub imported: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_engine_defaults_to_rolling_and_displays_stably() {
+        let config = CompactionConfig::default();
+        assert_eq!(config.engine, CompactionEngine::Rolling);
+        assert_eq!(config.engine.to_string(), "rolling");
+        assert_eq!(config.model, None);
+        assert_eq!(CompactionEngine::parse("LCM"), Some(CompactionEngine::Lcm));
+    }
+
+    #[test]
+    fn compaction_config_deserializes_new_fields_without_changing_old_defaults() {
+        let config: CompactionConfig =
+            serde_json::from_str(r#"{"engine":"lcm","model":"openai-api:gpt-5.5"}"#)
+                .expect("compaction config should deserialize");
+        assert_eq!(config.engine, CompactionEngine::Lcm);
+        assert_eq!(config.model.as_deref(), Some("openai-api:gpt-5.5"));
+
+        let legacy: CompactionConfig =
+            serde_json::from_str("{}").expect("legacy config should deserialize");
+        assert_eq!(legacy.engine, CompactionEngine::Rolling);
+        assert_eq!(legacy.model, None);
+    }
 }

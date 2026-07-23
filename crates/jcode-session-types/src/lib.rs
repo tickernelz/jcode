@@ -240,6 +240,175 @@ pub struct StoredMessage {
     pub token_usage: Option<StoredTokenUsage>,
 }
 
+/// Immutable persisted summary node. Hashes are lowercase SHA-256 hex strings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredContextNode {
+    pub id: String,
+    pub schema_version: u32,
+    pub level: u32,
+    pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_message_ids: Vec<String>,
+    pub source_sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_node_ids: Vec<String>,
+    pub summary_text: String,
+    pub estimated_tokens: u64,
+    pub summarizer_model: String,
+    pub summarizer_provider: String,
+    pub summarizer_route: String,
+    pub prompt_schema_version: u32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Small mutable pointer set into the immutable context node graph.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredContextFrontier {
+    pub schema_version: u32,
+    pub generation: u64,
+    pub active_node_ids: Vec<String>,
+    pub covered_message_count: usize,
+    pub covered_through_message_id: Option<String>,
+    pub source_prefix_sha256: String,
+    pub next_node_sequence: u64,
+}
+
+/// Canonical input captured before a context graph transaction is prepared.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextGraphInputProof {
+    pub schema_version: u32,
+    pub source_session_id: String,
+    pub source_message_ids: Vec<String>,
+    pub source_sha256: String,
+}
+
+/// One append-only, generation-checked graph publication.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextGraphTransaction {
+    pub schema_version: u32,
+    pub op_id: String,
+    pub base_generation: u64,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub append_context_nodes: Vec<StoredContextNode>,
+    pub frontier: StoredContextFrontier,
+    pub input_proof: ContextGraphInputProof,
+}
+
+/// Validate node identity, parent availability, cycles, and frontier references.
+pub fn validate_context_graph(
+    nodes: &[StoredContextNode],
+    frontier: Option<&StoredContextFrontier>,
+) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+
+    fn is_lower_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    let mut by_id = HashMap::new();
+    for node in nodes {
+        if node.schema_version != 1
+            || node.prompt_schema_version == 0
+            || node.id.is_empty()
+            || node.source_session_id.is_empty()
+            || node.source_message_ids.is_empty()
+            || !is_lower_sha256(&node.source_sha256)
+            || node.summary_text.trim().is_empty()
+            || node.estimated_tokens == 0
+            || node.summarizer_model.is_empty()
+            || node.summarizer_provider.is_empty()
+            || node.summarizer_route.is_empty()
+        {
+            return Err(format!("context node {} has invalid metadata", node.id));
+        }
+        if by_id.insert(node.id.as_str(), node).is_some() {
+            return Err(format!("duplicate context node id {}", node.id));
+        }
+    }
+    for node in nodes {
+        let mut unique_children = HashSet::new();
+        for child in &node.child_node_ids {
+            if !unique_children.insert(child.as_str()) {
+                return Err(format!(
+                    "context node {} references child {child} more than once",
+                    node.id
+                ));
+            }
+            if !by_id.contains_key(child.as_str()) {
+                return Err(format!(
+                    "context node {} has missing child {child}",
+                    node.id
+                ));
+            }
+        }
+    }
+
+    fn visit<'a>(
+        id: &'a str,
+        nodes: &HashMap<&'a str, &'a StoredContextNode>,
+        visiting: &mut HashSet<&'a str>,
+        visited: &mut HashSet<&'a str>,
+    ) -> Result<(), String> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if !visiting.insert(id) {
+            return Err(format!("context graph cycle at {id}"));
+        }
+        for child in &nodes[id].child_node_ids {
+            visit(child, nodes, visiting, visited)?;
+        }
+        visiting.remove(id);
+        visited.insert(id);
+        Ok(())
+    }
+
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for id in by_id.keys().copied() {
+        visit(id, &by_id, &mut visiting, &mut visited)?;
+    }
+    for node in nodes {
+        for child in &node.child_node_ids {
+            let child_node = by_id[child.as_str()];
+            if child_node.level >= node.level {
+                return Err(format!(
+                    "context node {} level {} must be above child {child} level {}",
+                    node.id, node.level, child_node.level
+                ));
+            }
+        }
+    }
+    if let Some(frontier) = frontier {
+        if frontier.schema_version != 1
+            || frontier.generation == 0
+            || frontier.active_node_ids.is_empty()
+            || frontier.covered_message_count == 0
+            || frontier.covered_through_message_id.is_none()
+            || !is_lower_sha256(&frontier.source_prefix_sha256)
+            || frontier.next_node_sequence == 0
+        {
+            return Err("context frontier has invalid metadata".to_string());
+        }
+        let mut unique_active = HashSet::new();
+        for id in &frontier.active_node_ids {
+            if !unique_active.insert(id.as_str()) {
+                return Err(format!(
+                    "context frontier references node {id} more than once"
+                ));
+            }
+            if !by_id.contains_key(id.as_str()) {
+                return Err(format!("context frontier references missing node {id}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredDisplayRole {
@@ -1062,5 +1231,50 @@ mod session_search_tests {
         let fenced = session_search_markdown_code_block("contains ``` fence");
         assert!(fenced.starts_with("````text\n"));
         assert!(fenced.ends_with("\n````"));
+    }
+}
+
+#[cfg(test)]
+mod context_graph_tests {
+    use super::*;
+
+    fn node(id: &str, children: &[&str]) -> StoredContextNode {
+        StoredContextNode {
+            id: id.to_string(),
+            schema_version: 1,
+            level: u32::from(!children.is_empty()),
+            source_session_id: "session".to_string(),
+            source_message_ids: vec![format!("message-{id}")],
+            source_sha256: "a".repeat(64),
+            child_node_ids: children.iter().map(|id| (*id).to_string()).collect(),
+            summary_text: id.to_string(),
+            estimated_tokens: 1,
+            summarizer_model: "model".to_string(),
+            summarizer_provider: "provider".to_string(),
+            summarizer_route: "route".to_string(),
+            prompt_schema_version: 1,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn graph_rejects_duplicate_ids() {
+        let err = validate_context_graph(&[node("a", &[]), node("a", &[])], None)
+            .expect_err("duplicate IDs must fail");
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn graph_rejects_missing_children() {
+        let err = validate_context_graph(&[node("parent", &["missing"])], None)
+            .expect_err("missing children must fail");
+        assert!(err.contains("missing child"));
+    }
+
+    #[test]
+    fn graph_rejects_cycles() {
+        let err = validate_context_graph(&[node("a", &["b"]), node("b", &["a"])], None)
+            .expect_err("cycles must fail");
+        assert!(err.contains("cycle"));
     }
 }

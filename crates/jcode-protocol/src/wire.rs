@@ -287,6 +287,14 @@ pub enum Request {
         mode: jcode_config_types::CompactionMode,
     },
 
+    /// Set or clear the server-global compaction model route spec.
+    #[serde(rename = "set_compaction_model")]
+    SetCompactionModel {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+
     /// Set or clear the active session's custom display title.
     #[serde(rename = "rename_session")]
     RenameSession {
@@ -1237,6 +1245,16 @@ pub enum ServerEvent {
         id: u64,
         mode: jcode_config_types::CompactionMode,
         #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Authoritative result of a server-global compaction model mutation.
+    #[serde(rename = "compaction_model_changed")]
+    CompactionModelChanged {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
 

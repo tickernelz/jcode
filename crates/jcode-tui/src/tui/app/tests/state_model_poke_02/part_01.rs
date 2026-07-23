@@ -228,8 +228,14 @@ fn test_handterm_native_scroll_command_updates_chat_offset() {
         pane: super::handterm_native_scroll::PaneKind::Chat,
         delta: -2,
     });
-    assert_eq!(app.scroll_offset, 5, "the first row should render immediately");
-    assert_eq!(app.mouse_scroll_queue, -1, "the second row should remain queued");
+    assert_eq!(
+        app.scroll_offset, 5,
+        "the first row should render immediately"
+    );
+    assert_eq!(
+        app.mouse_scroll_queue, -1,
+        "the second row should remain queued"
+    );
     app.progress_mouse_scroll_animation();
     assert_eq!(app.scroll_offset, 4);
 
@@ -237,10 +243,19 @@ fn test_handterm_native_scroll_command_updates_chat_offset() {
         pane: super::handterm_native_scroll::PaneKind::Chat,
         delta: 3,
     });
-    assert_eq!(app.scroll_offset, 5, "the first row should render immediately");
-    assert_eq!(app.mouse_scroll_queue, 2, "later rows should animate on ticks");
+    assert_eq!(
+        app.scroll_offset, 5,
+        "the first row should render immediately"
+    );
+    assert_eq!(
+        app.mouse_scroll_queue, 2,
+        "later rows should animate on ticks"
+    );
     app.progress_mouse_scroll_animation();
-    assert_eq!(app.scroll_offset, 6, "the queued rows should be revealed separately");
+    assert_eq!(
+        app.scroll_offset, 6,
+        "the queued rows should be revealed separately"
+    );
     assert_eq!(app.mouse_scroll_queue, 1);
     app.progress_mouse_scroll_animation();
     assert_eq!(app.scroll_offset, 7);
@@ -1284,6 +1299,19 @@ fn test_agents_command_opens_agent_picker() {
         })
         .expect("swarm entry");
     assert!(swarm_entry.options[0].detail.contains("/swarm-prompt"));
+    assert_eq!(picker.filtered.len(), picker.entries.len());
+    let compaction = picker
+        .entries
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.action,
+                crate::tui::PickerAction::AgentTarget(crate::tui::AgentModelTarget::Compaction)
+            )
+        })
+        .expect("compaction entry");
+    assert_eq!(compaction.name, "LCM compactor");
+    assert_eq!(compaction.options[0].api_method, "compaction.model");
 }
 
 #[test]
@@ -1291,6 +1319,38 @@ fn test_agents_command_suggestions_include_targets() {
     let app = create_test_app();
     let suggestions = app.get_suggestions_for("/agents re");
     assert!(suggestions.iter().any(|(cmd, _)| cmd == "/agents review"));
+    let suggestions = app.get_suggestions_for("/agents comp");
+    assert!(
+        suggestions
+            .iter()
+            .any(|(cmd, _)| cmd == "/agents compaction")
+    );
+    let help = app.command_help("agents").expect("agents help");
+    assert!(help.contains("compaction"));
+    assert!(help.contains("/agents lcm"));
+}
+
+#[test]
+fn test_agents_lcm_alias_opens_compaction_model_picker() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        configure_test_remote_models(&mut app);
+        app.input = "/agents lcm".to_string();
+        app.submit_input();
+
+        let picker = app
+            .inline_interactive_state
+            .as_ref()
+            .expect("alias should open model picker");
+        assert!(matches!(
+            picker.entries[0].action,
+            crate::tui::PickerAction::AgentModelChoice {
+                target: crate::tui::AgentModelTarget::Compaction,
+                clear_override: true,
+            }
+        ));
+        assert!(picker.entries[0].name.starts_with("inherit ("));
+    });
 }
 
 #[test]

@@ -1,4 +1,37 @@
 #[test]
+fn test_compaction_model_mutation_roundtrip_preserves_route_spec() -> Result<()> {
+    let request = Request::SetCompactionModel {
+        id: 42,
+        model: Some("openai-api:gpt-5.5".to_string()),
+    };
+    let json = serde_json::to_string(&request)?;
+    let decoded = parse_request_json(&json)?;
+    assert!(matches!(
+        decoded,
+        Request::SetCompactionModel {
+            id: 42,
+            model: Some(ref model),
+        } if model == "openai-api:gpt-5.5"
+    ));
+
+    let event = ServerEvent::CompactionModelChanged {
+        id: 42,
+        model: Some("openai-api:gpt-5.5".to_string()),
+        error: None,
+    };
+    let decoded = parse_event_json(encode_event(&event).trim())?;
+    assert!(matches!(
+        decoded,
+        ServerEvent::CompactionModelChanged {
+            id: 42,
+            model: Some(ref model),
+            error: None,
+        } if model == "openai-api:gpt-5.5"
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_transcript_request_roundtrip() -> Result<()> {
     let req = Request::Transcript {
         id: 77,
@@ -457,9 +490,7 @@ fn test_provider_guardrail_event_roundtrip() -> Result<()> {
     assert_eq!(message, "Provider guardrail stopped the response");
 
     // stop_reason is optional on the wire.
-    let decoded = parse_event_json(
-        r#"{"type":"provider_guardrail","message":"blocked"}"#,
-    )?;
+    let decoded = parse_event_json(r#"{"type":"provider_guardrail","message":"blocked"}"#)?;
     let ServerEvent::ProviderGuardrail { stop_reason, .. } = decoded else {
         return Err(anyhow!("expected ProviderGuardrail event"));
     };

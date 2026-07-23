@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use super::journal::{PersistVectorMode, SessionJournalEntry, metadata_requires_snapshot};
 use super::storage_paths::{file_len_or_zero, session_journal_path_from_snapshot, session_path};
-use super::{MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session, SessionStartupStub};
+use super::{
+    ContextGraphTransaction, MAX_SESSION_JOURNAL_BYTES, RemoteStartupSessionSnapshot, Session,
+    SessionStartupStub,
+};
 use crate::storage;
 
 /// Outcome of replaying one session journal file.
@@ -29,17 +32,13 @@ impl JournalReplayStats {
 /// If a writer died mid-append (torn line without a trailing newline), the
 /// next successful append starts writing on the same line, producing
 /// `<torn json><complete entry json>\n` or `<entry json><entry json>\n`.
-/// Serialized entries always begin with `{"meta":` (struct field order), so
-/// scan for candidate starts and stream-parse consecutive complete entries
-/// from the first position that yields any.
+/// Scan object starts and stream-parse consecutive complete entries from the
+/// first position that yields any. This supports both legacy `{"meta":...}`
+/// and sequenced `{"sequence":...}` entries.
 fn salvage_glued_journal_entries(line: &str, mut apply: impl FnMut(SessionJournalEntry)) -> usize {
-    const ENTRY_START: &str = "{\"meta\":";
     let mut salvaged = 0usize;
     let mut search_from = 0usize;
-    while let Some(rel) = line
-        .get(search_from..)
-        .and_then(|rest| rest.find(ENTRY_START))
-    {
+    while let Some(rel) = line.get(search_from..).and_then(|rest| rest.find('{')) {
         let candidate_start = search_from + rel;
         let mut stream = serde_json::Deserializer::from_str(&line[candidate_start..])
             .into_iter::<SessionJournalEntry>();
@@ -57,7 +56,7 @@ fn salvage_glued_journal_entries(line: &str, mut apply: impl FnMut(SessionJourna
             }
             break;
         }
-        search_from = candidate_start + ENTRY_START.len();
+        search_from = candidate_start + 1;
     }
     salvaged
 }
@@ -75,6 +74,7 @@ fn salvage_glued_journal_entries(line: &str, mut apply: impl FnMut(SessionJourna
 /// gap are far better than losing the whole tail.
 fn replay_journal_lines(
     journal_path: &Path,
+    snapshot_watermark: u64,
     mut apply: impl FnMut(SessionJournalEntry),
 ) -> Result<JournalReplayStats> {
     let mut stats = JournalReplayStats::default();
@@ -84,6 +84,7 @@ fn replay_journal_lines(
 
     let file = std::fs::File::open(journal_path)?;
     let reader = BufReader::new(file);
+    let mut current_sequence = snapshot_watermark;
     for (line_idx, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
@@ -91,13 +92,38 @@ fn replay_journal_lines(
             continue;
         }
         match serde_json::from_str::<SessionJournalEntry>(trimmed) {
-            Ok(entry) => {
+            Ok(mut entry) => {
                 stats.entries += 1;
-                apply(entry);
+                // Legacy entries had no sequence. Assign them deterministic file-order
+                // sequences so the next checkpoint can cover them. A non-zero snapshot
+                // watermark can only have been written after all legacy entries present
+                // at that checkpoint were applied, so any sequence-less entry left beside
+                // such a snapshot is stale journal-retirement residue.
+                if entry.sequence == 0 {
+                    if snapshot_watermark > 0 {
+                        continue;
+                    }
+                    entry.sequence = current_sequence.saturating_add(1);
+                }
+                if entry.sequence > snapshot_watermark && entry.sequence > current_sequence {
+                    current_sequence = entry.sequence;
+                    apply(entry);
+                }
             }
             Err(err) => {
                 stats.skipped_lines += 1;
-                let salvaged = salvage_glued_journal_entries(trimmed, &mut apply);
+                let salvaged = salvage_glued_journal_entries(trimmed, |mut entry| {
+                    if entry.sequence == 0 {
+                        if snapshot_watermark > 0 {
+                            return;
+                        }
+                        entry.sequence = current_sequence.saturating_add(1);
+                    }
+                    if entry.sequence > snapshot_watermark && entry.sequence > current_sequence {
+                        current_sequence = entry.sequence;
+                        apply(entry);
+                    }
+                });
                 stats.entries += salvaged;
                 stats.salvaged_entries += salvaged;
                 crate::logging::warn(&format!(
@@ -129,18 +155,52 @@ fn replay_journal_lines(
 }
 
 impl Session {
+    /// Validate and durably checkpoint a context graph transaction before the
+    /// live session can observe it. A failed write leaves `self` byte-for-byte
+    /// unchanged from the caller's perspective.
+    pub fn commit_context_graph_transaction(
+        &mut self,
+        transaction: ContextGraphTransaction,
+    ) -> Result<bool> {
+        let mut candidate = self.clone();
+        if !candidate.apply_context_transaction_inner(&transaction, false)? {
+            return Ok(false);
+        }
+
+        candidate.updated_at = Utc::now();
+        let snapshot_path = session_path(&candidate.id)?;
+        let journal_path = session_journal_path_from_snapshot(&snapshot_path);
+        candidate.checkpoint_snapshot(&snapshot_path, &journal_path)?;
+        *self = candidate;
+        Ok(true)
+    }
+
     fn apply_journal_entry(&mut self, entry: SessionJournalEntry) {
+        self.journal_sequence = self.journal_sequence.max(entry.sequence);
         self.apply_journal_meta(entry.meta);
         self.messages.extend(entry.append_messages);
         self.env_snapshots.extend(entry.append_env_snapshots);
         self.memory_injections
             .extend(entry.append_memory_injections);
         self.replay_events.extend(entry.append_replay_events);
+        if let Some(transaction) = entry.context_transaction {
+            if let Err(err) = self.apply_context_transaction_inner(&transaction, false) {
+                crate::logging::warn(&format!(
+                    "Ignoring invalid context transaction {} for session {}: {}",
+                    transaction.op_id, self.id, err
+                ));
+            }
+        }
         self.mark_memory_profile_dirty();
     }
 
     fn checkpoint_snapshot(&mut self, snapshot_path: &Path, journal_path: &Path) -> Result<()> {
-        storage::write_json_fast(snapshot_path, self)?;
+        let previous_watermark = self.journal_watermark;
+        self.journal_watermark = self.journal_sequence;
+        if let Err(err) = storage::write_json(snapshot_path, self) {
+            self.journal_watermark = previous_watermark;
+            return Err(err);
+        }
         if journal_path.exists() {
             let _ = std::fs::remove_file(journal_path);
         }
@@ -177,13 +237,15 @@ impl Session {
         let snapshot_bytes = file_len_or_zero(path);
         let snapshot_start = Instant::now();
         let mut session: Session = storage::read_json(path)?;
+        session.discard_invalid_context_graph();
         let snapshot_ms = snapshot_start.elapsed().as_millis();
         let journal_path = session_journal_path_from_snapshot(path);
         let journal_bytes = file_len_or_zero(&journal_path);
         let journal_start = Instant::now();
-        let replay_stats = replay_journal_lines(&journal_path, |entry| {
-            session.apply_journal_entry(entry);
-        })?;
+        let replay_stats =
+            replay_journal_lines(&journal_path, session.journal_watermark, |entry| {
+                session.apply_journal_entry(entry);
+            })?;
         let journal_entries = replay_stats.entries;
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
@@ -256,15 +318,25 @@ impl Session {
         let snapshot: RemoteStartupSessionSnapshot = serde_json::from_reader(reader)?;
         let snapshot_ms = snapshot_start.elapsed().as_millis();
         let mut session = Self::session_from_remote_startup_snapshot(snapshot);
+        session.discard_invalid_context_graph();
         let journal_path = session_journal_path_from_snapshot(&path);
         let journal_bytes = file_len_or_zero(&journal_path);
         let journal_start = Instant::now();
         let mut journal_entries = 0usize;
-        replay_journal_lines(&journal_path, |entry| {
+        replay_journal_lines(&journal_path, session.journal_watermark, |entry| {
             journal_entries += 1;
+            session.journal_sequence = session.journal_sequence.max(entry.sequence);
             session.apply_journal_meta(entry.meta);
             session.messages.extend(entry.append_messages);
             session.replay_events.extend(entry.append_replay_events);
+            if let Some(transaction) = entry.context_transaction {
+                if let Err(err) = session.apply_context_transaction_inner(&transaction, false) {
+                    crate::logging::warn(&format!(
+                        "Ignoring invalid context transaction {} for remote session {}: {}",
+                        transaction.op_id, session.id, err
+                    ));
+                }
+            }
         })?;
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
@@ -322,6 +394,8 @@ impl Session {
             || self.persist_state.env_snapshots_mode == PersistVectorMode::Full
             || self.persist_state.memory_injections_mode == PersistVectorMode::Full
             || self.persist_state.replay_events_mode == PersistVectorMode::Full
+            || (self.persist_state.pending_context_transaction.is_none()
+                && self.context_nodes.len() != self.persist_state.context_nodes_len)
             || self.messages.len() < self.persist_state.messages_len
             || self.env_snapshots.len() < self.persist_state.env_snapshots_len
             || self.memory_injections.len() < self.persist_state.memory_injections_len
@@ -368,6 +442,7 @@ impl Session {
         } else {
             let entry_build_start = Instant::now();
             let entry = SessionJournalEntry {
+                sequence: self.journal_sequence.saturating_add(1),
                 meta: current_meta.clone(),
                 append_messages: self.messages[self.persist_state.messages_len..].to_vec(),
                 append_env_snapshots: self.env_snapshots[self.persist_state.env_snapshots_len..]
@@ -377,6 +452,7 @@ impl Session {
                     .to_vec(),
                 append_replay_events: self.replay_events[self.persist_state.replay_events_len..]
                     .to_vec(),
+                context_transaction: self.persist_state.pending_context_transaction.clone(),
             };
             let entry_build_ms = entry_build_start.elapsed().as_millis();
             let append_start = Instant::now();
@@ -384,6 +460,7 @@ impl Session {
             let append_ms = append_start.elapsed().as_millis();
             match append_result {
                 Ok(()) => {
+                    self.journal_sequence = entry.sequence;
                     self.reset_persist_state(true);
                     let journal_stat_start = Instant::now();
                     let journal_bytes_after = file_len_or_zero(&journal_path);

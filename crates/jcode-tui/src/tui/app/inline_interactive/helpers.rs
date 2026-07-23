@@ -50,6 +50,7 @@ pub(super) fn agent_model_target_label(target: AgentModelTarget) -> &'static str
         AgentModelTarget::Judge => "Judge",
         AgentModelTarget::Memory => "Memory",
         AgentModelTarget::Ambient => "Ambient",
+        AgentModelTarget::Compaction => "LCM compactor",
     }
 }
 
@@ -60,6 +61,7 @@ pub(super) fn agent_model_target_slug(target: AgentModelTarget) -> &'static str 
         AgentModelTarget::Judge => "judge",
         AgentModelTarget::Memory => "memory",
         AgentModelTarget::Ambient => "ambient",
+        AgentModelTarget::Compaction => "compaction",
     }
 }
 
@@ -70,6 +72,7 @@ pub(super) fn agent_model_target_config_path(target: AgentModelTarget) -> &'stat
         AgentModelTarget::Judge => "autojudge.model",
         AgentModelTarget::Memory => "agents.memory_model",
         AgentModelTarget::Ambient => "ambient.model",
+        AgentModelTarget::Compaction => "compaction.model",
     }
 }
 
@@ -81,6 +84,7 @@ pub(super) fn load_agent_model_override(target: AgentModelTarget) -> Option<Stri
         AgentModelTarget::Judge => cfg.autojudge.model,
         AgentModelTarget::Memory => cfg.agents.memory_model,
         AgentModelTarget::Ambient => cfg.ambient.model,
+        AgentModelTarget::Compaction => cfg.compaction.model,
     }
 }
 
@@ -99,6 +103,7 @@ pub(super) fn save_agent_model_override(
         AgentModelTarget::Judge => cfg.autojudge.model = value,
         AgentModelTarget::Memory => cfg.agents.memory_model = value,
         AgentModelTarget::Ambient => cfg.ambient.model = value,
+        AgentModelTarget::Compaction => cfg.compaction.model = value,
     }
     cfg.save()
 }
@@ -197,6 +202,7 @@ pub(super) fn agent_model_inherit_fallback_label(target: AgentModelTarget) -> &'
         | AgentModelTarget::Review
         | AgentModelTarget::Judge
         | AgentModelTarget::Ambient => "provider default",
+        AgentModelTarget::Compaction => "active session route",
     }
 }
 
@@ -235,6 +241,9 @@ pub(super) fn agent_model_default_summary(target: AgentModelTarget, app: &App) -
             .or_else(|| Some(app.provider.model())),
         AgentModelTarget::Memory => load_agent_model_override(target),
         AgentModelTarget::Ambient => load_agent_model_override(target),
+        AgentModelTarget::Compaction => load_agent_model_override(target)
+            .or_else(|| app.session.model.clone())
+            .or_else(|| Some(app.provider.model())),
     };
 
     normalize_agent_model_summary(target, summary)

@@ -26,6 +26,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
+fn message_fingerprint(messages: &[Message]) -> Option<u64> {
+    messages
+        .iter()
+        .map(jcode_message_types::stable_message_hash)
+        .reduce(jcode_message_types::extend_stable_hash)
+}
+
 pub use jcode_compaction_core::{
     CHARS_PER_TOKEN, COMPACTION_THRESHOLD, CRITICAL_THRESHOLD, CompactionAction, CompactionEvent,
     CompactionStats, DEFAULT_TOKEN_BUDGET, EMBED_MAX_CHARS_PER_MSG, EMBEDDING_HISTORY_WINDOW,
@@ -156,6 +163,10 @@ pub struct CompactionManager {
     /// Turn index (relative to uncompacted messages) where pending compaction will cut off
     pending_cutoff: usize,
 
+    /// Stable cache-relevant fingerprint of the exact source prefix captured by
+    /// the pending task. Message count alone cannot detect same-length rewrites.
+    pending_source_fingerprint: Option<u64>,
+
     /// Total turns seen (for tracking)
     total_turns: usize,
 
@@ -215,6 +226,7 @@ impl CompactionManager {
             pending_task: None,
             pending_trigger: None,
             pending_cutoff: 0,
+            pending_source_fingerprint: None,
             total_turns: 0,
             suppress_compaction_until_new_message: false,
             token_budget: DEFAULT_TOKEN_BUDGET,
@@ -232,6 +244,9 @@ impl CompactionManager {
 
     /// Reset all compaction state
     pub fn reset(&mut self) {
+        if let Some(task) = self.pending_task.take() {
+            task.abort();
+        }
         *self = Self::new();
     }
 
@@ -321,9 +336,12 @@ impl CompactionManager {
         state: &crate::session::StoredCompactionState,
         total_messages: usize,
     ) {
-        self.pending_task = None;
+        if let Some(task) = self.pending_task.take() {
+            task.abort();
+        }
         self.pending_trigger = None;
         self.pending_cutoff = 0;
+        self.pending_source_fingerprint = None;
         self.observed_input_tokens = None;
         self.last_compaction = None;
         self.token_history.clear();
@@ -900,6 +918,7 @@ impl CompactionManager {
         ));
 
         self.pending_cutoff = cutoff;
+        self.pending_source_fingerprint = message_fingerprint(&active[..cutoff]);
         self.pending_trigger = Some(mode_label.clone());
 
         // Spawn background task that notifies via Bus when done
@@ -1114,6 +1133,7 @@ impl CompactionManager {
         let existing_summary = self.active_summary.clone();
 
         self.pending_cutoff = cutoff;
+        self.pending_source_fingerprint = message_fingerprint(&active[..cutoff]);
         self.pending_trigger = Some("manual".to_string());
 
         self.pending_task = Some(tokio::spawn(async move {
@@ -1175,14 +1195,18 @@ impl CompactionManager {
                 // it. Hard compacts already abort the pending task, so this is a
                 // belt-and-suspenders guard.
                 let active_len = self.active_messages(all_messages).len();
+                let source_matches = message_fingerprint(
+                    &self.active_messages(all_messages)[..self.pending_cutoff.min(active_len)],
+                ) == self.pending_source_fingerprint;
                 let leaves_no_healthy_tail =
                     self.pending_cutoff > active_len.saturating_sub(MIN_TURNS_TO_KEEP);
-                if !all_messages.is_empty() && leaves_no_healthy_tail {
+                if !all_messages.is_empty() && (leaves_no_healthy_tail || !source_matches) {
                     crate::logging::warn(&format!(
                         "[compaction] Discarding stale background compaction result (pending_cutoff={}, active_len={}, trigger={}) — context changed since it started",
                         self.pending_cutoff, active_len, trigger,
                     ));
                     self.pending_cutoff = 0;
+                    self.pending_source_fingerprint = None;
                     self.pending_trigger = None;
                     return;
                 }
@@ -1262,17 +1286,20 @@ impl CompactionManager {
                 self.turns_since_last_compact = 0;
 
                 self.pending_cutoff = 0;
+                self.pending_source_fingerprint = None;
                 self.pending_trigger = None;
             }
             Ok(Err(e)) => {
                 crate::logging::error(&format!("[compaction] Failed to generate summary: {}", e));
                 self.pending_trigger = None;
                 self.pending_cutoff = 0;
+                self.pending_source_fingerprint = None;
             }
             Err(e) => {
                 crate::logging::error(&format!("[compaction] Task panicked: {}", e));
                 self.pending_trigger = None;
                 self.pending_cutoff = 0;
+                self.pending_source_fingerprint = None;
             }
         }
     }
@@ -1505,6 +1532,7 @@ impl CompactionManager {
                 self.pending_cutoff, self.pending_trigger,
             ));
             self.pending_cutoff = 0;
+            self.pending_source_fingerprint = None;
             self.pending_trigger = None;
         }
 

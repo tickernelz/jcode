@@ -835,6 +835,13 @@ pub(super) async fn handle_client(
                         let _ = client_event_tx.send(event);
                         last_available_models_snapshot = Some(encoded_event);
                     }
+                    Ok(BusEvent::CompactionModelChanged { model }) => {
+                        let _ = client_event_tx.send(ServerEvent::CompactionModelChanged {
+                            id: 0,
+                            model,
+                            error: None,
+                        });
+                    }
                     Ok(BusEvent::BatchProgress(progress)) => {
                         if progress.session_id == client_session_id {
                             let _ = client_event_tx.send(ServerEvent::BatchProgress { progress });
@@ -1519,6 +1526,11 @@ pub(super) async fn handle_client(
                         last_available_models_snapshot = Some(snapshot);
                     }
                 }
+                let _ = client_event_tx.send(ServerEvent::CompactionModelChanged {
+                    id: 0,
+                    model: crate::config::Config::load().compaction.model,
+                    error: None,
+                });
                 client_subscribed = true;
             }
 
@@ -1767,6 +1779,31 @@ pub(super) async fn handle_client(
 
             Request::SetCompactionMode { id, mode } => {
                 handle_set_compaction_mode(id, mode, &agent, &client_event_tx).await;
+            }
+
+            Request::SetCompactionModel { id, model } => {
+                let model = model
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                let mut config = crate::config::Config::load();
+                let previous_model = config.compaction.model.clone();
+                config.compaction.model = model.clone();
+                let error = config.save().err().map(|error| error.to_string());
+                let authoritative_model = if error.is_none() {
+                    model
+                } else {
+                    previous_model
+                };
+                let _ = client_event_tx.send(ServerEvent::CompactionModelChanged {
+                    id,
+                    model: authoritative_model.clone(),
+                    error: error.clone(),
+                });
+                if error.is_none() {
+                    Bus::global().publish(BusEvent::CompactionModelChanged {
+                        model: authoritative_model,
+                    });
+                }
             }
 
             Request::RenameSession { id, title } => {

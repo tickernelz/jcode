@@ -550,6 +550,50 @@ async fn messages_for_provider_applies_manual_compaction_in_native_auto_mode() {
     }
 }
 
+#[tokio::test]
+async fn rewind_undo_restores_exact_compaction_state() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    for i in 0..3 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("turn {i}"),
+                cache_control: None,
+            }],
+        );
+    }
+    let compaction = crate::session::StoredCompactionState {
+        summary_text: "exact pre-rewind summary".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+        compacted_count: 1,
+    };
+    agent.session.compaction = Some(compaction.clone());
+    agent.seed_compaction_from_session();
+
+    agent.rewind_to_message(1).expect("rewind should succeed");
+    assert!(agent.session.compaction.is_none());
+    assert!(
+        agent
+            .registry
+            .compaction()
+            .read()
+            .await
+            .persisted_state()
+            .is_none()
+    );
+
+    agent.undo_rewind().expect("undo should succeed");
+    assert_eq!(agent.session.compaction, Some(compaction.clone()));
+    assert_eq!(
+        agent.registry.compaction().read().await.persisted_state(),
+        Some(compaction)
+    );
+}
+
 // ── InterruptSignal tests ────────────────────────────────────────────────
 
 #[tokio::test]

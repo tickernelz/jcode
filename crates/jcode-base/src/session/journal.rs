@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EnvSnapshot, SessionImproveMode, SessionStatus, StoredCompactionState, StoredMemoryInjection,
-    StoredMessage, StoredReplayEvent,
+    ContextGraphTransaction, EnvSnapshot, SessionImproveMode, SessionStatus, StoredCompactionState,
+    StoredMemoryInjection, StoredMessage, StoredReplayEvent,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -37,6 +37,8 @@ pub(super) struct SessionJournalMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SessionJournalEntry {
+    #[serde(default)]
+    pub(super) sequence: u64,
     pub(super) meta: SessionJournalMeta,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) append_messages: Vec<StoredMessage>,
@@ -46,6 +48,8 @@ pub(super) struct SessionJournalEntry {
     pub(super) append_memory_injections: Vec<StoredMemoryInjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) append_replay_events: Vec<StoredReplayEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) context_transaction: Option<ContextGraphTransaction>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,10 +67,12 @@ pub(super) struct SessionPersistState {
     pub(super) env_snapshots_len: usize,
     pub(super) memory_injections_len: usize,
     pub(super) replay_events_len: usize,
+    pub(super) context_nodes_len: usize,
     pub(super) messages_mode: PersistVectorMode,
     pub(super) env_snapshots_mode: PersistVectorMode,
     pub(super) memory_injections_mode: PersistVectorMode,
     pub(super) replay_events_mode: PersistVectorMode,
+    pub(super) pending_context_transaction: Option<ContextGraphTransaction>,
     pub(super) last_meta: Option<SessionJournalMeta>,
 }
 

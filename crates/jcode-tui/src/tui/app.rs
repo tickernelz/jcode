@@ -155,6 +155,7 @@ struct TurnReasoningTrace {
 #[derive(Debug, Clone)]
 struct LocalRewindUndoSnapshot {
     messages: Vec<StoredMessage>,
+    compaction: Option<crate::session::StoredCompactionState>,
     provider_session_id: Option<String>,
     session_provider_session_id: Option<String>,
     visible_message_count: usize,
@@ -1071,6 +1072,8 @@ pub struct App {
     remote_service_tier: Option<String>,
     remote_transport: Option<String>,
     remote_compaction_mode: Option<crate::config::CompactionMode>,
+    remote_compaction_model: Option<String>,
+    pending_remote_compaction_model: Option<Option<String>>,
     remote_available_entries: Vec<String>,
     remote_model_options: Vec<crate::provider::ModelRoute>,
     pending_remote_model_refresh_snapshot: Option<(Vec<String>, Vec<crate::provider::ModelRoute>)>,

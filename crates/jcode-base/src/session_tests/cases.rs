@@ -1,6 +1,241 @@
 use super::*;
 use anyhow::{Result, anyhow};
 
+fn context_transaction(session_id: &str, op_id: &str) -> ContextGraphTransaction {
+    let node_id = format!("node-{op_id}");
+    ContextGraphTransaction {
+        schema_version: 1,
+        op_id: op_id.to_string(),
+        base_generation: 0,
+        generation: 1,
+        append_context_nodes: vec![StoredContextNode {
+            id: node_id.clone(),
+            schema_version: 1,
+            level: 0,
+            source_session_id: session_id.to_string(),
+            source_message_ids: vec!["message-1".to_string()],
+            source_sha256: "a".repeat(64),
+            child_node_ids: Vec::new(),
+            summary_text: format!("summary-{op_id}"),
+            estimated_tokens: 4,
+            summarizer_model: "model".to_string(),
+            summarizer_provider: "provider".to_string(),
+            summarizer_route: "route".to_string(),
+            prompt_schema_version: 1,
+            created_at: chrono::Utc::now(),
+        }],
+        frontier: StoredContextFrontier {
+            schema_version: 1,
+            generation: 1,
+            active_node_ids: vec![node_id],
+            covered_message_count: 1,
+            covered_through_message_id: Some("message-1".to_string()),
+            source_prefix_sha256: "b".repeat(64),
+            next_node_sequence: 2,
+        },
+        input_proof: ContextGraphInputProof {
+            schema_version: 1,
+            source_session_id: session_id.to_string(),
+            source_message_ids: vec!["message-1".to_string()],
+            source_sha256: "a".repeat(64),
+        },
+    }
+}
+
+#[test]
+fn context_graph_snapshot_and_journal_store_nodes_once() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "context_graph_once";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.apply_context_graph_transaction(context_transaction(id, "first"))?;
+    session.save()?;
+
+    let snapshot = std::fs::read_to_string(session_path(id)?)?;
+    assert_eq!(snapshot.matches("summary-first").count(), 1);
+    assert_eq!(snapshot.matches("node-first").count(), 2); // node id plus frontier reference
+
+    let mut second = context_transaction(id, "second");
+    second.base_generation = 1;
+    second.generation = 2;
+    second.frontier.generation = 2;
+    second.frontier.active_node_ids = vec!["node-second".to_string()];
+    session.apply_context_graph_transaction(second)?;
+    session.save()?;
+    let journal = std::fs::read_to_string(session_journal_path(id)?)?;
+    assert_eq!(journal.matches("summary-second").count(), 1);
+    assert!(!journal.contains("summary-first"));
+
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.context_nodes.len(), 2);
+    assert_eq!(loaded.context_frontier.unwrap().generation, 2);
+    Ok(())
+}
+
+#[test]
+fn context_graph_replay_is_op_id_idempotent() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "context_graph_idempotent";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.save()?;
+    session.apply_context_graph_transaction(context_transaction(id, "once"))?;
+    session.save()?;
+
+    let path = session_journal_path(id)?;
+    let line = std::fs::read_to_string(&path)?;
+    std::fs::write(&path, format!("{line}{line}"))?;
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.context_nodes.len(), 1);
+    assert_eq!(loaded.context_frontier.unwrap().generation, 1);
+    Ok(())
+}
+
+#[test]
+fn context_graph_rejects_conflicting_op_id_reuse() -> Result<()> {
+    let id = "context_graph_conflicting_op";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    let original = context_transaction(id, "same-op");
+    assert!(session.apply_context_graph_transaction(original.clone())?);
+    assert!(!session.apply_context_graph_transaction(original)?);
+
+    let mut conflicting = context_transaction(id, "same-op");
+    conflicting.append_context_nodes[0].summary_text = "different".into();
+    let err = session
+        .apply_context_graph_transaction(conflicting)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("reused with a different transaction")
+    );
+    assert_eq!(session.context_nodes.len(), 1);
+    assert_eq!(session.context_nodes[0].summary_text, "summary-same-op");
+    Ok(())
+}
+
+#[test]
+fn context_graph_commit_is_idempotent_after_reload() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "context_graph_retry_after_reload";
+    let transaction = context_transaction(id, "durable-retry");
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    assert!(session.commit_context_graph_transaction(transaction.clone())?);
+
+    let mut loaded = Session::load(id)?;
+    assert!(!loaded.commit_context_graph_transaction(transaction)?);
+    assert_eq!(loaded.context_nodes.len(), 1);
+    assert_eq!(loaded.context_frontier.unwrap().generation, 1);
+    Ok(())
+}
+
+#[test]
+fn context_graph_commit_failure_does_not_publish_candidate() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "context_graph_failed_commit";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+
+    // Make the expected sessions directory a regular file so the durable
+    // snapshot write fails before publication.
+    std::fs::write(home.path().join("sessions"), b"not a directory")?;
+    assert!(
+        session
+            .commit_context_graph_transaction(context_transaction(id, "must-not-publish"))
+            .is_err()
+    );
+    assert!(session.context_nodes.is_empty());
+    assert!(session.context_frontier.is_none());
+    assert!(session.last_context_op_id.is_none());
+    assert!(session.last_context_op_sha256.is_none());
+    Ok(())
+}
+
+#[test]
+fn context_graph_rejects_generation_mismatch() {
+    let id = "context_graph_generation";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    let mut transaction = context_transaction(id, "bad-generation");
+    transaction.base_generation = 1;
+    assert!(
+        session
+            .apply_context_graph_transaction(transaction)
+            .unwrap_err()
+            .to_string()
+            .contains("generation mismatch")
+    );
+    assert!(session.context_nodes.is_empty());
+    assert!(session.context_frontier.is_none());
+}
+
+#[test]
+fn torn_context_transaction_replay_keeps_old_frontier() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "context_graph_torn";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.save()?;
+    session.apply_context_graph_transaction(context_transaction(id, "torn"))?;
+    session.save()?;
+
+    let path = session_journal_path(id)?;
+    let journal = std::fs::read(&path)?;
+    std::fs::write(&path, &journal[..journal.len() / 2])?;
+    let loaded = Session::load(id)?;
+    assert!(loaded.context_nodes.is_empty());
+    assert!(loaded.context_frontier.is_none());
+    Ok(())
+}
+
+#[test]
+fn legacy_snapshot_loads_with_empty_context_graph() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "context_graph_legacy";
+    let session = Session::create_with_id(id.to_string(), None, None);
+    let mut value = serde_json::to_value(&session)?;
+    let object = value
+        .as_object_mut()
+        .expect("session serializes as an object");
+    object.remove("context_nodes");
+    object.remove("context_frontier");
+    std::fs::create_dir_all(session_path(id)?.parent().unwrap())?;
+    std::fs::write(session_path(id)?, serde_json::to_vec(&value)?)?;
+
+    let loaded = Session::load(id)?;
+    assert!(loaded.context_nodes.is_empty());
+    assert!(loaded.context_frontier.is_none());
+    Ok(())
+}
+
+#[test]
+fn context_graph_invalid_snapshot_falls_back_to_legacy_state() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "context_graph_invalid_snapshot";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    let transaction = context_transaction(id, "invalid-snapshot");
+    session.context_nodes = vec![
+        transaction.append_context_nodes[0].clone(),
+        transaction.append_context_nodes[0].clone(),
+    ];
+    session.context_frontier = Some(transaction.frontier);
+    std::fs::create_dir_all(session_path(id)?.parent().unwrap())?;
+    std::fs::write(session_path(id)?, serde_json::to_vec(&session)?)?;
+
+    let loaded = Session::load(id)?;
+    assert!(loaded.context_nodes.is_empty());
+    assert!(loaded.context_frontier.is_none());
+    Ok(())
+}
+
 #[test]
 fn test_session_exists_roundtrip() -> Result<()> {
     let tmp_dir = std::env::temp_dir().join(format!(
@@ -923,6 +1158,105 @@ fn test_save_checkpoints_after_full_mutation_and_clears_journal() -> Result<()> 
     assert_eq!(loaded.title.as_deref(), Some("checkpointed title"));
     assert_eq!(loaded.messages.len(), 1);
     assert_eq!(loaded.messages[0].content_preview(), "one");
+    Ok(())
+}
+
+#[test]
+fn legacy_journal_entries_get_deterministic_sequences() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "legacy_journal_sequence";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.save()?;
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "legacy".into(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    let journal_path = session_journal_path(id)?;
+    let mut entry: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&journal_path)?.trim())?;
+    entry.as_object_mut().unwrap().remove("sequence");
+    std::fs::write(
+        &journal_path,
+        format!("{}\n", serde_json::to_string(&entry)?),
+    )?;
+
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(loaded.journal_sequence, 1);
+    Ok(())
+}
+
+#[test]
+fn stale_journal_left_after_checkpoint_is_filtered_by_watermark() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "stale_journal_watermark";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.save()?;
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "once".into(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    let stale_journal = std::fs::read(&journal_path)?;
+
+    session.title = Some("forces checkpoint".into());
+    session.save()?;
+    assert_eq!(session.journal_watermark, 1);
+    // Model journal retirement failure by restoring the already-covered file.
+    std::fs::write(&journal_path, stale_journal)?;
+
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(loaded.messages[0].content_preview(), "once");
+    assert_eq!(loaded.journal_watermark, 1);
+    Ok(())
+}
+
+#[test]
+fn stale_legacy_journal_left_after_checkpoint_is_filtered_by_watermark() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "stale_legacy_journal_watermark";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.save()?;
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "once".into(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    let journal_path = session_journal_path(id)?;
+    let mut legacy_entry: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&journal_path)?.trim())?;
+    legacy_entry.as_object_mut().unwrap().remove("sequence");
+    let stale_legacy_journal = format!("{}\n", serde_json::to_string(&legacy_entry)?);
+
+    session.title = Some("forces checkpoint".into());
+    session.save()?;
+    assert_eq!(session.journal_watermark, 1);
+    // A migrated sequence-less journal can also survive snapshot installation.
+    std::fs::write(&journal_path, stale_legacy_journal)?;
+
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(loaded.messages[0].content_preview(), "once");
+    assert_eq!(loaded.journal_watermark, 1);
     Ok(())
 }
 

@@ -31,6 +31,7 @@ impl StreamingGuard {
 }
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 mod crash;
@@ -46,8 +47,10 @@ pub use crash::{
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
 };
 pub use jcode_session_types::{
-    EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
+    ContextGraphInputProof, ContextGraphTransaction, EnvSnapshot, GitState, SessionImproveMode,
+    SessionStatus, StoredCompactionState, StoredContextFrontier, StoredContextNode,
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
+    validate_context_graph,
 };
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
 pub use maintenance::prune_old_session_backups;
@@ -98,6 +101,16 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<StoredMessage>,
+    /// Highest journal sequence incorporated into this in-memory session.
+    #[serde(default)]
+    pub journal_sequence: u64,
+    /// Highest journal sequence covered by this installed snapshot.
+    #[serde(default)]
+    pub journal_watermark: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_nodes: Vec<StoredContextNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_frontier: Option<StoredContextFrontier>,
     /// Persisted compacted-view state so reload/resume can continue using the
     /// active summary + recent tail instead of re-sending the full transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +185,12 @@ pub struct Session {
     pub replay_events: Vec<StoredReplayEvent>,
     #[serde(skip)]
     persist_state: SessionPersistState,
+    /// Receipt for the most recent accepted context transaction. This keeps an
+    /// exact retry idempotent across reload without retaining every transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_context_op_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_context_op_sha256: Option<String>,
     #[serde(skip)]
     provider_messages_cache: Vec<Message>,
     #[serde(skip)]
@@ -263,6 +282,18 @@ fn default_is_test_session() -> bool {
     env_flag_enabled("JCODE_TEST_SESSION")
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn context_transaction_sha256(transaction: &ContextGraphTransaction) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(transaction)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 pub fn derive_session_provider_key(provider_name: &str) -> Option<String> {
     let normalized_name = provider_name.trim().to_ascii_lowercase();
     if normalized_name == "jcode" {
@@ -346,6 +377,10 @@ impl Session {
         session.created_at = snapshot.created_at;
         session.updated_at = snapshot.updated_at;
         session.messages = snapshot.messages;
+        session.journal_sequence = snapshot.journal_sequence;
+        session.journal_watermark = snapshot.journal_watermark;
+        session.context_nodes = snapshot.context_nodes;
+        session.context_frontier = snapshot.context_frontier;
         session.compaction = snapshot.compaction;
         session.provider_session_id = snapshot.provider_session_id;
         session.provider_key = snapshot.provider_key;
@@ -513,12 +548,121 @@ impl Session {
             env_snapshots_len: self.env_snapshots.len(),
             memory_injections_len: self.memory_injections.len(),
             replay_events_len: self.replay_events.len(),
+            context_nodes_len: self.context_nodes.len(),
             messages_mode: PersistVectorMode::Clean,
             env_snapshots_mode: PersistVectorMode::Clean,
             memory_injections_mode: PersistVectorMode::Clean,
             replay_events_mode: PersistVectorMode::Clean,
+            pending_context_transaction: None,
             last_meta: Some(self.journal_meta()),
         };
+    }
+
+    fn apply_context_transaction_inner(
+        &mut self,
+        transaction: &ContextGraphTransaction,
+        persist: bool,
+    ) -> anyhow::Result<bool> {
+        let transaction_sha256 = context_transaction_sha256(transaction)?;
+        if self.last_context_op_id.as_deref() == Some(transaction.op_id.as_str()) {
+            if self.last_context_op_sha256.as_deref() == Some(transaction_sha256.as_str()) {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "context op id {} was reused with a different transaction",
+                transaction.op_id
+            );
+        }
+        let current_generation = self
+            .context_frontier
+            .as_ref()
+            .map_or(0, |frontier| frontier.generation);
+        if transaction.base_generation != current_generation
+            || transaction.generation != current_generation + 1
+            || transaction.frontier.generation != transaction.generation
+        {
+            anyhow::bail!(
+                "context generation mismatch: current {}, base {}, transaction {}, frontier {}",
+                current_generation,
+                transaction.base_generation,
+                transaction.generation,
+                transaction.frontier.generation
+            );
+        }
+        if transaction.schema_version != 1
+            || transaction.input_proof.schema_version != 1
+            || transaction.op_id.is_empty()
+            || transaction.input_proof.source_session_id != self.id
+            || !is_sha256_hex(&transaction.input_proof.source_sha256)
+            || transaction.append_context_nodes.iter().any(|node| {
+                node.source_session_id != self.id || !is_sha256_hex(&node.source_sha256)
+            })
+            || !is_sha256_hex(&transaction.frontier.source_prefix_sha256)
+        {
+            anyhow::bail!("invalid context transaction identity or SHA-256 proof");
+        }
+        if persist && self.persist_state.pending_context_transaction.is_some() {
+            anyhow::bail!("a context transaction is already pending persistence");
+        }
+
+        let mut candidate = self.context_nodes.clone();
+        for node in &transaction.append_context_nodes {
+            match candidate.iter().find(|existing| existing.id == node.id) {
+                Some(existing) if existing == node => {}
+                Some(_) => anyhow::bail!("conflicting duplicate context node id {}", node.id),
+                None => candidate.push(node.clone()),
+            }
+        }
+        if candidate
+            .iter()
+            .any(|node| node.source_session_id != self.id)
+        {
+            anyhow::bail!("context graph contains a node from another session");
+        }
+        validate_context_graph(&candidate, Some(&transaction.frontier))
+            .map_err(anyhow::Error::msg)?;
+
+        self.context_nodes = candidate;
+        self.context_frontier = Some(transaction.frontier.clone());
+        self.last_context_op_id = Some(transaction.op_id.clone());
+        self.last_context_op_sha256 = Some(transaction_sha256);
+        if persist {
+            self.persist_state.pending_context_transaction = Some(transaction.clone());
+        }
+        Ok(true)
+    }
+
+    /// Stage one immutable graph delta for journal and recovery tests. Runtime
+    /// callers must use `commit_context_graph_transaction`, which persists a
+    /// cloned candidate before publishing it to this live session.
+    #[cfg(test)]
+    pub(crate) fn apply_context_graph_transaction(
+        &mut self,
+        transaction: ContextGraphTransaction,
+    ) -> anyhow::Result<bool> {
+        self.apply_context_transaction_inner(&transaction, true)
+    }
+
+    fn discard_invalid_context_graph(&mut self) {
+        let validation = if self
+            .context_nodes
+            .iter()
+            .any(|node| node.source_session_id != self.id)
+        {
+            Err("context graph contains a node from another session".to_string())
+        } else {
+            validate_context_graph(&self.context_nodes, self.context_frontier.as_ref())
+        };
+        if let Err(err) = validation {
+            crate::logging::warn(&format!(
+                "Ignoring invalid persisted context graph for session {}: {}",
+                self.id, err
+            ));
+            self.context_nodes.clear();
+            self.context_frontier = None;
+            self.last_context_op_id = None;
+            self.last_context_op_sha256 = None;
+        }
     }
 
     fn reset_provider_messages_cache(&mut self) {
@@ -724,6 +868,10 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            journal_sequence: 0,
+            journal_watermark: 0,
+            context_nodes: Vec::new(),
+            context_frontier: None,
             compaction: None,
             provider_session_id: None,
             provider_key: None,
@@ -748,6 +896,8 @@ impl Session {
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
             persist_state: SessionPersistState::default(),
+            last_context_op_id: None,
+            last_context_op_sha256: None,
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
             provider_messages_cache_len: 0,
@@ -778,6 +928,10 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            journal_sequence: 0,
+            journal_watermark: 0,
+            context_nodes: Vec::new(),
+            context_frontier: None,
             compaction: None,
             provider_session_id: None,
             provider_key: None,
@@ -802,6 +956,8 @@ impl Session {
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
             persist_state: SessionPersistState::default(),
+            last_context_op_id: None,
+            last_context_op_sha256: None,
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
             provider_messages_cache_len: 0,
@@ -1574,6 +1730,14 @@ struct RemoteStartupSessionSnapshot {
     updated_at: DateTime<Utc>,
     #[serde(default)]
     messages: Vec<StoredMessage>,
+    #[serde(default)]
+    journal_sequence: u64,
+    #[serde(default)]
+    journal_watermark: u64,
+    #[serde(default)]
+    context_nodes: Vec<StoredContextNode>,
+    #[serde(default)]
+    context_frontier: Option<StoredContextFrontier>,
     #[serde(default)]
     compaction: Option<StoredCompactionState>,
     #[serde(default)]

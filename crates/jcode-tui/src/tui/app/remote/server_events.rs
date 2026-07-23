@@ -2380,6 +2380,25 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             false
         }
+        ServerEvent::CompactionModelChanged { id, model, error } => {
+            app.remote_compaction_model = model.clone();
+            app.pending_remote_compaction_model = None;
+            if let Some(err) = error {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Failed to set LCM compactor model: {}",
+                    err
+                )));
+                app.set_status_notice("LCM compactor model change failed");
+            } else if id != 0 {
+                let label = model.as_deref().unwrap_or("inherit active session route");
+                app.push_display_message(DisplayMessage::system(format!(
+                    "✓ LCM compactor model → {}",
+                    label
+                )));
+                app.set_status_notice(format!("LCM compactor model: {}", label));
+            }
+            true
+        }
         ServerEvent::SoftInterruptInjected {
             content,
             display_role,

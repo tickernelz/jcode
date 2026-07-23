@@ -201,17 +201,20 @@ impl Agent {
         let removed = message_count - message_index;
         self.rewind_undo_snapshot = Some(RewindUndoSnapshot {
             messages: self.session.messages.clone(),
+            compaction: self.session.compaction.clone(),
             provider_session_id: self.provider_session_id.clone(),
             session_provider_session_id: self.session.provider_session_id.clone(),
             visible_message_count: message_count,
         });
         self.session.truncate_messages(stored_len);
+        self.session.compaction = None;
         self.session.updated_at = chrono::Utc::now();
         self.provider_session_id = None;
         self.session.provider_session_id = None;
         self.cache_tracker.reset();
         self.locked_tools = None;
         self.reset_tool_output_tracking();
+        self.seed_compaction_from_session();
         self.persist_session_best_effort("conversation rewind");
         Ok(removed)
     }
@@ -224,12 +227,14 @@ impl Agent {
         let current_count = self.session.rewind_target_count();
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
         self.session.replace_messages(snapshot.messages);
+        self.session.compaction = snapshot.compaction;
         self.provider_session_id = snapshot.provider_session_id;
         self.session.provider_session_id = snapshot.session_provider_session_id;
         self.session.updated_at = chrono::Utc::now();
         self.cache_tracker.reset();
         self.locked_tools = None;
         self.reset_tool_output_tracking();
+        self.seed_compaction_from_session();
         self.persist_session_best_effort("conversation rewind undo");
         Ok(restored)
     }

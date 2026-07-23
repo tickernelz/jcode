@@ -433,6 +433,10 @@ pub enum BusEvent {
     CompactionFinished,
     /// Provider's available models list may have changed
     ModelsUpdated,
+    /// The server-global compaction model changed.
+    CompactionModelChanged {
+        model: Option<String>,
+    },
     /// Synchronous provider activation after a login/import has completed, so
     /// the model picker can stop hiding the stale pre-auth catalog.
     AuthCatalogRefreshReady,

@@ -8,16 +8,16 @@
 - Initiative: `jcode-native-lcm-context-engine`
 - Branch: `feat/native-lcm-context-engine`
 - Baseline commit: `6e443c82e456a2e51015e5555a5fcb52f439d410`
-- Current phase: **Phase 0, baseline and correctness prerequisites**
+- Current phase: **Phase 3, opt-in depth-zero LCM**
 - Overall status: **in progress**
 - Last updated: **2026-07-23**
 
 | Phase | Status | Evidence |
 |---|---|---|
-| 0. Baseline and correctness prerequisites | In progress | Baseline commit recorded, implementation pending |
-| 1. Minimal control plane | Pending | |
-| 2. Durable graph persistence | Pending | |
-| 3. Opt-in depth-zero LCM | Pending | |
+| 0. Baseline and correctness prerequisites | Complete | Stable prefix fingerprint; reset/restore/rewind cancel stale work; undo restores exact durable compaction state |
+| 1. Minimal control plane | Complete | `rolling|lcm` engine config; route-preserving compaction model; local and authoritative remote `/agents compaction` plus `/agents lcm` |
+| 2. Durable graph persistence | Complete | Versioned graph transaction; staged durable commit-before-publication; sequenced/watermarked journal recovery; fault and legacy tests |
+| 3. Opt-in depth-zero LCM | In progress | Implementation started only after Phase 0–2 focused gates passed |
 | 4. Lifecycle and hierarchy | Pending | |
 | 5. Canary and validation gates | Pending | |
 | 6. Default promotion | Pending | |
@@ -31,6 +31,15 @@
 - No production code had been changed at authorization time.
 - Durable initiative and requirement-to-check feedback loop were created.
 
+### 2026-07-23: Phase 0–2 prerequisites completed
+
+- Phase 0 now rejects same-length divergent history when an async summary returns, aborts pending work on reset/restore, invalidates compaction on Agent and local-TUI rewind, and restores the exact durable compaction snapshot on undo.
+- Phase 1 adds only `compaction.engine` and optional `compaction.model`. Trigger modes and thresholds are unchanged. Local pickers persist exact route specs; remote pickers mutate authoritative server state, roll back on rejection, and hydrate from the server after reconnect.
+- Phase 2 adds immutable versioned context nodes, a small frontier, generation-checked transactions, exact-retry receipts, graph validation, and invalid-derived-state fallback without changing raw-message canonical ownership.
+- Session journal entries now carry monotonic sequences. Snapshots install a watermark before best-effort journal retirement, and replay filters covered, duplicate, out-of-order, torn, glued, and stale legacy entries.
+- Runtime graph publication now clones and validates a candidate, durably checkpoints it, and only then swaps it into the live session. Write failure leaves live graph state unchanged.
+- Remaining filesystem caveat is explicit: Unix durable snapshots fsync the file and attempt parent-directory fsync, but the existing storage helper ignores directory-sync errors; non-Unix replacement retains the existing brief missing-primary limitation.
+
 ## Decisions and deviations
 
 Record any approved or evidence-driven deviation here before changing the plan below.
@@ -39,9 +48,26 @@ Record any approved or evidence-driven deviation here before changing the plan b
 
 ## Verification log
 
-Record exact commands, result counts, benchmark artifacts, and unmet gates here after each phase.
+### 2026-07-23: clean detached baseline
 
-- Baseline verification pending.
+- Baseline source: detached worktree at `6e443c82e456a2e51015e5555a5fcb52f439d410`.
+- `cargo fmt --all -- --check`: passed.
+- Focused command: `cargo test -p jcode-compaction-core -p jcode-base -p jcode-app-core -p jcode-tui`.
+- The run reached `jcode-app-core` and started 1,010 tests, then exited 101 with three observed failures before emitting a final count:
+  - `server::reload_recovery::tests::garbage_collection_removes_delivered_and_stale_records`, which passed when rerun alone and is classified as baseline cross-test/flaky behavior.
+  - `server::swarm_persistence::swarm_persistence_tests::legacy_snapshot_without_mode_defaults_to_light`, which also fails alone at the existing `legacy plan` assertion.
+  - `tool::batch::batch_tests::test_schema_only_requires_tool`, which also fails alone because the baseline schema requires `["tool", "intent"]` while the test expects `["tool"]`.
+- Artifact: `$JCODE_SCRATCH_DIR/jcode-lcm-baseline-clean.log`.
+- These pre-existing failures are not LCM regressions. LCM-focused tests must pass, and final full-suite results will be compared against this baseline rather than reported as wholly green.
+
+### 2026-07-23: Phase 0–2 focused gates
+
+- `cargo fmt --all -- --check`: passed after integration.
+- Combined `cargo check` for `jcode-session-types`, `jcode-base`, `jcode-config-types`, `jcode-protocol`, `jcode-app-core`, and `jcode-tui`: passed.
+- Session persistence/recovery suite: 63 passed, including durable commit failure, retry after reload, torn transaction, stale sequenced journal, stale legacy journal, and checkpoint healing.
+- `jcode-session-types`: 10 passed, including duplicate, missing-child, and cycle graph rejection.
+- Focused compaction same-length divergence, Agent rewind/undo, config, protocol, remote-authority, reconnect, and picker tests passed in worker runs and were rerun after integration.
+- A combined full-library attempt reached 1,011 `jcode-app-core` tests and reproduced the baseline `tool::batch::batch_tests::test_schema_only_requires_tool` failure. A separate parallel `jcode-base` run exposed five environment/order-sensitive unrelated tests; those paths were untouched and remain outside the LCM focused gate. Final Phase 5 certification must compare fresh isolated runs against the detached baseline.
 
 ---
 

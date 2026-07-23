@@ -331,6 +331,66 @@ fn test_handle_server_event_compaction_mode_changed_updates_remote_mode() {
 }
 
 #[test]
+fn test_compaction_model_success_and_reconnect_hydration_apply_server_value() {
+    let mut app = create_test_app();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _runtime_guard = runtime.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    app.is_remote = true;
+    app.pending_remote_compaction_model = Some(None);
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::CompactionModelChanged {
+            id: 7,
+            model: Some("openai-api:gpt-5.5".to_string()),
+            error: None,
+        },
+        &mut remote,
+    );
+    assert_eq!(app.remote_compaction_model.as_deref(), Some("openai-api:gpt-5.5"));
+    assert!(app.pending_remote_compaction_model.is_none());
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::CompactionModelChanged {
+            id: 0,
+            model: Some("claude-api:claude-fable-5".to_string()),
+            error: None,
+        },
+        &mut remote,
+    );
+    assert_eq!(
+        app.remote_compaction_model.as_deref(),
+        Some("claude-api:claude-fable-5")
+    );
+}
+
+#[test]
+fn test_compaction_model_rejection_restores_authoritative_value_and_shows_error() {
+    let mut app = create_test_app();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _runtime_guard = runtime.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    app.is_remote = true;
+    app.remote_compaction_model = Some("requested-model".to_string());
+    app.pending_remote_compaction_model = Some(Some("previous-model".to_string()));
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::CompactionModelChanged {
+            id: 8,
+            model: Some("previous-model".to_string()),
+            error: Some("permission denied".to_string()),
+        },
+        &mut remote,
+    );
+
+    assert_eq!(app.remote_compaction_model.as_deref(), Some("previous-model"));
+    assert!(app.pending_remote_compaction_model.is_none());
+    assert!(app.display_messages.iter().any(|message| {
+        message.role == "error" && message.content.contains("permission denied")
+    }));
+}
+
+#[test]
 fn test_tool_done_preserves_sibling_streaming_tool_inputs_and_intents() {
     // When one assistant message emits multiple tool calls, ToolDone for the
     // first call must not wipe the parsed input/intent of siblings that are

@@ -385,6 +385,35 @@ async fn test_stale_background_result_discarded_when_context_shrinks() {
 }
 
 #[tokio::test]
+async fn test_stale_background_result_discarded_when_source_changes_at_same_length() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+    let mut messages = Vec::new();
+    for i in 0..30 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("turn {i} content {}", "q".repeat(60)),
+        ));
+        manager.notify_message_added();
+    }
+
+    manager.update_observed_input_tokens(850);
+    manager.maybe_start_compaction_with(&messages, Arc::new(MockSummaryProvider));
+    assert!(manager.is_compacting());
+
+    messages[0] = make_text_message(Role::User, "divergent history with the same message count");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && manager.is_compacting() {
+        manager.check_and_apply_compaction_with(&messages);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(!manager.is_compacting());
+    assert_eq!(manager.compacted_count, 0);
+    assert!(manager.active_summary.is_none());
+    assert_eq!(manager.pending_source_fingerprint, None);
+}
+
+#[tokio::test]
 async fn test_guard_at_95_triggers_hard_compact() {
     let mut manager = CompactionManager::new().with_budget(1_000);
     let mut messages = Vec::new();

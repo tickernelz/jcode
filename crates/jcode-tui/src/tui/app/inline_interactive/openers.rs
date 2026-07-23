@@ -16,10 +16,15 @@ impl App {
             AgentModelTarget::Judge,
             AgentModelTarget::Memory,
             AgentModelTarget::Ambient,
+            AgentModelTarget::Compaction,
         ]
         .into_iter()
         .map(|target| {
-            let configured = load_agent_model_override(target);
+            let configured = if self.is_remote && target == AgentModelTarget::Compaction {
+                self.remote_compaction_model.clone()
+            } else {
+                load_agent_model_override(target)
+            };
             let summary = configured
                 .clone()
                 .unwrap_or_else(|| agent_model_default_summary(target, self));
@@ -49,12 +54,13 @@ impl App {
                 effort: None,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
 
         self.inline_view_state = None;
+        let filtered = (0..models.len()).collect();
         self.inline_interactive_state = Some(InlineInteractiveState {
             kind: PickerKind::Model,
-            filtered: (0..5).collect(),
+            filtered,
             entries: models,
             selected: 0,
             column: 0,
@@ -175,7 +181,11 @@ impl App {
     }
 
     pub(crate) fn open_agent_model_picker(&mut self, target: AgentModelTarget) {
-        let configured = load_agent_model_override(target);
+        let configured = if self.is_remote && target == AgentModelTarget::Compaction {
+            self.remote_compaction_model.clone()
+        } else {
+            load_agent_model_override(target)
+        };
         let inherit_summary = agent_model_default_summary(target, self);
         self.open_model_picker();
         let load_started = std::time::Instant::now();

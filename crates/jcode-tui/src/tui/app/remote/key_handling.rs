@@ -315,6 +315,35 @@ async fn handle_remote_key_internal(
     if let Some(ref picker) = app.inline_interactive_state
         && !picker.preview
     {
+        if code == KeyCode::Enter
+            && let Some(index) = picker.filtered.get(picker.selected).copied()
+            && let Some(entry) = picker.entries.get(index)
+            && let crate::tui::PickerAction::AgentModelChoice {
+                target: crate::tui::AgentModelTarget::Compaction,
+                clear_override,
+            } = entry.action
+        {
+            let model = if clear_override {
+                None
+            } else {
+                Some(app_mod::inline_interactive::selected_agent_model_spec(
+                    entry,
+                ))
+            };
+            app.pending_remote_compaction_model = Some(app.remote_compaction_model.clone());
+            app.inline_interactive_state = None;
+            if let Err(error) = remote.set_compaction_model(model).await {
+                app.pending_remote_compaction_model = None;
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Failed to request LCM compactor model change: {}",
+                    error
+                )));
+                app.set_status_notice("LCM compactor model change failed");
+            } else {
+                app.set_status_notice("Updating LCM compactor model...");
+            }
+            return Ok(());
+        }
         return app.handle_inline_interactive_key(code, modifiers);
     }
 

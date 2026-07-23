@@ -515,6 +515,7 @@ impl App {
                     ("/agents judge".into(), "Configure judge model"),
                     ("/agents memory".into(), "Configure memory sidecar model"),
                     ("/agents ambient".into(), "Configure ambient model"),
+                    ("/agents compaction".into(), "Configure LCM compactor model"),
                 ],
             );
         }
