@@ -22,6 +22,7 @@ use crate::provider::openai_request::{
 };
 use anyhow::Result;
 use chrono::Utc;
+use futures::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -40,6 +41,51 @@ fn stored_message_prefix_sha256(messages: &[crate::session::StoredMessage]) -> R
         "{:x}",
         Sha256::digest(serde_json::to_vec(messages)?)
     ))
+}
+
+fn lcm_source_matches_canonical_session(
+    source: &PendingLcmSource,
+    session: &crate::session::Session,
+) -> bool {
+    let source_end = source.covered_message_count;
+    let Some(source_start) = source_end.checked_sub(source.source_message_ids.len()) else {
+        return false;
+    };
+    if source.source_message_ids.is_empty() || source_end > session.messages.len() {
+        return false;
+    }
+    let current_source = &session.messages[source_start..source_end];
+    current_source
+        .iter()
+        .map(|message| message.id.as_str())
+        .eq(source.source_message_ids.iter().map(String::as_str))
+        && stored_message_prefix_sha256(current_source)
+            .is_ok_and(|sha256| sha256 == source.source_sha256)
+        && stored_message_prefix_sha256(&session.messages[..source_end])
+            .is_ok_and(|sha256| sha256 == source.source_prefix_sha256)
+}
+
+fn critical_lcm_cutoff(active: &[Message], target_tokens: usize) -> usize {
+    if active.len() <= MIN_TURNS_TO_KEEP {
+        return 0;
+    }
+    let active_char_counts: Vec<usize> = active.iter().map(message_char_count).collect();
+    let mut remaining_suffix_chars = vec![0usize; active_char_counts.len() + 1];
+    for index in (0..active_char_counts.len()).rev() {
+        remaining_suffix_chars[index] =
+            remaining_suffix_chars[index + 1].saturating_add(active_char_counts[index]);
+    }
+    let mut turns_to_keep = RECENT_TURNS_TO_KEEP.min(active.len().saturating_sub(1));
+    loop {
+        let candidate = safe_compaction_cutoff(active, active.len().saturating_sub(turns_to_keep));
+        if candidate > 0 && remaining_suffix_chars[candidate] / CHARS_PER_TOKEN <= target_tokens {
+            return candidate;
+        }
+        if turns_to_keep <= MIN_TURNS_TO_KEEP {
+            return safe_compaction_cutoff(active, active.len().saturating_sub(MIN_TURNS_TO_KEEP));
+        }
+        turns_to_keep = (turns_to_keep / 2).max(MIN_TURNS_TO_KEEP);
+    }
 }
 
 fn lcm_node_id(
@@ -240,6 +286,9 @@ const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 350;
 const HARD_THRESHOLD_PENDING_POLL_MS: u64 = 50;
 #[cfg(test)]
 const HARD_THRESHOLD_PENDING_POLL_MS: u64 = 10;
+const LCM_CHUNK_CONCURRENCY: usize = 2;
+const LCM_INLINE_SOURCE_CHARS: usize = 1_024;
+const LCM_CRITICAL_PROMPT_CHARS: usize = 32_000;
 
 /// Result from background compaction task
 struct CompactionResult {
@@ -693,6 +742,34 @@ impl CompactionManager {
                 .map(|message| content_char_count(&message.content))
                 .sum(),
         );
+    }
+
+    /// Restore a projection already proven to be owned by the durable native
+    /// LCM graph. The ordinary restore path deliberately refuses arbitrary
+    /// rolling/provider-native state when LCM is active.
+    pub fn restore_native_lcm_stored_state_with(
+        &mut self,
+        state: &crate::session::StoredCompactionState,
+        all_messages: &[crate::session::StoredMessage],
+    ) {
+        self.restore_persisted_stored_state_with(state, all_messages);
+        if self.engine != crate::config::CompactionEngine::Lcm {
+            return;
+        }
+        self.compacted_count = state.compacted_count.min(all_messages.len());
+        self.active_summary = Some(Summary {
+            text: state.summary_text.clone(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: state.covers_up_to_turn,
+            original_turn_count: state.original_turn_count,
+        });
+        self.active_chars.set_exact(
+            all_messages[self.compacted_count..]
+                .iter()
+                .map(|message| content_char_count(&message.content))
+                .sum(),
+        );
+        self.suppress_compaction_until_new_message = !all_messages.is_empty();
     }
 
     /// Export the currently active compacted view for persistence.
@@ -1890,13 +1967,7 @@ impl CompactionManager {
             );
             return;
         }
-        let all_messages = session.messages_for_provider_uncached();
-        let source_end = source.covered_message_count.min(all_messages.len());
-        let source_start = self.compacted_count.min(source_end);
-        if source_end != source.covered_message_count
-            || message_fingerprint(&all_messages[source_start..source_end])
-                != source.source_fingerprint
-        {
+        if !lcm_source_matches_canonical_session(&source, session) {
             crate::logging::warn(
                 "Discarding completed LCM job because canonical source history changed",
             );
@@ -2109,8 +2180,9 @@ impl CompactionManager {
         if self.context_usage_with(&all_messages) >= CRITICAL_THRESHOLD {
             let critical_policy_model = crate::config::config().compaction.model.clone();
             let active = self.active_messages(&all_messages);
-            let cutoff =
-                safe_compaction_cutoff(active, active.len().saturating_sub(RECENT_TURNS_TO_KEEP));
+            let target_tokens =
+                (self.token_budget as f64 * f64::from(COMPACTION_THRESHOLD)) as usize;
+            let cutoff = critical_lcm_cutoff(active, target_tokens);
             if cutoff > 0 {
                 if self.pending_task.is_none() && self.prepared_lcm_context.is_none() {
                     let _ = self.start_lcm_job_with_model(
@@ -2310,29 +2382,8 @@ impl CompactionManager {
             ));
         }
         let pre_tokens = self.effective_token_count_with(&all_messages) as u64;
-        let active_char_counts: Vec<usize> = active.iter().map(message_char_count).collect();
-        let mut remaining_suffix_chars = vec![0usize; active_char_counts.len() + 1];
-        for index in (0..active_char_counts.len()).rev() {
-            remaining_suffix_chars[index] =
-                remaining_suffix_chars[index + 1].saturating_add(active_char_counts[index]);
-        }
-        let mut turns_to_keep = RECENT_TURNS_TO_KEEP.min(active.len().saturating_sub(1));
-        let cutoff = loop {
-            let candidate =
-                safe_compaction_cutoff(active, active.len().saturating_sub(turns_to_keep));
-            if candidate > 0
-                && remaining_suffix_chars[candidate] / CHARS_PER_TOKEN <= self.token_budget
-            {
-                break candidate;
-            }
-            if turns_to_keep <= MIN_TURNS_TO_KEEP {
-                break safe_compaction_cutoff(
-                    active,
-                    active.len().saturating_sub(MIN_TURNS_TO_KEEP),
-                );
-            }
-            turns_to_keep = (turns_to_keep / 2).max(MIN_TURNS_TO_KEEP);
-        };
+        let target_tokens = (self.token_budget as f64 * f64::from(COMPACTION_THRESHOLD)) as usize;
+        let cutoff = critical_lcm_cutoff(active, target_tokens);
         if cutoff == 0 {
             return Err("Cannot compact - would split tool call/result pairs".to_string());
         }
@@ -3321,7 +3372,7 @@ async fn acquire_lcm_scheduler_from(
 }
 
 const LCM_SUMMARY_SYSTEM_PROMPT: &str = r#"You are the Jcode LCM context compactor.
-Return only stable Markdown with these sections: Objective and user intent; Explicit constraints and prohibited actions; Decisions and rationale; Repository state and exact paths/symbols/branches/commits; Changes actually completed; Commands and tests with actual outcomes; Failures, diagnosis, and unresolved blockers; Open questions and next steps; Retrieval anchors and source range.
+Return at most 900 characters of stable Markdown with these sections: Objective and user intent; Explicit constraints and prohibited actions; Decisions and rationale; Repository state and exact paths/symbols/branches/commits; Changes actually completed; Commands and tests with actual outcomes; Failures, diagnosis, and unresolved blockers; Open questions and next steps; Retrieval anchors and source range. Retain at most one highest-value excerpt per section.
 Separate observed facts from plans or assumptions. Preserve newer corrections and mark superseded decisions. Every non-placeholder content line must be `- [source] ` followed by one exact, contiguous excerpt copied verbatim from the observed source. Do not paraphrase or combine excerpts. Use `None observed.` when a section has no useful excerpt. Never claim an edit, commit, command, or test happened unless an exact source excerpt says it did. Do not include chain-of-thought, credentials, tokens, or raw tool blobs. Do not invent missing details."#;
 
 const LCM_REQUIRED_SECTIONS: [&str; 9] = [
@@ -3434,6 +3485,128 @@ fn lcm_output_is_grounded(summary: &str, source: &str) -> bool {
                     .any(|source_line| source_line.trim() == excerpt)
         })
     })
+}
+
+fn repair_lcm_output_grounding(summary: &str, source: &str, max_chars: usize) -> Option<String> {
+    if !lcm_output_has_required_sections(summary) {
+        return None;
+    }
+    let mut excerpts = vec![Vec::<String>::new(); LCM_REQUIRED_SECTIONS.len()];
+    let mut current_section = None;
+
+    for line in summary.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            let heading = line.trim_start_matches('#').trim();
+            current_section = LCM_REQUIRED_SECTIONS
+                .iter()
+                .position(|required| heading.eq_ignore_ascii_case(required));
+            continue;
+        }
+        let Some(section) = current_section else {
+            continue;
+        };
+        let content = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line)
+            .trim();
+        let Some(excerpt) = content.strip_prefix("[source] ").map(str::trim) else {
+            continue;
+        };
+        let canonical_line = source
+            .lines()
+            .map(str::trim)
+            .find(|source_line| !excerpt.is_empty() && source_line.contains(excerpt));
+        if let Some(canonical_line) = canonical_line
+            && !excerpts[section].iter().any(|kept| kept == canonical_line)
+        {
+            excerpts[section].push(canonical_line.to_string());
+        }
+    }
+
+    let render = |excerpts: &[Vec<String>]| {
+        LCM_REQUIRED_SECTIONS
+            .iter()
+            .zip(excerpts)
+            .map(|(heading, excerpts)| {
+                let content = if excerpts.is_empty() {
+                    "None observed.".to_string()
+                } else {
+                    excerpts
+                        .iter()
+                        .map(|excerpt| format!("- [source] {excerpt}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                format!("# {heading}\n{content}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let mut repaired = render(&excerpts);
+    while repaired.len() > max_chars {
+        let Some(section) = excerpts.iter().rposition(|section| !section.is_empty()) else {
+            break;
+        };
+        excerpts[section].pop();
+        repaired = render(&excerpts);
+    }
+    Some(repaired)
+}
+
+fn reduce_validated_lcm_summaries(summaries: &[String], max_chars: usize) -> Option<String> {
+    if summaries.is_empty()
+        || summaries
+            .iter()
+            .any(|summary| !lcm_output_has_required_sections(summary))
+    {
+        return None;
+    }
+    let candidate = summaries.join("\n\n");
+    let exact_excerpts = summaries
+        .iter()
+        .flat_map(|summary| summary.lines())
+        .filter_map(|line| line.trim().strip_prefix("- [source] ").map(str::trim))
+        .filter(|excerpt| !excerpt.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    repair_lcm_output_grounding(&candidate, &exact_excerpts, max_chars)
+}
+
+fn summarize_small_lcm_source(
+    messages: &[Message],
+    existing_summary: Option<&Summary>,
+    output_budget_chars: usize,
+) -> Option<String> {
+    let source = lcm_safe_source_text(messages, existing_summary);
+    let excerpts = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with('#')
+                && !line.starts_with("**")
+                && !line.eq_ignore_ascii_case("none observed.")
+        })
+        .map(|line| format!("- [source] {line}"))
+        .collect::<Vec<_>>();
+    let candidate = LCM_REQUIRED_SECTIONS
+        .iter()
+        .map(|heading| {
+            if *heading == "Retrieval anchors and source range" && !excerpts.is_empty() {
+                format!("# {heading}\n{}", excerpts.join("\n"))
+            } else {
+                format!("# {heading}\nNone observed.")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    repair_lcm_output_grounding(
+        &candidate,
+        &source,
+        output_budget_chars.min(LCM_INLINE_SOURCE_CHARS),
+    )
 }
 
 fn is_lcm_context_limit_error(error: &anyhow::Error) -> bool {
@@ -3562,6 +3735,7 @@ async fn complete_lcm_bounded(
             .unwrap_or(0);
     let canonical_source = lcm_safe_source_text(messages, existing_summary);
     let prompt = build_lcm_compaction_prompt(messages, existing_summary, max_prompt_chars);
+    let completion_start = Instant::now();
     let summary = tokio::time::timeout(
         LCM_PROVIDER_TIMEOUT,
         provider.complete_simple(&prompt, LCM_SUMMARY_SYSTEM_PROMPT),
@@ -3569,11 +3743,52 @@ async fn complete_lcm_bounded(
     .await
     .map_err(|_| anyhow::anyhow!("LCM compactor provider call timed out"))??;
     let summary = crate::message::redact_secrets(&summary);
-    if lcm_output_is_concise(&summary, source_chars, output_budget_chars)
-        && lcm_output_has_required_sections(&summary)
-        && lcm_output_is_grounded(&summary, &canonical_source)
-    {
+    let concise = lcm_output_is_concise(&summary, source_chars, output_budget_chars);
+    let structured = lcm_output_has_required_sections(&summary);
+    let grounded = lcm_output_is_grounded(&summary, &canonical_source);
+    crate::logging::event_info(
+        "LCM_PROVIDER_STAGE",
+        vec![
+            ("phase", "initial_completion".to_string()),
+            (
+                "elapsed_ms",
+                completion_start.elapsed().as_millis().to_string(),
+            ),
+            ("source_chars", source_chars.to_string()),
+            ("prompt_chars", prompt.len().to_string()),
+            ("output_chars", summary.len().to_string()),
+            ("concise", concise.to_string()),
+            ("structured", structured.to_string()),
+            ("grounded", grounded.to_string()),
+        ],
+    );
+    if concise && structured && grounded {
         return Ok(summary.trim().to_string());
+    }
+    let deterministic_repair_budget =
+        output_budget_chars.min(source_chars.saturating_sub(1).max(1_024));
+    if structured
+        && let Some(repaired) =
+            repair_lcm_output_grounding(&summary, &canonical_source, deterministic_repair_budget)
+    {
+        let concise = lcm_output_is_concise(&repaired, source_chars, output_budget_chars);
+        let grounded = lcm_output_is_grounded(&repaired, &canonical_source);
+        let retained_source = repaired.contains("- [source] ");
+        crate::logging::event_info(
+            "LCM_PROVIDER_STAGE",
+            vec![
+                ("phase", "deterministic_repair".to_string()),
+                ("source_chars", source_chars.to_string()),
+                ("input_chars", summary.len().to_string()),
+                ("output_chars", repaired.len().to_string()),
+                ("concise", concise.to_string()),
+                ("grounded", grounded.to_string()),
+                ("retained_source", retained_source.to_string()),
+            ],
+        );
+        if concise && grounded && retained_source {
+            return Ok(repaired);
+        }
     }
     let target_chars = output_budget_chars
         .min(source_chars.saturating_sub(1))
@@ -3581,6 +3796,7 @@ async fn complete_lcm_bounded(
     let rewrite_prompt = format!(
         "Rewrite the following candidate into at most {target_chars} characters. Use all nine exact required Markdown headings from the system instruction. Every retained content line must be `- [source] ` plus one exact contiguous excerpt from the original observed source; otherwise replace it with `None observed.`. Remove unsupported completion claims and secrets. Return only the rewrite.\n\n{summary}"
     );
+    let rewrite_start = Instant::now();
     let rewritten = tokio::time::timeout(
         LCM_PROVIDER_TIMEOUT,
         provider.complete_simple(&rewrite_prompt, LCM_SUMMARY_SYSTEM_PROMPT),
@@ -3588,10 +3804,26 @@ async fn complete_lcm_bounded(
     .await
     .map_err(|_| anyhow::anyhow!("LCM compactor rewrite timed out"))??;
     let rewritten = crate::message::redact_secrets(&rewritten);
-    if !lcm_output_is_concise(&rewritten, source_chars, output_budget_chars)
-        || !lcm_output_has_required_sections(&rewritten)
-        || !lcm_output_is_grounded(&rewritten, &canonical_source)
-    {
+    let concise = lcm_output_is_concise(&rewritten, source_chars, output_budget_chars);
+    let structured = lcm_output_has_required_sections(&rewritten);
+    let grounded = lcm_output_is_grounded(&rewritten, &canonical_source);
+    crate::logging::event_info(
+        "LCM_PROVIDER_STAGE",
+        vec![
+            ("phase", "rewrite_completion".to_string()),
+            (
+                "elapsed_ms",
+                rewrite_start.elapsed().as_millis().to_string(),
+            ),
+            ("source_chars", source_chars.to_string()),
+            ("prompt_chars", rewrite_prompt.len().to_string()),
+            ("output_chars", rewritten.len().to_string()),
+            ("concise", concise.to_string()),
+            ("structured", structured.to_string()),
+            ("grounded", grounded.to_string()),
+        ],
+    );
+    if !concise || !structured || !grounded {
         anyhow::bail!(
             "LCM compactor output remained invalid, unsupported, or oversized after one rewrite"
         );
@@ -3623,57 +3855,78 @@ async fn summarize_lcm_source_with_budget(
         .await;
     }
 
-    let mut summaries = Vec::new();
-    for (index, chunk) in lcm_message_chunks(messages, chunk_chars)
-        .into_iter()
-        .enumerate()
-    {
-        summaries.push(
-            complete_lcm_bounded(
+    let chunks = lcm_message_chunks(messages, chunk_chars);
+    crate::logging::event_info(
+        "LCM_PROVIDER_STAGE",
+        vec![
+            ("phase", "source_chunks".to_string()),
+            ("chunks", chunks.len().to_string()),
+            ("source_chars", source_chars.to_string()),
+            ("max_concurrency", LCM_CHUNK_CONCURRENCY.to_string()),
+        ],
+    );
+    let existing_summary_ref = existing_summary.as_ref();
+    let mut indexed_summaries = futures::stream::iter(chunks.into_iter().enumerate().map(
+        |(index, chunk)| async move {
+            let prior_summary = (index == 0).then_some(existing_summary_ref).flatten();
+            let chunk_source_chars = chunk.iter().map(message_char_count).sum::<usize>()
+                + prior_summary.map(summary_payload_char_count).unwrap_or(0);
+            if chunk_source_chars <= LCM_INLINE_SOURCE_CHARS {
+                let summary =
+                    summarize_small_lcm_source(&chunk, prior_summary, output_budget_chars)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("LCM small source could not be reduced safely")
+                        })?;
+                crate::logging::event_info(
+                    "LCM_PROVIDER_STAGE",
+                    vec![
+                        ("phase", "deterministic_small_source".to_string()),
+                        ("source_chars", chunk_source_chars.to_string()),
+                        ("output_chars", summary.len().to_string()),
+                    ],
+                );
+                return Ok::<_, anyhow::Error>((index, summary));
+            }
+            let summary = complete_lcm_bounded(
                 provider,
                 &chunk,
-                (index == 0).then_some(existing_summary.as_ref()).flatten(),
+                prior_summary,
                 max_prompt_chars,
                 output_budget_chars,
             )
-            .await?,
-        );
-    }
+            .await?;
+            Ok::<_, anyhow::Error>((index, summary))
+        },
+    ))
+    .buffer_unordered(LCM_CHUNK_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+    indexed_summaries.sort_unstable_by_key(|(index, _)| *index);
+    let mut summaries = indexed_summaries
+        .into_iter()
+        .map(|(_, summary)| summary)
+        .collect::<Vec<_>>();
     if summaries.is_empty()
         && let Some(existing) = existing_summary
     {
         summaries.push(existing.text);
     }
 
-    while summaries.len() > 1 {
-        let summary_messages = summaries
-            .into_iter()
-            .enumerate()
-            .map(|(index, summary)| Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: format!("[chronological LCM chunk {}]\n{summary}", index + 1),
-                    cache_control: None,
-                }],
-                timestamp: None,
-                tool_duration_ms: None,
-            })
-            .collect::<Vec<_>>();
-        let groups = lcm_message_chunks(summary_messages, chunk_chars);
-        let mut reduced = Vec::with_capacity(groups.len());
-        for group in groups {
-            reduced.push(
-                complete_lcm_bounded(
-                    provider,
-                    &group,
-                    None,
-                    max_prompt_chars,
-                    output_budget_chars,
-                )
-                .await?,
-            );
-        }
-        summaries = reduced;
+    if summaries.len() > 1 {
+        let input_chars = summaries.iter().map(String::len).sum::<usize>();
+        let reduction_budget = output_budget_chars.min(input_chars.saturating_sub(1).max(1_024));
+        let reduced = reduce_validated_lcm_summaries(&summaries, reduction_budget)
+            .ok_or_else(|| anyhow::anyhow!("LCM chunk summaries could not be reduced safely"))?;
+        crate::logging::event_info(
+            "LCM_PROVIDER_STAGE",
+            vec![
+                ("phase", "deterministic_reduction".to_string()),
+                ("chunks", summaries.len().to_string()),
+                ("input_chars", input_chars.to_string()),
+                ("output_chars", reduced.len().to_string()),
+            ],
+        );
+        summaries = vec![reduced];
     }
     summaries
         .pop()
@@ -3792,6 +4045,9 @@ async fn generate_lcm_compaction_artifact(
     );
     let (route_key, mut max_prompt_chars, output_budget_chars) =
         lcm_prompt_budget(provider.as_ref(), route_identity.as_deref());
+    if priority == LcmJobPriority::Critical {
+        max_prompt_chars = max_prompt_chars.min(LCM_CRITICAL_PROMPT_CHARS);
+    }
     let mut attempts = 0;
     let summary = loop {
         match summarize_lcm_source_with_budget(

@@ -554,6 +554,100 @@ fn lcm_stale_source_is_not_published() -> Result<()> {
 }
 
 #[test]
+fn lcm_completed_source_validation_uses_captured_raw_range() -> Result<()> {
+    let mut session = make_lcm_session("lcm_captured_raw_range", 20);
+    session.context_frontier = Some(crate::session::StoredContextFrontier {
+        schema_version: 1,
+        generation: 1,
+        active_node_ids: Vec::new(),
+        covered_message_count: 1,
+        covered_through_message_id: Some(session.messages[0].id.clone()),
+        source_prefix_sha256: stored_message_prefix_sha256(&session.messages[..1])?,
+        next_node_sequence: 2,
+    });
+    let manager = CompactionManager::new();
+    let source = manager.capture_lcm_source(
+        &session,
+        10,
+        "model".into(),
+        "provider".into(),
+        "route".into(),
+        None,
+        850,
+        "critical_selected_route".into(),
+    )?;
+
+    assert_eq!(source.source_message_ids.len(), 9);
+    assert!(lcm_source_matches_canonical_session(&source, &session));
+
+    let original_prefix = session.messages[0].content.clone();
+    session.messages[0].content = vec![ContentBlock::Text {
+        text: "changed covered prefix".into(),
+        cache_control: None,
+    }];
+    assert!(!lcm_source_matches_canonical_session(&source, &session));
+    session.messages[0].content = original_prefix;
+
+    session.messages[1].content = vec![ContentBlock::Text {
+        text: "changed captured source".into(),
+        cache_control: None,
+    }];
+    assert!(!lcm_source_matches_canonical_session(&source, &session));
+    Ok(())
+}
+
+#[test]
+fn lcm_resume_restores_only_explicit_native_graph_projection() {
+    let session = make_lcm_session("lcm_native_resume", 20);
+    let state = crate::session::StoredCompactionState {
+        summary_text: "native graph projection".into(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 10,
+        original_turn_count: 10,
+        compacted_count: 10,
+    };
+    let mut manager = CompactionManager::new();
+    manager.engine = crate::config::CompactionEngine::Lcm;
+
+    manager.restore_persisted_stored_state_with(&state, &session.messages);
+    assert_eq!(manager.compacted_count, 0);
+    assert!(manager.active_summary.is_none());
+
+    manager.restore_native_lcm_stored_state_with(&state, &session.messages);
+    assert_eq!(manager.compacted_count, 10);
+    assert_eq!(
+        manager
+            .active_summary
+            .as_ref()
+            .map(|summary| summary.text.as_str()),
+        Some("native graph projection")
+    );
+}
+
+#[test]
+fn lcm_critical_cutoff_preserves_ten_unless_the_tail_itself_overflows() {
+    let normal = (0..12)
+        .map(|index| make_text_message(Role::User, &format!("message {index}")))
+        .collect::<Vec<_>>();
+    assert_eq!(critical_lcm_cutoff(&normal, 1_000), 2);
+
+    let oversized = vec![
+        make_text_message(Role::User, &"large observed source ".repeat(3_000)),
+        make_text_message(Role::Assistant, "short response"),
+        make_text_message(Role::User, "short follow-up"),
+    ];
+    assert_eq!(critical_lcm_cutoff(&oversized, 1_000), 1);
+
+    let canary_shape = vec![
+        make_text_message(Role::User, &"injected context ".repeat(40)),
+        make_text_message(Role::User, &"pressure source ".repeat(3_500)),
+        make_text_message(Role::Assistant, "short response"),
+        make_text_message(Role::User, "short follow-up"),
+    ];
+    assert_eq!(critical_lcm_cutoff(&canary_shape, 12_000), 2);
+}
+
+#[test]
 fn lcm_durable_write_failure_keeps_candidate_and_live_state_unpublished() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::tempdir()?;
@@ -1462,6 +1556,99 @@ fn lcm_output_requires_exact_source_grounding_for_every_claim() {
 }
 
 #[test]
+fn lcm_grounding_repair_keeps_exact_excerpts_and_drops_unsupported_claims() {
+    let source = "Do not claim all tests pass.\nObserved command failed.";
+    let candidate = structured_test_summary(
+        "Observed command failed.\nThe whole change set is now green and landed.",
+    );
+
+    let repaired =
+        repair_lcm_output_grounding(&candidate, source, usize::MAX).expect("structured repair");
+
+    assert!(repaired.contains("- [source] Observed command failed."));
+    assert!(!repaired.contains("green and landed"));
+    assert!(lcm_output_has_required_sections(&repaired));
+    assert!(lcm_output_is_grounded(&repaired, source));
+}
+
+#[test]
+fn lcm_grounding_repair_accepts_exact_contiguous_partial_line() {
+    let source = "Observed command: cargo test -p jcode-base. Result: 36 passed.";
+    let candidate = structured_test_summary("Result: 36 passed.");
+    let repaired = repair_lcm_output_grounding(&candidate, source, 900)
+        .expect("exact contiguous excerpt should survive repair");
+
+    assert!(
+        repaired
+            .contains("- [source] Observed command: cargo test -p jcode-base. Result: 36 passed.")
+    );
+    assert!(lcm_output_is_grounded(&repaired, source));
+}
+
+#[test]
+fn lcm_deterministic_reduction_preserves_chunk_order() {
+    let first = structured_test_summary("Decision alpha was observed.");
+    let second = structured_test_summary("Decision beta corrected alpha.");
+
+    let reduced = reduce_validated_lcm_summaries(&[first, second], usize::MAX)
+        .expect("deterministic reduction");
+
+    let alpha = reduced.find("Decision alpha").expect("alpha retained");
+    let beta = reduced.find("Decision beta").expect("beta retained");
+    assert!(alpha < beta);
+    assert!(lcm_output_has_required_sections(&reduced));
+    assert!(lcm_output_is_grounded(
+        &reduced,
+        "Decision alpha was observed.\nDecision beta corrected alpha."
+    ));
+}
+
+#[test]
+fn lcm_small_source_summary_is_exact_and_bounded() {
+    let messages = vec![make_text_message(
+        Role::Assistant,
+        "Observed correction: keep rolling as default.",
+    )];
+    let summary =
+        summarize_small_lcm_source(&messages, None, 4_096).expect("small deterministic summary");
+
+    assert!(summary.contains("- [source] Observed correction: keep rolling as default."));
+    assert!(summary.len() <= LCM_INLINE_SOURCE_CHARS);
+    assert!(lcm_output_has_required_sections(&summary));
+    assert!(lcm_output_is_grounded(
+        &summary,
+        &lcm_safe_source_text(&messages, None)
+    ));
+}
+
+#[tokio::test]
+async fn lcm_critical_prompt_uses_latency_safe_cap() -> Result<()> {
+    let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(PromptCapturingProvider {
+        systems,
+        prompts: Arc::clone(&prompts),
+    });
+
+    generate_lcm_compaction_artifact(
+        provider,
+        vec![make_text_message(
+            Role::User,
+            &"observed line\n".repeat(4_000),
+        )],
+        None,
+        Some("latency-cap-route".to_string()),
+        LcmJobPriority::Critical,
+    )
+    .await?;
+
+    let prompts = prompts.lock().expect("prompt lock");
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].len() <= LCM_CRITICAL_PROMPT_CHARS);
+    Ok(())
+}
+
+#[test]
 fn lcm_prompt_uses_only_the_structured_schema() {
     let opaque_secret = "correct horse battery staple";
     let messages = vec![Message {
@@ -1929,6 +2116,34 @@ fn lcm_chunking_preserves_missing_and_orphan_tool_result_evidence() {
     assert!(rendered.contains("orphan-call"));
     assert!(rendered.contains("status=error"));
     assert!(rendered.contains("recovered result tail"));
+}
+
+#[tokio::test]
+async fn lcm_source_chunks_run_with_bounded_concurrency() -> Result<()> {
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: Arc<dyn Provider> = Arc::new(ScheduledProvider {
+        active: Arc::clone(&active),
+        maximum: Arc::clone(&maximum),
+    });
+    let messages = (0..6)
+        .map(|index| {
+            make_text_message(
+                Role::User,
+                &format!("chunk-{index}: {}", "observed source ".repeat(80)),
+            )
+        })
+        .collect();
+
+    let summary = summarize_lcm_source_with_budget(&provider, messages, None, 2_000, 2_000).await?;
+
+    assert!(lcm_output_has_required_sections(&summary));
+    assert_eq!(
+        maximum.load(std::sync::atomic::Ordering::SeqCst),
+        LCM_CHUNK_CONCURRENCY
+    );
+    assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+    Ok(())
 }
 
 const LCM_CERT_TRACE_COUNT: usize = 30;

@@ -489,7 +489,24 @@ impl Agent {
         let budget = self.provider.context_window();
         manager.set_budget(budget);
         if let Some(state) = self.session.compaction.as_ref() {
-            manager.restore_persisted_stored_state_with(state, &self.session.messages);
+            let native_lcm_owned = state.openai_encrypted_content.is_none()
+                && self
+                    .session
+                    .context_frontier
+                    .as_ref()
+                    .is_some_and(|frontier| {
+                        frontier.covered_message_count == state.compacted_count
+                            && frontier.covered_message_count == state.covers_up_to_turn
+                            && !frontier.active_node_ids.is_empty()
+                            && frontier.active_node_ids.iter().all(|id| {
+                                self.session.context_nodes.iter().any(|node| node.id == *id)
+                            })
+                    });
+            if native_lcm_owned {
+                manager.restore_native_lcm_stored_state_with(state, &self.session.messages);
+            } else {
+                manager.restore_persisted_stored_state_with(state, &self.session.messages);
+            }
         } else {
             manager.seed_restored_stored_messages_with(&self.session.messages);
         }
