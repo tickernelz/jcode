@@ -8,19 +8,19 @@
 - Initiative: `jcode-native-lcm-context-engine`
 - Branch: `feat/native-lcm-context-engine`
 - Baseline commit: `6e443c82e456a2e51015e5555a5fcb52f439d410`
-- Current phase: **Phase 3/4 hardening, opt-in LCM plus lifecycle and hierarchy**
-- Overall status: **in progress**
-- Last updated: **2026-07-23**
+- Current phase: **Phase 5/6 certification complete; promotion denied**
+- Overall status: **native opt-in implementation complete; `rolling` remains default**
+- Last updated: **2026-07-24**
 
 | Phase | Status | Evidence |
 |---|---|---|
 | 0. Baseline and correctness prerequisites | Complete | Stable prefix fingerprint; reset/restore/rewind cancel stale work; undo restores exact durable compaction state |
 | 1. Minimal control plane | Complete | `rolling|lcm` engine config; route-preserving compaction model; local and authoritative remote `/agents compaction` plus `/agents lcm` |
 | 2. Durable graph persistence | Complete | Versioned graph transaction; staged durable commit-before-publication; sequenced/watermarked journal recovery; fault and legacy tests |
-| 3. Opt-in depth-zero LCM | In progress | Native Rust leaf generation, adaptive compactor ceiling, typed inherited routes, provider-independent graph, structured output validation, critical fallback chain, and focused safety tests implemented; full provider/fault/quality gates remain |
-| 4. Lifecycle and hierarchy | In progress | Immutable fanout-4 hierarchy, recursive same-generation carry, rewind/reload validation, transfer engine snapshot, export stripping, retrieval anchors, and lifecycle guards implemented; full lifecycle and swarm certification remain |
-| 5. Canary and validation gates | Blocked | No real provider matrix, external quality comparison, cache/journal benchmark, fault campaign, canary, or rollback evidence yet |
-| 6. Default promotion | Blocked | `rolling` remains default; synthetic planted-fact control is not promotion evidence |
+| 3. Opt-in depth-zero LCM | Complete | Native Rust leaf generation, adaptive compactor ceiling, typed inherited routes, provider-independent graph, structured output validation, and critical fallback chain |
+| 4. Lifecycle and hierarchy | Complete | Immutable fanout-4 hierarchy, recursive same-generation carry, rewind/reload validation, transfer engine snapshot, export stripping, retrieval anchors, and lifecycle guards |
+| 5. Canary and validation gates | Complete, not green | Configured provider matrix, external Hermes comparison, quality, resource counters, scheduler, faults, process crash, canary, and rollback were executed; strict preferred-route, full-suite, Windows, route coverage, growth, and observation gates are not all green |
+| 6. Default promotion | **Denied** | Boolean-AND certification is false. `rolling` remains explicit live default and rollback path. See `docs/dev/LCM_PHASE56_CERTIFICATION_LEDGER.md`. |
 
 ## Progress log
 
@@ -98,6 +98,15 @@ Record any approved or evidence-driven deviation here before changing the plan b
 - The synthetic 30-trace control recovered 150/150 planted facts with a 0.497 character ratio after full-line extractive grounding. This remains synthetic regression evidence only.
 - Independent read-only audits found concrete graph-CAS, route/auth, scheduler, stale-fallback, restart, prompt-secret, output-grounding, imported-split, retrieval-continuation, transfer-snapshot, recovery-telemetry, cross-platform writer-lock, and canonical-transcript mutation defects. Those findings were fixed and covered by focused regressions. The targeted post-fix re-audit found no remaining concrete correctness/security blocker in its four final areas.
 - **Promotion remains blocked:** no objective real-provider route/account matrix, external Hermes-versus-LCM quality corpus, real token/latency/cache-hit/journal-amplification benchmark, comprehensive fault injection, scheduler fairness/queue-p95 evidence, real Windows compile/runtime contention run, multi-hop/multibyte retrieval campaign, canary deployment, rollback drill, or production observation window exists yet.
+
+### 2026-07-24: Phase 5/6 certification completed without promotion
+
+- The configured `sub2api-codex` profile passed credential, provider, and real tool smoke for all three configured models. Exact named-profile identity and explicit context-window precedence received regressions.
+- Native rolling and LCM passed the neutral 30-trace, two-cycle scorecard with 150/150 active facts, Wilson 95% lower bound 0.9750, zero false completion claims, and 60 compactions each. External Hermes passed the shared corpus, its official full release suite, and 60-run deterministic replay.
+- Scheduler fairness completed 24 background and 24 critical jobs with zero starvation and p95 below 500 ms. The exact migration/fault campaign passed 12/12. A real `SIGKILL` during provider-backed LCM scheduling automatically recovered and published, then an explicit rolling downgrade recovered canonical raw history.
+- The isolated functional canary completed eight turns and four graph generations, but every compaction used `local:emergency`; provider-backed critical attempts exceeded the 15-second wait. This strict route gate failed.
+- The full app-core regression gate still has isolated failures. Real Windows runtime, direct OpenRouter/Gemini and other unconfigured routes, sustained cache/journal growth bounds, and the fixed observation window remain blocked rather than inferred.
+- The immutable command, threshold, result, artifact-hash, and Boolean-AND record is `docs/dev/LCM_PHASE56_CERTIFICATION_LEDGER.md`. Its result is **DO NOT PROMOTE**. Live `compaction.engine` remains `rolling`.
 
 ---
 
