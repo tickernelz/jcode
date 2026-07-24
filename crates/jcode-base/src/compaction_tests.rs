@@ -1159,6 +1159,15 @@ fn critical_lcm_recovery_is_synchronous_portable_and_durable() -> Result<()> {
             .summary_text
             .contains(labeled_secret)
     );
+    loaded.context_nodes[0]
+        .summary_text
+        .push_str(&format!("\nFiles referenced: {opaque_secret}"));
+    loaded
+        .compaction
+        .as_mut()
+        .unwrap()
+        .summary_text
+        .push_str(&format!("\nFiles referenced: {opaque_secret}"));
     let mut restored_manager = CompactionManager::new().with_budget(1_000);
     restored_manager.engine = crate::config::CompactionEngine::Lcm;
     restored_manager.restore_native_lcm_stored_state_with(

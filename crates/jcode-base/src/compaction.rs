@@ -758,7 +758,7 @@ impl CompactionManager {
         }
         self.compacted_count = state.compacted_count.min(all_messages.len());
         self.active_summary = Some(Summary {
-            text: state.summary_text.clone(),
+            text: lcm_redact_uncertain_secrets(&state.summary_text),
             openai_encrypted_content: None,
             covers_up_to_turn: state.covers_up_to_turn,
             original_turn_count: state.original_turn_count,
@@ -2131,7 +2131,7 @@ impl CompactionManager {
                     .context_nodes
                     .iter()
                     .find(|node| node.id == *id)
-                    .map(|node| node.summary_text.as_str())
+                    .map(|node| lcm_redact_uncertain_secrets(&node.summary_text))
             })
             .collect::<Vec<_>>();
         let messages = if !frontier_summaries.is_empty() {
@@ -2140,7 +2140,7 @@ impl CompactionManager {
                 messages.push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
-                        text: compacted_summary_text_block(summary),
+                        text: compacted_summary_text_block(&summary),
                         cache_control: None,
                     }],
                     timestamp: None,
@@ -2151,10 +2151,11 @@ impl CompactionManager {
             messages
         } else if let Some(summary) = self.active_summary.as_ref() {
             let mut messages = Vec::with_capacity(active.len() + 1);
+            let summary_text = lcm_redact_uncertain_secrets(&summary.text);
             messages.push(Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
-                    text: compacted_summary_text_block(&summary.text),
+                    text: compacted_summary_text_block(&summary_text),
                     cache_control: None,
                 }],
                 timestamp: None,
