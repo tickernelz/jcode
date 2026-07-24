@@ -1831,81 +1831,146 @@ fn lcm_chunking_preserves_missing_and_orphan_tool_result_evidence() {
     assert!(rendered.contains("recovered result tail"));
 }
 
+const LCM_CERT_TRACE_COUNT: usize = 30;
+const LCM_CERT_FACTS_PER_TRACE: usize = 5;
+const LCM_CERT_CYCLES: usize = 2;
+
+fn lcm_cert_trace(trace: usize, cycle: usize) -> (Vec<String>, Vec<Message>) {
+    let kinds = ["DECISION", "CONSTRAINT", "CORRECTION", "PATH", "ERROR"];
+    let facts = kinds
+        .iter()
+        .map(|kind| format!("PLANTED_{kind}_{trace:02}"))
+        .collect::<Vec<_>>();
+    let messages = facts
+        .iter()
+        .enumerate()
+        .flat_map(|(turn, fact)| {
+            [
+                make_text_message(
+                    Role::User,
+                    &format!(
+                        "trace {trace:02} cycle {cycle} turn {turn}: inspect src/module_{trace:02}.rs and retain {fact}"
+                    ),
+                ),
+                make_text_message(
+                    Role::Assistant,
+                    &format!(
+                        "Observed {fact}; the coding task remains pending. Evidence: {}",
+                        "source and test output remain canonical. ".repeat(4)
+                    ),
+                ),
+            ]
+        })
+        .collect();
+    (facts, messages)
+}
+
+fn lcm_cert_percentile(samples: &mut [u128], percentile: usize) -> u128 {
+    samples.sort_unstable();
+    samples[(samples.len() * percentile).div_ceil(100) - 1]
+}
+
 #[tokio::test]
 async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Result<()> {
-    const TRACE_COUNT: usize = 30;
-    const FACTS_PER_TRACE: usize = 5;
     let provider: Arc<dyn Provider> = Arc::new(FactPreservingProvider);
-    let mut lcm_recovered = 0;
-    let mut rolling_recovered = 0;
-    let mut source_chars = 0;
-    let mut lcm_chars = 0;
-    let mut lcm_latencies = Vec::with_capacity(TRACE_COUNT);
+    let mut results = serde_json::Map::new();
 
-    for trace in 0..TRACE_COUNT {
-        let facts = [
-            format!("PLANTED_DECISION_{trace:02}"),
-            format!("PLANTED_CONSTRAINT_{trace:02}"),
-            format!("PLANTED_CORRECTION_{trace:02}"),
-            format!("PLANTED_PATH_{trace:02}"),
-            format!("PLANTED_ERROR_{trace:02}"),
-        ];
-        let messages = facts
-            .iter()
-            .enumerate()
-            .flat_map(|(index, fact)| {
-                [
-                    make_text_message(
-                        Role::User,
-                        &format!("trace {trace} turn {index}: retain {fact}"),
-                    ),
-                    make_text_message(
-                        Role::Assistant,
-                        &format!(
-                            "Acknowledged {fact}; work is still pending. Supporting observed context: {}",
-                            "implementation evidence remains canonical. ".repeat(4)
-                        ),
-                    ),
-                ]
-            })
-            .collect::<Vec<_>>();
-        source_chars += messages.iter().map(message_char_count).sum::<usize>();
+    for strategy in ["rolling", "native_lcm"] {
+        let mut recovered = 0;
+        let mut source_chars = 0;
+        let mut output_chars = 0;
+        let mut fabricated_completion_claims = 0;
+        let mut latencies_us = Vec::with_capacity(LCM_CERT_TRACE_COUNT * LCM_CERT_CYCLES);
 
-        let started = Instant::now();
-        let lcm = generate_lcm_compaction_artifact(
-            Arc::clone(&provider),
-            messages.clone(),
-            None,
-            None,
-            LcmJobPriority::Background,
-        )
-        .await?;
-        lcm_latencies.push(started.elapsed());
-        let rolling = generate_compaction_artifact(Arc::clone(&provider), messages, None).await?;
-        lcm_chars += lcm.summary_text.len();
+        for trace in 0..LCM_CERT_TRACE_COUNT {
+            let mut prior_summary: Option<String> = None;
+            for cycle in 0..LCM_CERT_CYCLES {
+                let (facts, mut messages) = lcm_cert_trace(trace, cycle);
+                if let Some(summary) = prior_summary.take() {
+                    messages.insert(0, make_text_message(Role::Assistant, &summary));
+                }
+                source_chars += messages.iter().map(message_char_count).sum::<usize>();
+                let started = Instant::now();
+                let summary = if strategy == "native_lcm" {
+                    generate_lcm_compaction_artifact(
+                        Arc::clone(&provider),
+                        messages,
+                        None,
+                        None,
+                        LcmJobPriority::Background,
+                    )
+                    .await?
+                    .summary_text
+                } else {
+                    generate_compaction_artifact(Arc::clone(&provider), messages, None)
+                        .await?
+                        .summary_text
+                };
+                latencies_us.push(started.elapsed().as_micros());
+                output_chars += summary.len();
+                fabricated_completion_claims += summary.matches("completed successfully").count();
+                if cycle + 1 == LCM_CERT_CYCLES {
+                    recovered += facts
+                        .iter()
+                        .filter(|fact| summary.contains(fact.as_str()))
+                        .count();
+                }
+                prior_summary = Some(summary);
+            }
+        }
 
-        lcm_recovered += facts
-            .iter()
-            .filter(|fact| lcm.summary_text.contains(fact.as_str()))
-            .count();
-        rolling_recovered += facts
-            .iter()
-            .filter(|fact| rolling.summary_text.contains(fact.as_str()))
-            .count();
-        assert!(!lcm.summary_text.contains("completed successfully"));
+        let planted = LCM_CERT_TRACE_COUNT * LCM_CERT_FACTS_PER_TRACE;
+        let recall = recovered as f64 / planted as f64;
+        let ratio = output_chars as f64 / source_chars as f64;
+        let p50 = lcm_cert_percentile(&mut latencies_us.clone(), 50);
+        let p95 = lcm_cert_percentile(&mut latencies_us, 95);
+        let passed = recall >= 1.0
+            && ratio <= 1.0
+            && p95 <= 1_000_000
+            && fabricated_completion_claims == 0
+            && LCM_CERT_CYCLES >= 2;
+        results.insert(
+            strategy.to_string(),
+            serde_json::json!({
+                "active_fact_recall": recall,
+                "source_output_character_ratio": ratio,
+                "latency_p50_us": p50,
+                "latency_p95_us": p95,
+                "fabricated_completion_claims": fabricated_completion_claims,
+                "multi_cycle_compactions": LCM_CERT_TRACE_COUNT * LCM_CERT_CYCLES,
+                "passed": passed,
+            }),
+        );
     }
 
-    lcm_latencies.sort();
-    let planted = TRACE_COUNT * FACTS_PER_TRACE;
-    let p95 = lcm_latencies[(TRACE_COUNT * 95).div_ceil(100) - 1];
-    eprintln!(
-        "LCM synthetic scorecard: traces={TRACE_COUNT} fact_recovery={lcm_recovered}/{planted} rolling={rolling_recovered}/{planted} char_ratio={:.3} p95_ms={}",
-        lcm_chars as f64 / source_chars as f64,
-        p95.as_millis()
-    );
-    assert_eq!(lcm_recovered, planted);
-    assert!(lcm_recovered >= rolling_recovered);
-    assert!(lcm_chars < source_chars);
+    let overall_passed = results.values().all(|result| result["passed"] == true);
+    let scorecard = serde_json::json!({
+        "schema_version": 1,
+        "corpus": {
+            "name": "neutral_coding_trace_v1",
+            "trace_count": LCM_CERT_TRACE_COUNT,
+            "cycles_per_trace": LCM_CERT_CYCLES,
+            "facts_per_trace": LCM_CERT_FACTS_PER_TRACE,
+            "scrubbed": true,
+            "oracle": "deterministic-oracle-v1",
+        },
+        "thresholds": {
+            "min_active_fact_recall": 1.0,
+            "max_source_output_character_ratio": 1.0,
+            "max_latency_p95_us": 1_000_000,
+            "max_fabricated_completion_claims": 0,
+            "min_cycles_per_trace": 2,
+        },
+        "results": results,
+        "passed": overall_passed,
+    });
+    if let Some(path) = std::env::var_os("JCODE_LCM_CERT_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&scorecard)?)?;
+    }
+
+    assert_eq!(scorecard["corpus"]["trace_count"], 30);
+    assert_eq!(scorecard["corpus"]["cycles_per_trace"], 2);
+    assert!(overall_passed, "{scorecard:#}");
     Ok(())
 }
 
