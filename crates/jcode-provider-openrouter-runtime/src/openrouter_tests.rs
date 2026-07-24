@@ -1966,6 +1966,42 @@ fn named_openai_compatible_model_context_window_overrides_default() {
 }
 
 #[test]
+fn named_profile_context_window_overrides_conflicting_live_catalog() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let config = jcode_base::config::NamedProviderConfig {
+        base_url: "https://compat.example.test/v1".to_string(),
+        api_key: Some("test".to_string()),
+        default_model: Some("custom-budget".to_string()),
+        models: vec![jcode_base::config::NamedProviderModelConfig {
+            id: "custom-budget".to_string(),
+            context_window: Some(16_384),
+            input: Vec::new(),
+        }],
+        model_catalog: true,
+        ..Default::default()
+    };
+    let provider =
+        OpenRouterProvider::new_named_openai_compatible("custom", &config).expect("provider");
+    {
+        let mut cache = provider
+            .models_cache
+            .try_write()
+            .expect("models cache lock");
+        cache.models.push(ModelInfo {
+            id: "custom-budget".to_string(),
+            name: "Catalog claims a larger window".to_string(),
+            context_length: Some(272_000),
+            pricing: ModelPricing::default(),
+            created: None,
+        });
+        cache.fetched = true;
+    }
+
+    assert_eq!(provider.context_window(), 16_384);
+}
+
+#[test]
 fn named_profile_context_window_survives_provider_qualified_model() {
     // Regression for #403: if the runtime model transiently carries the
     // session-routing `<profile>:<model>` prefix, context_window() must still

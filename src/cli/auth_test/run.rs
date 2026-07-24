@@ -271,7 +271,7 @@ async fn run_context_audit_for_target(
 ) -> AuthTestContextAuditReport {
     let (provider_id, display_name, supports_openrouter_catalog) = match target {
         ResolvedAuthTestTarget::Generic { provider, choice } => {
-            super::provider_init::apply_login_provider_profile_env(provider);
+            apply_auth_test_provider_profile_env(provider);
             let supports_openrouter_catalog = matches!(
                 provider.target,
                 crate::provider_catalog::LoginProviderTarget::OpenRouter
@@ -639,7 +639,7 @@ async fn populate_generic_auth_test_report(
     tool_smoke_prompt: &str,
     mut report: AuthTestProviderReport,
 ) -> AuthTestProviderReport {
-    super::provider_init::apply_login_provider_profile_env(provider);
+    apply_auth_test_provider_profile_env(provider);
     probe_generic_provider_auth(provider, &mut report);
 
     maybe_run_auth_test_smoke_for_choice(
@@ -663,6 +663,70 @@ async fn populate_generic_auth_test_report(
     .await;
 
     report
+}
+
+fn apply_auth_test_provider_profile_env(
+    provider: crate::provider_catalog::LoginProviderDescriptor,
+) {
+    let named_profile_active = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let compatible_target = matches!(
+        provider.target,
+        crate::provider_catalog::LoginProviderTarget::OpenAiCompatible(_)
+    );
+
+    // Top-level CLI dispatch has already expanded `--provider-profile` into the
+    // exact named endpoint and credential source. Reapplying the generic
+    // built-in OpenAI-compatible profile here would silently replace that
+    // identity immediately before the credential probe and smoke requests.
+    if named_profile_active && compatible_target {
+        return;
+    }
+
+    super::provider_init::apply_login_provider_profile_env(provider);
+}
+
+#[cfg(test)]
+mod named_profile_tests {
+    use super::*;
+
+    #[test]
+    fn auth_test_preserves_explicit_named_compatible_profile() {
+        let _lock = crate::storage::lock_test_env();
+        let keys = [
+            "JCODE_NAMED_PROVIDER_PROFILE",
+            "JCODE_PROVIDER_PROFILE_ACTIVE",
+            "JCODE_OPENROUTER_API_KEY_NAME",
+            "JCODE_OPENROUTER_ENV_FILE",
+        ];
+        let previous = keys.map(|key| (key, std::env::var_os(key)));
+
+        crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", "private-gateway");
+        crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
+        crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", "PRIVATE_GATEWAY_KEY");
+        crate::env::set_var("JCODE_OPENROUTER_ENV_FILE", "private-gateway.env");
+
+        apply_auth_test_provider_profile_env(
+            crate::provider_catalog::OPENAI_COMPAT_LOGIN_PROVIDER,
+        );
+
+        assert_eq!(
+            crate::provider_catalog::active_named_provider_profile_credential_source(),
+            Some((
+                "PRIVATE_GATEWAY_KEY".to_string(),
+                "private-gateway.env".to_string()
+            ))
+        );
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                crate::env::set_var(key, value);
+            } else {
+                crate::env::remove_var(key);
+            }
+        }
+    }
 }
 
 fn persist_auth_test_report(report: &AuthTestProviderReport, model: Option<&str>) {

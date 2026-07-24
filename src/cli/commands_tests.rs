@@ -124,6 +124,57 @@ fn test_parse_tailscale_dns_name_invalid_json() {
 }
 
 #[test]
+fn ndjson_compaction_event_preserves_complete_lcm_telemetry() {
+    let event = crate::protocol::ServerEvent::Compaction {
+        trigger: "background".to_string(),
+        engine: Some("lcm".to_string()),
+        ownership: Some("jcode-native-lcm".to_string()),
+        configured_route: Some("openrouter:model-a".to_string()),
+        effective_route: Some("openrouter:model-b".to_string()),
+        fallback_reason: Some("selected-route-failed".to_string()),
+        leaf_count: Some(4),
+        parent_count: Some(1),
+        frontier_size: Some(2),
+        max_node_level: Some(3),
+        graph_generation: Some(9),
+        pre_tokens: Some(800),
+        post_tokens: Some(300),
+        tokens_saved: Some(500),
+        duration_ms: Some(42),
+        messages_dropped: Some(7),
+        messages_compacted: Some(12),
+        summary_chars: Some(1_024),
+        active_messages: Some(10),
+    };
+    let mut output = Vec::new();
+    let mut state = NdjsonRunState::default();
+
+    emit_ndjson_event(&mut output, &mut state, event).expect("emit compaction event");
+    let emitted: serde_json::Value =
+        serde_json::from_slice(&output).expect("parse emitted NDJSON object");
+
+    assert_eq!(emitted["type"], "compaction");
+    assert_eq!(emitted["engine"], "lcm");
+    assert_eq!(emitted["ownership"], "jcode-native-lcm");
+    assert_eq!(emitted["configured_route"], "openrouter:model-a");
+    assert_eq!(emitted["effective_route"], "openrouter:model-b");
+    assert_eq!(emitted["fallback_reason"], "selected-route-failed");
+    assert_eq!(emitted["leaf_count"], 4);
+    assert_eq!(emitted["parent_count"], 1);
+    assert_eq!(emitted["frontier_size"], 2);
+    assert_eq!(emitted["max_node_level"], 3);
+    assert_eq!(emitted["graph_generation"], 9);
+    assert_eq!(emitted["pre_tokens"], 800);
+    assert_eq!(emitted["post_tokens"], 300);
+    assert_eq!(emitted["tokens_saved"], 500);
+    assert_eq!(emitted["duration_ms"], 42);
+    assert_eq!(emitted["messages_dropped"], 7);
+    assert_eq!(emitted["messages_compacted"], 12);
+    assert_eq!(emitted["summary_chars"], 1_024);
+    assert_eq!(emitted["active_messages"], 10);
+}
+
+#[test]
 fn configured_auth_test_targets_only_include_configured_supported_providers() {
     let _guard = crate::storage::lock_test_env();
 

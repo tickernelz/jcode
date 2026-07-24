@@ -822,6 +822,14 @@ impl Provider for OpenRouterProvider {
         // the (large) provider default and over-budgeting the request. See #403.
         let raw_model = self.model();
         let model_id = self.strip_session_profile_prefix(&raw_model).to_string();
+        let normalized_model_id = model_id.trim().to_ascii_lowercase();
+        // A context window explicitly declared in `[providers.<name>.models]`
+        // is an operator override, not merely fallback catalog metadata. Honor
+        // it before hydrated or persisted `/models` data so a gateway's stale
+        // or optimistic catalog cannot silently defeat the configured budget.
+        if let Some(limit) = self.static_context_limits.get(&normalized_model_id) {
+            return *limit;
+        }
         // Try cached model data from OpenRouter API
         let cache = self.models_cache.try_read();
         if let Ok(cache) = cache
@@ -839,10 +847,6 @@ impl Provider for OpenRouterProvider {
             && let Some(ctx) = model.context_length
         {
             return ctx as usize;
-        }
-        let normalized_model_id = model_id.trim().to_ascii_lowercase();
-        if let Some(limit) = self.static_context_limits.get(&normalized_model_id) {
-            return *limit;
         }
         if let Some(profile_id) = self.profile_id.as_deref()
             && let Some(limit) =
