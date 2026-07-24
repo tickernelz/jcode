@@ -3,7 +3,14 @@
 - Certification date: 2026-07-24 UTC
 - Branch: `feat/native-lcm-context-engine`
 - Native LCM implementation base: `97cb23ba472c80023e0e8eac9e0ab557a3e771f4`
-- Certified source revision before this ledger: `f35a7ddfc7931944602f6663d6b1b87cff3b135c`
+- Fixed promotion candidate: `01846a47a91aa1a74cd252fc305299c4cf2783f4`
+- Candidate identity is commit-object bound, not branch-tip bound. During the
+  final audit interval another process rebased the branch onto newer
+  `origin/master`; the frozen object remains preserved at
+  `safety/native-lcm-pre-rebase-20260724`. No result in this ledger certifies or
+  promotes the later rebased tip.
+- Certification-only harness commits in its ancestry: `6dc7361` (Windows durability cohort) and `fb5fe7c` (development installer version expectation).
+- Production hardening after `a9d3488`: `60c7bf8` (opaque-secret classification), `9e99e00` (deterministic emergency path), and `01846a4` (restored derived-context materialization).
 - External Hermes oracle revision: `main@23d5adc`
 - Decision rule: **promote only when every promotion gate is `PASS`**. `FAIL` and `BLOCKED` both evaluate to false.
 - Decision: **DO NOT PROMOTE**. Keep `compaction.engine = "rolling"`.
@@ -22,25 +29,45 @@ The certification did not change the product thresholds or engine boundaries:
 - The raw session journal is canonical. The context graph is rebuildable derived state.
 - Hermes Python and SQLite are comparison-only. Native Jcode LCM has no Python, Hermes, or SQLite runtime dependency.
 
+## Next-candidate acceptance thresholds
+
+These thresholds were fixed before the next promotion-candidate run. They may
+only be changed by an explicit evidence review, never to turn a red run green.
+
+- Preferred-route critical LCM completion: <= 15,000 ms, with zero
+  `local:emergency` events in the strict canary.
+- Full regression: zero failures in two consecutive `jcode-app-core` runs from
+  the same initially clean isolated `JCODE_HOME`.
+- Scheduler: zero starvation and queue p95 <= 500 ms for both priority classes.
+- Warm-cache reuse: cache-read/input ratio no more than five percentage points
+  below rolling on the identical provider corpus.
+- Durable overhead: LCM snapshot + journal + derived graph bytes <= 1.25x
+  rolling after normalizing for the identical canonical raw transcript.
+- Reconnect residue: zero unexplained one-message session snapshots.
+- Real compaction token ratio: aggregate post/pre <= 0.35 after at least four
+  compactions; at least 95% of non-bootstrap events must save tokens.
+- Observation: >= 30 continuous minutes, >= 100 completed turns, >= 10
+  sessions, and zero fallback, stale publication, corruption, or starvation.
+
 ## Boolean-AND decision
 
 | ID | Promotion gate | Status | Evidence-based reason |
 |---|---|---:|---|
-| G01 | Source formatting, focused regressions, binary build | PASS | `cargo fmt --all -- --check`, three exact regressions, native quality/scheduler tests, and `cargo build --bin jcode` passed. |
+| G01 | Source formatting, focused regressions, binary build | PASS | At `01846a4`, formatting and binary build passed; serial compaction passed 75/75, compaction-core 18/18, Windows writer-lock 1/1, and the exact orphan regression 1/1. Adversarial secret tests cover provider, deterministic emergency, durable reload, and historical derived-context materialization. |
 | G02 | Native 30-trace, two-cycle quality scorecard | PASS | Rolling and native LCM both recalled 150/150 active facts. Wilson 95% lower bound was 0.9750. False completion claims were zero. |
 | G03 | External Hermes release, deterministic replay, and shared-corpus comparison | PASS | Official full release validation passed. Deterministic replay completed 60 runs with zero failures and 258/258 canaries. Shared two-cycle corpus passed. |
 | G04 | Every configured provider/profile/model route | PASS | Named profile `sub2api-codex` passed credential, provider, and real tool smoke for `gpt-5.6-luna`, `gpt-5.6-sol`, and `gpt-5.6-terra`. |
-| G05 | Strict isolated LCM canary on its preferred configured route | **FAIL** | Eight LCM turns and four graph publications completed, but all four compactions used `local:emergency`. Preferred-route compaction timed out at 15 seconds. |
+| G05 | Strict isolated LCM canary on its preferred configured route | **PASS** | After a diagnostic run overlapped the full local suite and timed out, a predeclared no-competing-work campaign required 3/3 passes. All three preferred `sub2api-codex:gpt-5.6-sol` completions passed at 8,717 / 8,877 / 8,787 ms with 24/24 exact replies, graph publication, rolling raw recovery, and zero emergency/fallback events. |
 | G06 | Rolling rollback and canonical raw-history recovery | PASS | Both normal rollback and post-SIGKILL downgrade recovered exact planted values from raw history. |
 | G07 | Scheduler fairness, starvation, and queue p95 | PASS | 24 background plus 24 critical jobs completed. Starved jobs: 0. Queue p95: 57.323 ms background and 31.342 ms critical, below 500 ms. |
-| G08 | Durability, fault, migration, stale-result, mutation, and process-crash campaign | PASS | 12/12 exact migration/fault cases passed. A real socket-owner `SIGKILL` during `LCM_SCHEDULER` automatically recovered the turn and graph event, then rolling recovered raw history. |
-| G09 | Full repository regression gate | **FAIL** | Relevant base/session/core suites passed, but broad `jcode-app-core` was 1003 passed, 10 failed, 4 ignored. Two repeat-run restore test collisions were fixed; eight isolated failures outside the focused LCM test set remain. |
-| G10 | Windows compile, contention, and crash recovery | **BLOCKED** | GNU cross-check cannot compile without `x86_64-w64-mingw32-gcc`. No real Windows host/runtime was available. Cross-checking on Linux is not runtime proof. |
-| G11 | Unconfigured provider/API/account/profile portability | **BLOCKED** | Direct OpenRouter pin/account evidence, Gemini OAuth/API-key evidence, and all other unconfigured routes lack credentials/accounts in this environment. They are not counted as passes. |
-| G12 | Sustained resource-growth bounds | **BLOCKED** | Raw token/cache/journal counters were captured, but no predeclared long-window cache and journal-growth acceptance bound was available. Eight one-message reconnect snapshots were observed and must be explained or bounded. |
-| G13 | Fixed observation window | **BLOCKED** | Future threshold is fixed at 30 continuous minutes **and** 100 completed turns across at least 10 sessions, with no preferred-route fallback, stale publication, or crash. Available canary evidence covered eight LCM turns in one isolated session and failed the preferred-route condition. |
-| G14 | Independent evidence-only audit | PASS | An isolated independent agent recomputed manifests, metrics, route/fault chronology, blockers, secret safety, and the Boolean. Its sole chronology correction was applied verbatim and passed a post-correction re-audit. |
-| G15 | Live default and isolation safety | PASS | A redacted check found explicit `compaction.engine = "rolling"`. Canary homes/sockets/configs were isolated. No credential values were copied into artifacts. |
+| G08 | Durability, fault, migration, stale-result, mutation, and process-crash campaign | **BLOCKED** | The formal 12-case campaign and later rolling raw-history recovery passed. A socket-owner `SIGKILL` was issued 58 ms after `LCM_SCHEDULER`, but the retained chronology shows the in-flight client completed before the explicit restart. This supports listener/socket-owner kill handling and subsequent rolling recovery, not automatic post-restart recovery of the killed process's turn or graph publication. |
+| G09 | Full repository regression gate | **PASS** | At exact candidate `01846a4`, two consecutive independently clean serial `jcode-app-core` rounds each passed `1013 passed; 0 failed; 4 ignored`. Exploratory parallel failures remain classified as process-global environment interference and are not substituted for deterministic evidence. |
+| G10 | Windows compile, contention, and crash recovery | **PASS** | GitHub-hosted run `30064063308` at exact SHA `01846a4` passed x64 build plus 8/8 named LCM durability tests, 2/2 real-binary lifecycle tests, launch/install, and ARM64 build/launch/install. The cohort covers writer contention, stale writer, torn/corrupt/glued journal recovery, downgrade/rebuild, failed durable write, stale source, process exit/rebind, and client/server operation. |
+| G11 | Unconfigured provider/API/account/profile portability | **BLOCKED** | Direct OpenRouter and Gemini OAuth/API-key identities still lack configured accounts. Catalog discovery found no suitable AI-model access tool (`99af593a-a6ee-4e83-b1c5-047e31aac9ae`); capability-gap suggestion `4351cf14-a85e-4ec1-bbdb-0b1430dcbbc9` was filed. |
+| G12 | Sustained resource-growth bounds | **FAIL** | Final frozen campaigns passed token saving, durable growth, exactness, and orphan bounds but failed unchanged cache/fallback bounds. The 20-pair interleaved run had rolling/LCM warm cache ratios 0.9656/0.7688 (delta -19.69 pp), 20/17 cache-hit requests, and one LCM emergency event. The earlier four-session candidate run also failed cache delta at -26.95 pp. |
+| G13 | Fixed observation window | **PASS** | The fresh systemd-backed campaign ran 1,800 seconds and completed 100/100 exact turns across 10 sessions. All 10 triggered compactions used exact effective route `sub2api-codex:gpt-5.6-sol`; emergency, fallback, corruption, starvation, stale publication, and orphan counts were zero; queue p95 was 0 ms. |
+| G14 | Independent evidence-only audit | **PASS** | A final independent correction re-audit recomputed representative manifests, exact test selections/counts, route identities, thresholds, source hardening, raw process-kill chronology, G01-G15 statuses, and the Boolean. It confirmed the corrected G08 `BLOCKED` language is evidence-faithful. Valid G08/G11 `BLOCKED` and G12 `FAIL` outcomes remain unchanged; promotion remains false. |
+| G15 | Live default and isolation safety | PASS | A redacted check found explicit `compaction.engine = "rolling"`. Canary homes/sockets/configs were isolated. No configured credential value was intentionally copied into certification artifacts. Artifacts retain synthetic secret-shaped test fixtures and review transcripts, so they are not a guarantee of containing no secret-like literals. |
 
 The promotion Boolean is:
 
@@ -48,6 +75,13 @@ The promotion Boolean is:
 PROMOTE = G01 ∧ G02 ∧ G03 ∧ G04 ∧ G05 ∧ G06 ∧ G07 ∧ G08
         ∧ G09 ∧ G10 ∧ G11 ∧ G12 ∧ G13 ∧ G14 ∧ G15
         = false
+```
+
+The immutable final status and critical evidence-manifest digest set is sealed at:
+
+```text
+$JCODE_SCRATCH_DIR/lcm-phase56/final-certification-hash-set-20260724T044000Z
+SHA256(SHA256SUMS) = 9edc2e350bbfb36a4706fcff04af10fb7d67047a215f12d1846dce68d0d4a587
 ```
 
 ## Quality evidence
@@ -184,28 +218,49 @@ $JCODE_SCRATCH_DIR/lcm-phase56/run-isolated-canary.sh
 
 Runner SHA256: `58595f0674fbebad68c54ab803db37a37a91f1c9cdfe222fc05aa4a2bc6c1121`.
 
-Functional fallback results:
+Final-candidate results:
 
-- 8/8 exact turn responses.
-- 4 native LCM compaction events.
-- Graph generation reached 4 with four durable leaves.
-- Rolling rollback recovered `VALUE_ALPHA` from canonical raw history.
-- Aggregate observed compaction counters: pre 57,310, post 16,040, saved 41,291; three of four events had positive savings.
-- Raw provider counters: nine requests, input 123,729, output 127, cache-read input 55,040, five requests with cache reads. No cross-provider cache hit-rate denominator was invented.
-- Durable bytes: 73,904 snapshot, 10,713 journal, 73,670 backup, 169,979 total session files.
-
-Strict-route result:
-
-- `preferred_route_events = 0`.
-- `local_emergency_events = 4`.
-- Three documented provider-backed critical-route attempts timed out after approximately the fixed 15-second wait (15,016 to 15,037 ms) and fell through to local emergency compaction. All four observed compaction events used `local:emergency`; the artifact does not document a fourth provider-backed timeout attempt.
-- Therefore the functional fallback subgate passes, but the promotion canary fails.
-
-An additional growth observation found eight one-message reconnect snapshots. The evidence does not prove whether this is expected bounded reconnect bookkeeping or orphan growth, so sustained growth remains blocked.
+- One diagnostic run overlapped the two-round local `jcode-app-core` campaign and reached the unchanged 15,000 ms timeout. It is retained at `isolated-canary-20260724T032314Z` with manifest digest `54e2d77a...`; it is not counted as a pass.
+- After the local suite ended, a threshold file and runner hash were written before a three-run reliability campaign. The fixed rule required all 3/3 runs to pass with no substitution.
+- All 24/24 turn responses were exact. Every run published a native LCM graph and recovered `VALUE_ALPHA` from canonical raw history after an explicit rolling restart.
+- Preferred route in all runs: `sub2api-codex:gpt-5.6-sol`.
+- Preferred completion durations: 8,717 / 8,877 / 8,787 ms, all below 15,000 ms.
+- Pre tokens were 14,260 each; post tokens were 461 / 460 / 491.
+- `preferred_route_events = 3`; `local_emergency_events = 0`; fallback events = 0.
+- The original aggregation executed after all runs but referenced `summary.json` instead of the runner's `canary-summary.json`. The artifact records this setup-only aggregation repair; no run, threshold, or result was replaced.
 
 ```text
-$JCODE_SCRATCH_DIR/lcm-phase56/isolated-canary-20260724T003033Z
-SHA256(SHA256SUMS) = 091b6324bd380eeadda10fac2f11ce6d8e92a701518a831fa81b58d2c2d2ad61
+$JCODE_SCRATCH_DIR/lcm-phase56/canary-reliability-20260724T032500Z
+SHA256(SHA256SUMS) = a086d7b9f74541b2b72502c5720165023cc7a077d8b31231be6f9fc657210809
+run manifests = b968cbd97b37b4d405c35691e5ec573f9f497a8dbf8c4b2bd8a79676b9a0a33c, 8a094a1f2af50a3473955872d30d7f1f35859b1ee25d295fd09bcd422fb2330a, d1f3831ebe6cb94ccf7f1e5dcc85718b07c8b4e14469ce0e4e4e65b4e05b9135
+```
+
+## Rolling versus LCM resource scorecard
+
+The original passing four-session scorecard was provisional because its warm-cache denominator had been selected after inspecting earlier results. It is not promotion evidence. At fixed candidate `01846a4`, the same metric and thresholds were frozen before a fresh four-session run. That run passed every non-cache bound but failed warm-cache delta because one of four LCM warm requests reported zero cache-read tokens: rolling/LCM ratios were 0.9656/0.6961, delta -26.95 percentage points.
+
+A follow-up fixed the sampling granularity rather than changing any threshold: 20 chronological rolling/LCM pairs, alternating which engine ran first, with the identical three-turn source in each pair. With four samples, one 6,912-token miss moves the aggregate by more than 20 percentage points, so 20 pairs allow the pre-existing five-point threshold to be measured rather than quantized to all-or-nothing. The 20-pair preregistration and runner hash were written before execution. The run still failed and no further result is substituted.
+
+| Metric | Threshold | Rolling | LCM |
+|---|---:|---:|---:|
+| Real compactions | >= 20 LCM | 20 | 20 |
+| Aggregate post/pre | <= 0.35 LCM | 0.0092 | 0.0313 |
+| Saving-event rate | >= 0.95 LCM | 1.000 | 1.000 |
+| Warm cache-read/input | LCM no more than 5 pp below rolling | 0.9656 | 0.7688 |
+| Warm requests with cache reads | recorded | 20/20 | 17/20 |
+| Durable session bytes | LCM/rolling <= 1.25x | 1,551,453 | 1,726,720 |
+| One-message snapshots | 0 | 0 | 0 |
+| Preferred/emergency LCM events | all preferred / zero emergency | n/a | 19 / 1 |
+
+Observed LCM minus rolling warm-cache ratio was -19.69 percentage points, outside the -5-point bound. LCM/rolling durable bytes was 1.1130x, post/pre was 0.0313, saving rate was 1.000, all 120 responses were exact, and canonical snapshot+journal message counts were seven for all 40 sessions. Those passing submetrics do not override the cache and emergency failures. `G12 = FAIL`.
+
+```text
+$JCODE_SCRATCH_DIR/lcm-phase56/resource-scorecard-20260724T032809Z
+SHA256(SHA256SUMS) = 5c0bee780d7b17a7e32bb7a99f0902e2047d11facb78e89f217954a6aa95a2b9
+
+$JCODE_SCRATCH_DIR/lcm-phase56/resource-paired20-20260724T033215Z
+SHA256(SHA256SUMS) = 9a67559540811bcfd0900b9b6cff06d101a116d2cc7776084ebb7554eeb52565
+runner SHA256 = 676509027da8baa56eb135894eec0aa22ee8c4a0fb6de59ce7d8e97e9617d491
 ```
 
 ## Scheduler evidence
@@ -231,7 +286,12 @@ cargo test -p jcode-base --lib session::tests::cases:: -- --test-threads=1
 cargo test -p jcode-compaction-core -- --test-threads=1
 ```
 
-Results: compaction 64/64, session 67/67, compaction core 18/18. Focused app lifecycle tests for native events, rewind/undo, clone/split, and persisted projection also passed.
+Results: final-candidate compaction 75/75 and compaction-core 18/18; the unchanged session cohort previously passed 67/67. The exact Windows writer-lock test passed 1/1 and the root-library repeated-resume orphan regression passed 1/1. Focused app lifecycle tests for native events, rewind/undo, clone/split, and persisted projection also passed.
+
+```text
+$JCODE_SCRATCH_DIR/lcm-phase56/final-local-tests-20260724T034151Z
+SHA256(SHA256SUMS) = 8ee551d83bd562d261140646e59eac07b55ea11d19e32c888f7b128ee1af8e47
+```
 
 The formal 12-case campaign covers engine switch and downgrade, encrypted-state raw rebuild, durable write failure, atomic parent/leaf publication, stale source rejection, legacy snapshot load, invalid graph fallback, stale writer rejection, torn context transaction, corrupt/glued journal repair, and mutation proof invalidation.
 
@@ -248,50 +308,89 @@ $JCODE_SCRATCH_DIR/lcm-phase56/run-process-kill.sh
 
 Runner SHA256: `92e25c554ae43759da609b7729186e4b3937504706c00a1483fc87379bc6541b`.
 
-The campaign killed the actual Unix-socket owner with `SIGKILL` 58 ms after a critical `LCM_SCHEDULER` event. Jcode automatically recovered `CRASH_STAGE6_OK` and published one compaction event after restart. An explicit restart on rolling then recovered `VALUE_CRASH` from raw history. Snapshot JSON remained valid and the journal remained replayable.
+The campaign issued `SIGKILL` to a PID reported by `fuser` as owning the Unix socket 58 ms after a critical `LCM_SCHEDULER` event. The retained client completed with exit 0 before the later explicit rolling restart. The artifact supports valid snapshot/journal state and subsequent rolling raw-history recovery of `VALUE_CRASH`; it does not prove automatic post-restart recovery of the killed server's in-flight turn or graph event.
 
 ```text
 $JCODE_SCRATCH_DIR/lcm-phase56/process-kill-20260724T004525Z
 SHA256(SHA256SUMS) = 14bf5c2f866540d2411352477311d9169adad14bcc2f5e02d8db69c9094c1222
 ```
 
-## Regression exceptions
+## Independent source security review
 
-A broad serial run reported:
+An isolated read-only reviewer rejected `a9d3488` because best-effort redaction could send and persist labeled low-entropy or unlabeled mixed-class opaque values. Candidate `60c7bf8` added a conservative LCM-only whole-line classifier and adversarial prompt/output tests. The first re-review then found a distinct deterministic local-emergency bypass through raw file-reference extraction; `9e99e00` routed source, prior summary, and final emergency output through the same classifier and added a graph/persist/reload/materialization regression. The second re-review returned `REMEDIATED`, while identifying historical pre-fix derived nodes as residual re-exposure risk. Final candidate `01846a4` additionally filters restored projection and frontier text at provider materialization; the regression injects historical unsafe derived text and proves it is not exposed.
+
+The classifier deliberately chooses privacy over recall for labeled lines and long mixed-class values. A completely unlabeled natural-language passphrase is intrinsically indistinguishable from ordinary prose and remains an explicit heuristic limitation. Tool payloads are omitted before classification. Rolling remains outside this native-LCM guarantee.
 
 ```text
-jcode-base compaction: 63 passed
-jcode-base session:     67 passed
-jcode-compaction-core:  18 passed
-jcode-app-core:       1003 passed, 10 failed, 4 ignored
+$JCODE_SCRATCH_DIR/lcm-phase56/fixed-candidate-review-20260724.md
+SHA256 = bfd347f08fe3dd68d714562b2e965aaee65829b6485fa86227198fa5bef5923a
+
+$JCODE_SCRATCH_DIR/lcm-phase56/secret-rereview-20260724.md
+SHA256 = 0d76b062a876ce959178360e97cac50a8280da3bd844ff0636feb4e70be43ef4
+
+$JCODE_SCRATCH_DIR/lcm-phase56/secret-rereview2-20260724.md
+SHA256 = 873fa6e4fe77d38e72c6c17aa8e6034e8e125393670c06874a8fdc0e19486bf1
+SHA256(review-run SHA256SUMS) = 8c45b4f9028f07dedaf1971dac0ad7a3c09d018a13ff5e3a5e2904bbc4e4c58f
 ```
 
-The compaction suite became 64/64 after adding the scheduler scorecard. Two restore-session failures were fixed as test-artifact ID collisions, then passed twice consecutively. Eight isolated `jcode-app-core` failures remain in server timing/state and first-party tool-intent schema tests. None is silently waived. Because the full regression gate is Boolean-AND, it remains `FAIL`.
+## Regression exceptions
+
+The broad fixed-candidate serial run reported twice consecutively from independently clean `HOME` and `JCODE_HOME` directories:
 
 ```text
-$JCODE_SCRATCH_DIR/lcm-phase56/fault-lifecycle-20260724T003117Z
-SHA256(SHA256SUMS) = 00f1926354f477a431a67f015e1c78fa5d4fb717c8839be700b164356f9bec56
+jcode-app-core round 1: 1013 passed, 0 failed, 4 ignored
+jcode-app-core round 2: 1013 passed, 0 failed, 4 ignored
+```
 
-$JCODE_SCRATCH_DIR/lcm-phase56/restore-repeatability-20260724T004808Z
-SHA256(SHA256SUMS) = f9b41d352750858b5f6c24ed564d3addce95c777305b92e0b0cc0f541b688b7f
+The command used `cargo test -p jcode-app-core --lib -- --test-threads=1`. Serial execution is required because a subset of tests intentionally mutates process-global environment variables; separate exploratory parallel runs demonstrated that interference and are retained as failed diagnostics, not counted as gate evidence. The exact repeated one-shot resume regression also passed separately.
 
-$JCODE_SCRATCH_DIR/lcm-phase56/app-core-failure-isolation-20260724T004832Z
-SHA256(SHA256SUMS) = b24e8430f06eac03ac7672dc8fb35cbfc24feb8c4bb3303e013360ebf0a68260
+```text
+$JCODE_SCRATCH_DIR/lcm-promotion/app-core-secret-final-serial-20260724T032307Z
+SHA256(SHA256SUMS) = 6f247696303aa8d901e45c2b1337636ffc24933b39fd5c44b0b4a08bffdc6446
 ```
 
 ## Windows evidence
 
-Command:
-
-```bash
-cargo check --workspace --target x86_64-pc-windows-gnu
-```
-
-The target is installed, but the check fails in `aws-lc-sys` because `x86_64-w64-mingw32-gcc` is unavailable. This is recorded as compile `FAIL`, not pass. No real Windows runtime was configured, so file-lock contention, prepare/persist crash recovery, restart, and downgrade are `BLOCKED`.
+Final GitHub Actions workflow dispatch:
 
 ```text
-$JCODE_SCRATCH_DIR/lcm-phase56/windows-cross-check-20260724T003725Z
-SHA256(SHA256SUMS) = 5592e702d59947bae03adbd9f1ac977533e7c44a727146e165afb220228e7033
+repository = tickernelz/jcode
+workflow = Windows Smoke
+run = 30064063308
+URL = https://github.com/tickernelz/jcode/actions/runs/30064063308
+head SHA = 01846a47a91aa1a74cd252fc305299c4cf2783f4
+conclusion = success
+x64 job = 89391412110, windows-latest, success
+ARM64 job = 89391412127, windows-11-arm, success
+```
+
+The x64 job built the release binary and test executables, then executed eight named native-LCM durability regressions. Each selected exactly one test and passed: writer-lock contention, stale concurrent writer rejection, torn context transaction replay, corrupt-line journal salvage, glued-entry salvage, encrypted-native downgrade/raw rebuild, durable-write fail-closed publication, and stale-source rejection. Two real-binary named-pipe lifecycle tests each selected one test and passed, including server exit/rebind. Binary launch and development-version installer lifecycle passed. The ARM64 hosted job independently built, launched, and installer-verified the ARM64 binary.
+
+The earlier GNU cross-check failure and superseded/cancelled workflow attempts remain historical diagnostics. They are not substituted for run `30064063308`; the archived API metadata asserts both final jobs and the exact head SHA.
+
+```text
+$JCODE_SCRATCH_DIR/lcm-phase56/windows-ci-30064063308
+SHA256(SHA256SUMS) = b5d9e9949e9b577d002b975c647d2593fea852a32624845b95019ef5bb4ca4c0
+```
+
+## Observation window
+
+The fresh campaign ran as transient user-systemd unit
+`jcode-lcm-observation-20260724T035333Z.service`, independently of the command
+harness's 600-second ceiling. It completed successfully after 1,800 seconds of
+paced wall time, with 100/100 exact replies across 10 sessions and 21 canonical
+messages per session. Ten compactions were observed, all on exact effective
+route `sub2api-codex:gpt-5.6-sol`; emergency and fallback events were zero.
+Queue p95 was 0 ms; scheduler starvation, corruption, stale-publication
+rejection, and one-message snapshots were all zero.
+
+Earlier harness-bounded observation attempts remain invalid and excluded. The
+passing unit restarted from zero, retained the unchanged predeclared thresholds,
+was not substituted, and produced its own closed manifest.
+
+```text
+$JCODE_SCRATCH_DIR/lcm-phase56/observation-20260724T035333Z
+SHA256(SHA256SUMS) = 589f6f4ac9ffc918afc6c6539df7d69dc1985244d33787c13f9c3fc58074df5d
 ```
 
 ## Live-default proof
@@ -307,15 +406,28 @@ A redacted parser read only the `compaction.engine` key and recorded no credenti
 ```
 
 ```text
-$JCODE_SCRATCH_DIR/lcm-phase56/live-default-status-20260724T005116Z
-SHA256(SHA256SUMS) = e4a08a27f662b2e6dd44958868ded966b0e2f9a1e0400451866559b7eadd1e24
+$JCODE_SCRATCH_DIR/lcm-phase56/live-default-final-20260724T035911Z
+SHA256(SHA256SUMS) = 0173b36eebf6723549d079566767a6cac294d6b707bdd66538ba48f18d27d13a
 ```
 
 ## Independent evidence-only audit
 
-The auditor ran in a separate isolated Jcode home, used a separate provider session, and had read-only instructions for repository/product files. It independently recomputed representative manifests and raw metrics, checked the strict canary and `SIGKILL` chronology, classified missing routes and Windows evidence, scanned for credential values, and recomputed the Boolean decision.
+The historical audit below found and corrected an earlier canary-count overstatement;
+it is retained for chronology but is superseded for the final candidate. The final
+auditor ran in a new isolated Jcode home and provider session with read-only
+instructions. It verified representative manifests, final canary runs, both
+app-core rounds, Windows logs/API metadata, final resource campaigns, the closed
+observation, rolling live default, and the `SIGKILL` chronology.
 
-The first review found one overstatement: the canary documented three provider timeout warnings but four emergency compaction events. The ledger now states those counts separately. The same independent agent re-read the corrected ledger and changed its recommendation to `G14 = PASS`. The correction does not change `G05 = FAIL` or the no-promotion result.
+The first final review rejected G14 because the ledger overstated the process-kill
+artifact as automatic recovery across restart. The ledger now records G08 as
+`BLOCKED` and accurately limits that artifact to socket-owner kill handling,
+valid durable files, and later rolling raw-history recovery. It also narrows the
+artifact-secret statement to configured credentials while acknowledging retained
+synthetic secret-shaped fixtures. The final independent correction re-audit then
+found the corrected ledger materially evidence-faithful and recommends
+`G14 = PASS`. Valid G08 `BLOCKED`, G11 `BLOCKED`, and G12 `FAIL` outcomes remain
+unchanged; no rejected review is discarded.
 
 ```text
 $JCODE_SCRATCH_DIR/lcm-phase56/independent-audit-20260724.md
@@ -325,13 +437,33 @@ $JCODE_SCRATCH_DIR/lcm-phase56/independent-audit-run-20260724T005548Z
 SHA256(SHA256SUMS) = e695fa3b888b00441c4329606659f1abd520630572e6a46c8b8a5a8afa982c50
 
 runner SHA256 = 4e927e42c4b3b018454930d8b47aa5d9a80619b765b36d76dc5da3fc4f454a98
+
+$JCODE_SCRATCH_DIR/lcm-phase56/independent-final-audit-20260724.md
+SHA256 = 1ef6277c272b7527c84b20e6199102aa19ee2338967b4868f663c379721ec3fa
+
+$JCODE_SCRATCH_DIR/lcm-phase56/independent-final-audit-run-20260724T042652Z
+SHA256(SHA256SUMS) = 73b1afaf72f39d636dabc336caf3b57d4f189af0fd3a7665c0b646045f361879
+
+$JCODE_SCRATCH_DIR/lcm-phase56/independent-final-reaudit-20260724.md
+SHA256 = 4cb3f0f732a5977b5f44571ed44d9e9531beec58c5dfd04b38b052f2936182af
+
+$JCODE_SCRATCH_DIR/lcm-phase56/independent-final-reaudit-run-20260724T043317Z
+SHA256(SHA256SUMS) = 524cce26039ab99457507b72632930693e9f0cd5b5e4bc3ac0aa9c681fedd0ee
 ```
 
 ## Required work before promotion
 
-1. Make the preferred provider-backed critical LCM route finish within the accepted critical path, then rerun the strict isolated canary with zero emergency fallbacks.
-2. Resolve all full-suite regressions and rerun the complete suite from a clean test home.
-3. Run the exact configured-account matrix for direct OpenRouter pinning, both Gemini auth methods, and every other promotion-scope route. Missing routes remain blocked.
-4. Build and run contention, `SIGKILL`, restart, journal recovery, migration, and rolling downgrade on a real Windows host.
-5. Predeclare sustained cache and journal-growth limits, explain or eliminate reconnect snapshots, and pass the fixed 30-minute/100-turn/10-session observation window.
-6. Recompute the Boolean-AND. Promotion is allowed only if every row is `PASS`.
+1. Run a valid process-death/restart campaign that binds the socket owner PID,
+   proves the client is interrupted at kill, restarts before recovery/publication,
+   and verifies durable replay after restart. Until then G08 remains `BLOCKED`.
+2. Provide the exact configured accounts for direct OpenRouter pinning and both
+   Gemini auth methods, then run those identities without substitution. Until
+   then G11 remains `BLOCKED`.
+3. Diagnose and fix the LCM warm-cache regression, including the missing 3 of 20
+   LCM cache hits, and eliminate emergency compaction. Rerun a pre-registered
+   sustained campaign with the same or stricter bounds. Until then G12 remains
+   `FAIL`.
+4. Recompute the Boolean-AND only after G08, G11, and G12 have each passed a new
+   evidence-bound campaign. Promotion is allowed only if every row is `PASS`.
+   Keep `rolling` as the live default and rollback path until a separate
+   promotion commit is explicitly authorized.
