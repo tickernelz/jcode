@@ -15,6 +15,55 @@
 - Decision rule: **promote only when every promotion gate is `PASS`**. `FAIL` and `BLOCKED` both evaluate to false.
 - Decision: **DO NOT PROMOTE**. Keep `compaction.engine = "rolling"`.
 
+## Post-rebase integration record
+
+The feature branch was subsequently rebased, without conflicts, from old base
+`6e443c82e456a2e51015e5555a5fcb52f439d410` onto tickernelz
+`origin/master` at `1a1ad68c439135fd2f76d2226dd9ca49f5ed82f1`. The rebased LCM code tip is
+`da0daf49deac4eb2ba6e5125e26db2013495c7b5`; the old candidate remains
+recoverable at `safety/native-lcm-pre-rebase-20260724` and annotated tag
+`safety-native-lcm-pre-rebase-20260724`.
+
+Rebase integrity checks found all 16 commits in the same order with `git
+range-diff` reporting 16 exact `=` mappings, zero changed mappings, and no
+deleted path relative to the new master. The local `master` ref remained
+`6e443c82e456a2e51015e5555a5fcb52f439d410`, while `origin/master` remained the
+recorded target. No master branch was checked out, reset, committed to, or
+pushed. The rewritten feature branch has not been force-pushed.
+
+Post-rebase validation is integration evidence, not a transfer of the frozen
+`01846a4` promotion certification:
+
+- `git diff --check`, `cargo fmt --all -- --check`, and a fully clean-target
+  `cargo check --locked` for `jcode-base`, `jcode-app-core`, `jcode-tui`, and
+  `jcode` passed.
+- Native LCM regressions passed 39/39; compaction-core passed 18/18; the exact
+  repeated-resume orphan regression passed 1/1.
+- Two independently clean serial `jcode-app-core` rounds each passed
+  `1016 passed; 0 failed; 4 ignored`.
+- Supporting config/session/protocol/provider crates passed all executed tests.
+- Full `jcode-base`, root `jcode`, and `jcode-tui` runs retained known red tests
+  from the exact `origin/master` baseline, but introduced no new failing test
+  name: base had the same 5 failures, root the same 4, and TUI had 8 failures
+  versus master's 9.
+- Two independent read-only rebase audits found no semantic integration or
+  patch-preservation blocker. They correctly retain real rebased-SHA Windows,
+  provider-backed canary, portability, resource, observation, and final audit
+  as fresh certification work rather than reusing pre-rebase proof.
+
+```text
+$JCODE_SCRATCH_DIR/lcm-phase56/rebase-20260724T042744Z
+post-rebase tests SHA256(SHA256SUMS) = 46f40a0c084d5b28b3cf858bc49bf6b8bb8fcfb7b3f8f98547647e88695d88dd
+post-rebase app-core SHA256(SHA256SUMS) = 5eb7f2e96140d5f51ba1cc8726c2873b3baa1c4b2256e1b58b418c8780b37bce
+master base SHA256(SHA256SUMS) = c7ac7a8224104797daa642a52b8f5904e0c9167500171c72931be13a4df5b105
+master root/TUI SHA256(SHA256SUMS) = 24708426b2c764dc8c25414513cc467164e690acbd010154ae6288ad235d9e95
+full rebase evidence SHA256(REBASE_SHA256SUMS) = 2e40ca409ca4ffc0181f6007013fb718c98b755e197790f470425c4a546e787c
+```
+
+The old exact-SHA evidence below remains an auditable historical no-promotion
+record only. Certification for the rebased candidate must start from the new
+SHA, and `rolling` remains the required default and rollback path meanwhile.
+
 ## Invariants held fixed
 
 The certification did not change the product thresholds or engine boundaries:
