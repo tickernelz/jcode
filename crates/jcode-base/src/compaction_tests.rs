@@ -347,7 +347,10 @@ impl Provider for FactPreservingProvider {
 
     async fn complete_simple(&self, prompt: &str, _system: &str) -> Result<String> {
         let mut shortest_by_fact = std::collections::HashMap::<String, String>::new();
-        for line in prompt.lines().map(str::trim) {
+        let evidence = prompt
+            .split_once("\nQUERIES:\n")
+            .map_or(prompt, |(context, _)| context);
+        for line in evidence.lines().map(str::trim) {
             for fact in line
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
                 .filter(|word| word.starts_with("PLANTED_"))
@@ -1834,14 +1837,23 @@ fn lcm_chunking_preserves_missing_and_orphan_tool_result_evidence() {
 const LCM_CERT_TRACE_COUNT: usize = 30;
 const LCM_CERT_FACTS_PER_TRACE: usize = 5;
 const LCM_CERT_CYCLES: usize = 2;
+const LCM_CERT_MIN_RECALL: f64 = 1.0;
+const LCM_CERT_MAX_OUTPUT_SOURCE_RATIO: f64 = 1.0;
+const LCM_CERT_MAX_P95_US: u128 = 1_000_000;
 
+/// Neutral generator contract for external Hermes: iterate trace `0..30`, then
+/// cycle `0..2`, then kinds `DECISION,CONSTRAINT,CORRECTION,PATH,ERROR`. Plant
+/// `PLANTED_<KIND>_<TRACE:02>` in one user/assistant pair per kind using the
+/// exact format strings below, including four copies of the evidence sentence.
+/// Append the fixed recall pair below. Use UTF-8, LF, and ascending indexes.
+/// This is byte-reproducible and scrubbed: no names, secrets, times, or repo data.
 fn lcm_cert_trace(trace: usize, cycle: usize) -> (Vec<String>, Vec<Message>) {
     let kinds = ["DECISION", "CONSTRAINT", "CORRECTION", "PATH", "ERROR"];
     let facts = kinds
         .iter()
         .map(|kind| format!("PLANTED_{kind}_{trace:02}"))
         .collect::<Vec<_>>();
-    let messages = facts
+    let mut messages: Vec<Message> = facts
         .iter()
         .enumerate()
         .flat_map(|(turn, fact)| {
@@ -1862,7 +1874,34 @@ fn lcm_cert_trace(trace: usize, cycle: usize) -> (Vec<String>, Vec<Message>) {
             ]
         })
         .collect();
+    messages.push(make_text_message(
+        Role::User,
+        "Recall every planted token from this trace; do not claim the task is complete.",
+    ));
+    messages.push(make_text_message(
+        Role::Assistant,
+        "Recall is pending compaction; the coding task remains pending.",
+    ));
     (facts, messages)
+}
+
+async fn lcm_cert_active_recall(
+    oracle: Arc<dyn Provider>,
+    summary: &str,
+    facts: &[String],
+) -> Result<usize> {
+    let queries = facts
+        .iter()
+        .map(|fact| format!("Is {fact} retained?"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let answer = oracle
+        .complete_simple(&format!("CONTEXT:\n{summary}\nQUERIES:\n{queries}"), "")
+        .await?;
+    Ok(facts
+        .iter()
+        .filter(|fact| answer.contains(fact.as_str()))
+        .count())
 }
 
 fn lcm_cert_percentile(samples: &mut [u128], percentile: usize) -> u128 {
@@ -1872,6 +1911,18 @@ fn lcm_cert_percentile(samples: &mut [u128], percentile: usize) -> u128 {
 
 #[tokio::test]
 async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Result<()> {
+    let (facts_a, messages_a) = lcm_cert_trace(7, 1);
+    let (facts_b, messages_b) = lcm_cert_trace(7, 1);
+    assert_eq!(facts_a, facts_b);
+    assert_eq!(
+        messages_a.iter().map(content_text).collect::<Vec<_>>(),
+        messages_b.iter().map(content_text).collect::<Vec<_>>()
+    );
+    assert!(
+        (0..LCM_CERT_TRACE_COUNT)
+            .flat_map(|trace| (0..LCM_CERT_CYCLES).map(move |cycle| lcm_cert_trace(trace, cycle)))
+            .all(|(_, messages)| messages.len() > 10)
+    );
     let provider: Arc<dyn Provider> = Arc::new(FactPreservingProvider);
     let mut results = serde_json::Map::new();
 
@@ -1910,10 +1961,8 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
                 output_chars += summary.len();
                 fabricated_completion_claims += summary.matches("completed successfully").count();
                 if cycle + 1 == LCM_CERT_CYCLES {
-                    recovered += facts
-                        .iter()
-                        .filter(|fact| summary.contains(fact.as_str()))
-                        .count();
+                    recovered +=
+                        lcm_cert_active_recall(Arc::clone(&provider), &summary, &facts).await?;
                 }
                 prior_summary = Some(summary);
             }
@@ -1924,9 +1973,9 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
         let ratio = output_chars as f64 / source_chars as f64;
         let p50 = lcm_cert_percentile(&mut latencies_us.clone(), 50);
         let p95 = lcm_cert_percentile(&mut latencies_us, 95);
-        let passed = recall >= 1.0
-            && ratio <= 1.0
-            && p95 <= 1_000_000
+        let passed = recall >= LCM_CERT_MIN_RECALL
+            && ratio <= LCM_CERT_MAX_OUTPUT_SOURCE_RATIO
+            && p95 <= LCM_CERT_MAX_P95_US
             && fabricated_completion_claims == 0
             && LCM_CERT_CYCLES >= 2;
         results.insert(
@@ -1951,13 +2000,15 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
             "trace_count": LCM_CERT_TRACE_COUNT,
             "cycles_per_trace": LCM_CERT_CYCLES,
             "facts_per_trace": LCM_CERT_FACTS_PER_TRACE,
+            "messages_per_cycle": 12,
             "scrubbed": true,
+            "generator": "trace 0..30, cycle 0..2, five fixed kind pairs plus fixed recall pair; exact contract in lcm_cert_trace rustdoc",
             "oracle": "deterministic-oracle-v1",
         },
         "thresholds": {
-            "min_active_fact_recall": 1.0,
-            "max_source_output_character_ratio": 1.0,
-            "max_latency_p95_us": 1_000_000,
+            "min_active_fact_recall": LCM_CERT_MIN_RECALL,
+            "max_source_output_character_ratio": LCM_CERT_MAX_OUTPUT_SOURCE_RATIO,
+            "max_latency_p95_us": LCM_CERT_MAX_P95_US,
             "max_fabricated_completion_claims": 0,
             "min_cycles_per_trace": 2,
         },
