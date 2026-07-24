@@ -851,11 +851,7 @@ async fn restore_session_resets_runtime_interrupt_and_queue_state() {
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
 
-    let mut restored_session = crate::session::Session::create_with_id(
-        "session_restore_resets_runtime_state".to_string(),
-        None,
-        None,
-    );
+    let mut restored_session = crate::session::Session::create(None, None);
     restored_session.save().expect("save restored session");
 
     seed_transient_session_state(&mut agent);
@@ -893,11 +889,7 @@ async fn restore_session_rehydrates_injected_memory_ids() {
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
 
-    let mut restored_session = crate::session::Session::create_with_id(
-        "session_restore_memory_dedup".to_string(),
-        None,
-        None,
-    );
+    let mut restored_session = crate::session::Session::create(None, None);
     restored_session.record_memory_injection(
         "🧠 auto-recalled 1 memory".to_string(),
         "persisted memory".to_string(),
