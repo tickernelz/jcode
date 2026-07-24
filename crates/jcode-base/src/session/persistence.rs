@@ -704,3 +704,42 @@ impl Session {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SessionWriterLock;
+    use std::time::Duration;
+
+    #[test]
+    fn session_writer_lock_serializes_contenders() {
+        let dir = tempfile::tempdir().expect("temp session directory");
+        let snapshot = dir.path().join("session.json");
+        let first = SessionWriterLock::acquire(&snapshot).expect("first writer lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender_snapshot = snapshot.clone();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).expect("started signal");
+            let lock = SessionWriterLock::acquire(&contender_snapshot);
+            acquired_tx.send(lock.is_ok()).expect("acquired signal");
+            lock
+        });
+
+        started_rx.recv().expect("contender started");
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("contender should acquire after release")
+        );
+        contender
+            .join()
+            .expect("contender thread")
+            .expect("second writer lock");
+    }
+}
