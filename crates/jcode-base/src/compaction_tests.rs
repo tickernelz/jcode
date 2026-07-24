@@ -1071,6 +1071,13 @@ fn critical_lcm_recovery_is_synchronous_portable_and_durable() -> Result<()> {
     let home = tempfile::tempdir()?;
     let _home = TestHomeGuard::set(home.path());
     let mut session = make_lcm_session("lcm_critical", 20);
+    let opaque_secret = "vault/q7Vn4Zp9Lx2Kc8Mw5Rt1Hs6Bd3Yf.rs";
+    let labeled_secret = "correct horse battery staple";
+    let ordinary_path = "src/ordinary_module.rs";
+    let ContentBlock::Text { text, .. } = &mut session.messages[0].content[0] else {
+        panic!("LCM fixture must start with text")
+    };
+    *text = format!("{opaque_secret}\nSession credential: {labeled_secret}\n{ordinary_path}");
     let mut manager = CompactionManager::new().with_budget(1_000);
     manager.engine = crate::config::CompactionEngine::Lcm;
     for _ in 0..20 {
@@ -1098,6 +1105,21 @@ fn critical_lcm_recovery_is_synchronous_portable_and_durable() -> Result<()> {
     assert_eq!(session.context_nodes.len(), 1);
     assert_eq!(session.context_nodes[0].summarizer_route, "local:emergency");
     assert!(
+        !session.context_nodes[0]
+            .summary_text
+            .contains(opaque_secret)
+    );
+    assert!(
+        !session.context_nodes[0]
+            .summary_text
+            .contains(labeled_secret)
+    );
+    assert!(
+        session.context_nodes[0]
+            .summary_text
+            .contains(ordinary_path)
+    );
+    assert!(
         session
             .compaction
             .as_ref()
@@ -1105,17 +1127,56 @@ fn critical_lcm_recovery_is_synchronous_portable_and_durable() -> Result<()> {
             .openai_encrypted_content
             .is_none()
     );
+    let mut loaded = crate::session::Session::load("lcm_critical")?;
     assert_eq!(
-        crate::session::Session::load("lcm_critical")?
+        loaded
             .context_frontier
+            .as_ref()
             .unwrap()
             .covered_message_count,
         dropped
     );
+    assert!(!loaded.context_nodes[0].summary_text.contains(opaque_secret));
+    assert!(
+        !loaded.context_nodes[0]
+            .summary_text
+            .contains(labeled_secret)
+    );
+    assert!(loaded.context_nodes[0].summary_text.contains(ordinary_path));
+    assert!(
+        !loaded
+            .compaction
+            .as_ref()
+            .unwrap()
+            .summary_text
+            .contains(opaque_secret)
+    );
+    assert!(
+        !loaded
+            .compaction
+            .as_ref()
+            .unwrap()
+            .summary_text
+            .contains(labeled_secret)
+    );
+    let mut restored_manager = CompactionManager::new().with_budget(1_000);
+    restored_manager.engine = crate::config::CompactionEngine::Lcm;
+    restored_manager.restore_native_lcm_stored_state_with(
+        loaded.compaction.as_ref().unwrap(),
+        &loaded.messages,
+    );
+    let (reloaded_provider_messages, _) = restored_manager.materialize_lcm_context(&mut loaded)?;
+    let reloaded_context = content_text(&reloaded_provider_messages[0]);
+    assert!(!reloaded_context.contains(opaque_secret));
+    assert!(!reloaded_context.contains(labeled_secret));
+    assert!(reloaded_context.contains(ordinary_path));
     let (provider_messages, _) = manager.materialize_lcm_context(&mut session)?;
     assert!(provider_messages.len() <= RECENT_TURNS_TO_KEEP + 1);
     assert!(content_text(&provider_messages[0]).contains("Emergency compaction"));
     assert!(content_text(&provider_messages[0]).contains("## Previous Conversation Summary"));
+    assert!(!content_text(&provider_messages[0]).contains(opaque_secret));
+    assert!(!content_text(&provider_messages[0]).contains(labeled_secret));
+    assert!(content_text(&provider_messages[0]).contains(ordinary_path));
     Ok(())
 }
 

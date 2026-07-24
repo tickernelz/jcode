@@ -2400,19 +2400,21 @@ impl CompactionManager {
                 trigger.to_string(),
             )
             .map_err(|error| error.to_string())?;
-        let summary_text = build_emergency_summary_text(
-            if session.context_frontier.is_none() {
-                self.active_summary
-                    .as_ref()
-                    .map(|summary| summary.text.as_str())
-            } else {
-                None
-            },
+        let existing_summary = if session.context_frontier.is_none() {
+            self.active_summary
+                .as_ref()
+                .map(|summary| lcm_redact_uncertain_secrets(&summary.text))
+        } else {
+            None
+        };
+        let safe_messages = lcm_safe_messages(&active[..cutoff]);
+        let summary_text = lcm_redact_uncertain_secrets(&build_emergency_summary_text(
+            existing_summary.as_deref(),
             cutoff,
             pre_tokens,
             self.token_budget,
-            &active[..cutoff],
-        );
+            &safe_messages,
+        ));
         if let Some(task) = self.pending_task.take() {
             task.abort();
         }
@@ -3423,7 +3425,7 @@ const LCM_OMITTED_SOURCE: &str = "[LCM sensitive source omitted]";
 /// mixed-class value. Tool payloads are removed before this classifier runs.
 fn lcm_line_may_contain_secret(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    const SENSITIVE_MARKERS: [&str; 31] = [
+    const SENSITIVE_MARKERS: [&str; 34] = [
         "[redacted_secret]",
         "-----begin ",
         "api key",
@@ -3455,17 +3457,13 @@ fn lcm_line_may_contain_secret(line: &str) -> bool {
         "session token",
         "session_token",
         "ssh-rsa ",
+        "token =",
+        "token:",
+        "token=",
     ];
     if SENSITIVE_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
-    {
-        return true;
-    }
-
-    if lower
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|word| matches!(word, "credential" | "credentials" | "token" | "tokens"))
     {
         return true;
     }
@@ -3514,8 +3512,20 @@ fn lcm_redact_uncertain_secrets(text: &str) -> String {
         .join("\n")
 }
 
+fn lcm_safe_messages(messages: &[Message]) -> Vec<Message> {
+    let mut safe_messages = compactor_safe_messages(messages);
+    for message in &mut safe_messages {
+        for block in &mut message.content {
+            if let ContentBlock::Text { text, .. } = block {
+                *text = lcm_redact_uncertain_secrets(text);
+            }
+        }
+    }
+    safe_messages
+}
+
 fn lcm_safe_source_text(messages: &[Message], existing_summary: Option<&Summary>) -> String {
-    let safe_messages = compactor_safe_messages(messages);
+    let safe_messages = lcm_safe_messages(messages);
     lcm_redact_uncertain_secrets(&build_compaction_conversation_text(
         &safe_messages,
         existing_summary,
