@@ -172,7 +172,7 @@ jobs:
             throw 'Could not determine Cargo.toml version'
           }
 
-          $version = 'v' + $cargoVersion.Matches[0].Groups[1].Value
+          $version = 'v' + $cargoVersion.Matches[0].Groups[1].Value + '-dev'
           & ./.github/scripts/verify_windows_install.ps1 `
             -ArtifactExePath 'target/x86_64-pc-windows-msvc/release/jcode.exe' `
             -Version $version
@@ -231,7 +231,7 @@ jobs:
             throw 'Could not determine Cargo.toml version'
           }
 
-          $version = 'v' + $cargoVersion.Matches[0].Groups[1].Value
+          $version = 'v' + $cargoVersion.Matches[0].Groups[1].Value + '-dev'
           & ./.github/scripts/verify_windows_install.ps1 `
             -ArtifactExePath 'target/aarch64-pc-windows-msvc/release/jcode.exe' `
             -Version $version
