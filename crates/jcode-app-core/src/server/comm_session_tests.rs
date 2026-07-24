@@ -22,6 +22,11 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 struct MockProvider;
 
+fn load_session_from_home(home: &std::path::Path, session_id: &str) -> crate::session::Session {
+    crate::storage::read_json(&home.join("sessions").join(format!("{session_id}.json")))
+        .expect("prepared session should save")
+}
+
 #[async_trait]
 impl Provider for MockProvider {
     async fn complete(
@@ -383,7 +388,7 @@ fn prepare_visible_spawn_session_persists_and_launches_provider_key_for_openrout
     .expect("visible spawn preparation should succeed");
 
     assert!(launched);
-    let session = crate::session::Session::load(&session_id).expect("prepared session should save");
+    let session = load_session_from_home(temp_home.path(), &session_id);
     assert_eq!(session.model.as_deref(), Some("openai/gpt-5.4@OpenAI"));
     assert_eq!(session.provider_key.as_deref(), Some("openrouter"));
 
@@ -410,7 +415,7 @@ fn prepare_visible_spawn_session_persists_requested_effort() {
     .expect("visible spawn preparation should succeed");
 
     assert!(launched);
-    let session = crate::session::Session::load(&session_id).expect("prepared session should save");
+    let session = load_session_from_home(temp_home.path(), &session_id);
     assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
     assert_eq!(
         session.reasoning_effort.as_deref(),
@@ -444,7 +449,7 @@ fn prepare_visible_spawn_session_prefers_parent_provider_key_over_model_guess() 
     .expect("visible spawn preparation should succeed");
 
     assert!(launched);
-    let session = crate::session::Session::load(&session_id).expect("prepared session should save");
+    let session = load_session_from_home(temp_home.path(), &session_id);
     assert_eq!(session.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(session.provider_key.as_deref(), Some("ollama"));
 

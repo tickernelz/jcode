@@ -1067,8 +1067,11 @@ fn version_command_plain_output_includes_core_fields() {
 }
 
 #[tokio::test]
-async fn restore_agent_session_if_requested_restores_resumed_session() {
+async fn repeated_single_message_resume_creates_no_orphan_sessions() {
     let _guard = crate::storage::lock_test_env();
+    let _saved_env = SavedEnv::capture(&["JCODE_HOME"]);
+    let home = tempfile::tempdir().expect("temp JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", home.path());
 
     let provider: Arc<dyn Provider> = Arc::new(TestProvider);
     let registry = Registry::new(provider.clone()).await;
@@ -1078,14 +1081,28 @@ async fn restore_agent_session_if_requested_restores_resumed_session() {
         .run_once_capture("seed session for resume test")
         .await
         .expect("seed session");
+    drop(original);
 
-    let registry = Registry::new(provider.clone()).await;
-    let mut resumed = crate::agent::Agent::new(provider, registry);
-    let fresh_session_id = resumed.session_id().to_string();
-    assert_ne!(fresh_session_id, original_session_id);
+    let sessions_dir = crate::storage::jcode_dir()
+        .expect("jcode dir")
+        .join("sessions");
+    let count_sessions = || {
+        std::fs::read_dir(&sessions_dir)
+            .expect("read sessions")
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .count()
+    };
+    let baseline = count_sessions();
+    assert_eq!(baseline, 1);
 
-    restore_agent_session_if_requested(&mut resumed, Some(&original_session_id))
-        .expect("restore session");
-
-    assert_eq!(resumed.session_id(), original_session_id);
+    for _ in 0..2 {
+        let registry = Registry::new(provider.clone()).await;
+        let resumed =
+            build_single_message_agent(provider.clone(), registry, Some(&original_session_id))
+                .expect("construct resumed agent");
+        assert_eq!(resumed.session_id(), original_session_id);
+        drop(resumed);
+        assert_eq!(count_sessions(), baseline);
+    }
 }

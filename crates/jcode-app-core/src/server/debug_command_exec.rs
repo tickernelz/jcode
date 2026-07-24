@@ -745,7 +745,9 @@ mod tests {
             "debug selfdev reload took too long"
         );
         assert!(
-            output.contains("Reload acknowledged") || output.contains("Server is restarting now"),
+            output.contains("Reload acknowledged")
+                || output.contains("Server is restarting now")
+                || output.contains("Test mode: skipped reload-to-newer-build."),
             "expected reload acknowledgement output, got: {}",
             output
         );

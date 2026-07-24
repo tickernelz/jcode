@@ -2443,8 +2443,7 @@ pub async fn run_single_message_command(
         // the agent runs. Warm runs skip this entirely and stay instant. (#390)
         wait_for_cold_cache_mcp_tools(&registry).await;
     }
-    let mut agent = crate::agent::Agent::new(provider.clone(), registry);
-    restore_agent_session_if_requested(&mut agent, resume_session)?;
+    let mut agent = build_single_message_agent(provider.clone(), registry, resume_session)?;
 
     if emit_json {
         let text = run_single_message_command_capture_with_auto_poke(&mut agent, message).await?;
@@ -2773,14 +2772,20 @@ async fn run_single_message_command_capture_with_auto_poke(
     Ok(outputs.join("\n\n"))
 }
 
-fn restore_agent_session_if_requested(
-    agent: &mut crate::agent::Agent,
+fn build_single_message_agent(
+    provider: std::sync::Arc<dyn crate::provider::Provider>,
+    registry: crate::tool::Registry,
     resume_session: Option<&str>,
-) -> Result<()> {
-    if let Some(session_id) = resume_session {
-        agent.restore_session(session_id)?;
+) -> Result<crate::agent::Agent> {
+    match resume_session {
+        Some(session_id) => {
+            let session = crate::session::Session::load(session_id)?;
+            Ok(crate::agent::Agent::new_resuming_session(
+                provider, registry, session,
+            ))
+        }
+        None => Ok(crate::agent::Agent::new(provider, registry)),
     }
-    Ok(())
 }
 
 async fn run_single_message_command_ndjson(

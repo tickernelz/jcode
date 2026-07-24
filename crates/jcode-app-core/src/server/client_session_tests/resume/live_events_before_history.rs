@@ -3,11 +3,12 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     let _guard = crate::storage::lock_test_env();
     let (_runtime, prev_runtime) = setup_runtime_dir()?;
 
-    let target_session_id = "session_restore_target";
-    let temp_session_id = "session_restore_temp";
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let target_session_id = format!("session_restore_target_{suffix}");
+    let temp_session_id = format!("session_restore_temp_{suffix}");
 
     let mut persisted = crate::session::Session::create_with_id(
-        target_session_id.to_string(),
+        target_session_id.clone(),
         None,
         Some("Resume Registration Ordering".to_string()),
     );
@@ -18,12 +19,12 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     let agent = Arc::new(Mutex::new(build_test_agent_with_id(
         provider.clone(),
         registry.clone(),
-        temp_session_id,
+        &temp_session_id,
         Vec::new(),
     )));
 
     let sessions = Arc::new(RwLock::new(HashMap::from([(
-        temp_session_id.to_string(),
+        temp_session_id.clone(),
         Arc::clone(&agent),
     )])));
     let shutdown_signals = Arc::new(RwLock::new(HashMap::<String, InterruptSignal>::new()));
@@ -33,7 +34,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         "conn_restore".to_string(),
         ClientConnectionInfo {
             client_id: "conn_restore".to_string(),
-            session_id: temp_session_id.to_string(),
+            session_id: temp_session_id.clone(),
             client_instance_id: None,
             debug_client_id: Some("debug_restore".to_string()),
             connected_at: now,
@@ -47,9 +48,9 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     let client_debug_state = Arc::new(RwLock::new(ClientDebugState::default()));
     let (placeholder_event_tx, _placeholder_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
-        temp_session_id.to_string(),
+        temp_session_id.clone(),
         SwarmMember {
-            session_id: temp_session_id.to_string(),
+            session_id: temp_session_id.clone(),
             event_tx: placeholder_event_tx,
             event_txs: HashMap::new(),
             working_dir: None,
@@ -92,7 +93,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     let mcp_pool = Arc::new(crate::mcp::SharedMcpPool::from_default_config());
 
     let mut client_selfdev = false;
-    let mut client_session_id = temp_session_id.to_string();
+    let mut client_session_id = temp_session_id;
     let writer_guard = writer.lock().await;
 
     let resume_task = tokio::spawn({
@@ -118,10 +119,11 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         let event_history = Arc::clone(&event_history);
         let event_counter = Arc::clone(&event_counter);
         let swarm_event_tx = swarm_event_tx.clone();
+        let resume_target_session_id = target_session_id.clone();
         async move {
             handle_resume_session(
                 46,
-                target_session_id.to_string(),
+                resume_target_session_id,
                 None,
                 None,
                 false,
@@ -163,7 +165,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
             let registered = {
                 let members = swarm_members.read().await;
                 members
-                    .get(target_session_id)
+                    .get(&target_session_id)
                     .map(|member| member.event_txs.contains_key("conn_restore"))
                     .unwrap_or(false)
             };

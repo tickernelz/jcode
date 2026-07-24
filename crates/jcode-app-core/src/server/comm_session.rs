@@ -418,7 +418,8 @@ fn clear_headed_startup_message(session_id: &str) {
 fn cleanup_prepared_visible_spawn_session(session_id: &str) {
     clear_headed_startup_message(session_id);
     if let Ok(path) = crate::session::session_path(session_id) {
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
     }
     if let Ok(path) = crate::session::session_journal_path(session_id) {
         let _ = std::fs::remove_file(path);

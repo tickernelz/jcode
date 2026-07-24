@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 struct IsolatedRuntimeDir {
     _prev_runtime: Option<std::ffi::OsString>,
+    _prev_home: Option<std::ffi::OsString>,
     _temp: tempfile::TempDir,
 }
 
@@ -324,10 +325,13 @@ impl IsolatedRuntimeDir {
     fn new() -> Self {
         let temp = tempfile::TempDir::new().expect("runtime dir");
         let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+        let prev_home = std::env::var_os("JCODE_HOME");
         crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+        crate::env::set_var("JCODE_HOME", temp.path().join("home"));
         crate::server::clear_reload_marker();
         Self {
             _prev_runtime: prev_runtime,
+            _prev_home: prev_home,
             _temp: temp,
         }
     }
@@ -374,6 +378,11 @@ impl Drop for IsolatedRuntimeDir {
             crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
         } else {
             crate::env::remove_var("JCODE_RUNTIME_DIR");
+        }
+        if let Some(prev_home) = self._prev_home.take() {
+            crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
         }
     }
 }

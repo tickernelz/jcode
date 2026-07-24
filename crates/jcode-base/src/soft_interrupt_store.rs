@@ -3,6 +3,28 @@ use jcode_agent_runtime::{SoftInterruptMessage, SoftInterruptSource};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_DIR_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestDirGuard(Option<PathBuf>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestDirGuard {
+    fn drop(&mut self) {
+        TEST_DIR_PATH.with(|path| {
+            path.replace(self.0.take());
+        });
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn use_test_dir(path: PathBuf) -> TestDirGuard {
+    TestDirGuard(TEST_DIR_PATH.with(|current| current.replace(Some(path))))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSoftInterrupt {
     content: String,
@@ -59,6 +81,10 @@ impl From<PersistedSoftInterrupt> for SoftInterruptMessage {
 }
 
 fn dir_path() -> Result<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(path) = TEST_DIR_PATH.with(|path| path.borrow().clone()) {
+        return Ok(path);
+    }
     Ok(crate::storage::jcode_dir()?.join("pending-soft-interrupts"))
 }
 

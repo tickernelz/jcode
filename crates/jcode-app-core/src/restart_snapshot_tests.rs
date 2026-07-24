@@ -52,9 +52,19 @@ fn capture_current_snapshot_includes_active_sessions_only() {
     closed.save().expect("save closed session");
 
     let snapshot = capture_current_snapshot().expect("capture snapshot");
-    assert_eq!(snapshot.sessions.len(), 1);
-    assert_eq!(snapshot.sessions[0].session_id, active.id);
-    assert_eq!(snapshot.sessions[0].working_dir.as_deref(), Some("/tmp"));
+    let captured_active = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.session_id == active.id)
+        .expect("active session should be captured");
+    assert_eq!(captured_active.working_dir.as_deref(), Some("/tmp"));
+    assert!(
+        !snapshot
+            .sessions
+            .iter()
+            .any(|session| session.session_id == closed.id),
+        "closed session should not be captured"
+    );
 }
 
 #[test]

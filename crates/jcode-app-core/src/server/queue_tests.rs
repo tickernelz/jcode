@@ -128,20 +128,20 @@ async fn queue_soft_interrupt_for_session_registers_queue_on_fallback_lookup() {
 async fn queue_soft_interrupt_for_session_persists_when_live_queue_is_unavailable() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().expect("temp dir");
-    let prev_home = std::env::var_os("JCODE_HOME");
-    crate::env::set_var("JCODE_HOME", temp.path());
+    let _interrupt_dir =
+        crate::soft_interrupt_store::use_test_dir(temp.path().join("pending-soft-interrupts"));
 
     let agent = test_agent().await;
     let session_id = {
         let guard = agent.lock().await;
         guard.session_id().to_string()
     };
-    crate::session::Session::create_with_id(session_id.clone(), None, None)
-        .save()
-        .expect("save session snapshot");
-
     let queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
-    let sessions = Arc::new(RwLock::new(HashMap::new()));
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        session_id.clone(),
+        Arc::clone(&agent),
+    )])));
+    let busy_agent = agent.lock().await;
 
     let queued = queue_soft_interrupt_for_session(
         &session_id,
@@ -152,6 +152,7 @@ async fn queue_soft_interrupt_for_session_persists_when_live_queue_is_unavailabl
         &sessions,
     )
     .await;
+    drop(busy_agent);
 
     assert!(
         queued,
@@ -166,20 +167,12 @@ async fn queue_soft_interrupt_for_session_persists_when_live_queue_is_unavailabl
 
     let provider: Arc<dyn Provider> = Arc::new(TestProvider);
     let registry = Registry::new(provider.clone()).await;
-    let mut restored = Agent::new(provider, registry);
-    restored
-        .restore_session(&session_id)
-        .expect("restore session should rehydrate interrupts");
+    let session = crate::session::Session::create_with_id(session_id.clone(), None, None);
+    let restored = Agent::new_resuming_session(provider, registry, session);
     assert_eq!(restored.soft_interrupt_count(), 1);
     assert!(
         crate::soft_interrupt_store::load(&session_id)
             .expect("load persisted interrupts after restore")
             .is_empty()
     );
-
-    if let Some(prev_home) = prev_home {
-        crate::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
-    }
 }

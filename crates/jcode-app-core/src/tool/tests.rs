@@ -123,13 +123,18 @@ impl Tool for BareSchemaTool {
 }
 
 #[test]
-fn tool_definitions_do_not_auto_inject_intent() {
+fn tool_definitions_auto_inject_required_intent() {
     let def = BareSchemaTool.to_definition();
-    assert!(def.input_schema["properties"]["intent"].is_null());
+    assert!(def.input_schema["properties"]["intent"].is_object());
+    assert!(
+        def.input_schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|value| value == "intent"))
+    );
 }
 
 #[tokio::test]
-async fn first_party_tool_definitions_include_optional_intent_explicitly() {
+async fn first_party_tool_definitions_include_required_intent() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
     registry.register_ambient_tools().await;
@@ -159,8 +164,8 @@ async fn first_party_tool_definitions_include_optional_intent_explicitly() {
         );
         let required = schema["required"].as_array().cloned().unwrap_or_default();
         assert!(
-            !required.iter().any(|value| value == "intent"),
-            "{} must not require intent",
+            required.iter().any(|value| value == "intent"),
+            "{} must require intent",
             def.name
         );
     }

@@ -64,7 +64,16 @@ fn sanitize_session_id(session_id: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RECOVERY_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 fn recovery_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_RECOVERY_DIR.with(|dir| dir.borrow().clone()) {
+        return Ok(path);
+    }
     Ok(crate::storage::jcode_dir()?.join("reload-recovery"))
 }
 
@@ -368,17 +377,17 @@ mod tests {
     use super::*;
 
     struct IsolatedHome {
-        prev_home: Option<std::ffi::OsString>,
+        previous: Option<PathBuf>,
         _temp: tempfile::TempDir,
     }
 
     impl IsolatedHome {
         fn new() -> Self {
             let temp = tempfile::TempDir::new().expect("jcode home");
-            let prev_home = std::env::var_os("JCODE_HOME");
-            crate::env::set_var("JCODE_HOME", temp.path());
+            let path = temp.path().join("reload-recovery");
+            let previous = TEST_RECOVERY_DIR.with(|dir| dir.replace(Some(path)));
             Self {
-                prev_home,
+                previous,
                 _temp: temp,
             }
         }
@@ -386,11 +395,9 @@ mod tests {
 
     impl Drop for IsolatedHome {
         fn drop(&mut self) {
-            if let Some(prev) = self.prev_home.take() {
-                crate::env::set_var("JCODE_HOME", prev);
-            } else {
-                crate::env::remove_var("JCODE_HOME");
-            }
+            TEST_RECOVERY_DIR.with(|dir| {
+                dir.replace(self.previous.take());
+            });
         }
     }
 

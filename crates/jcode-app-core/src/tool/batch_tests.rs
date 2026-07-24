@@ -132,7 +132,7 @@ fn test_schema_only_requires_tool() {
 
     assert_eq!(
         schema["properties"]["tool_calls"]["items"]["required"],
-        json!(["tool"])
+        json!(["tool", "intent"])
     );
     assert_eq!(
         schema["properties"]["tool_calls"]["items"]["additionalProperties"],

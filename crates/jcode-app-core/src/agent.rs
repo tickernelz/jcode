@@ -273,6 +273,7 @@ impl Agent {
     ) -> Self {
         let skills = SkillRegistry::shared_snapshot();
         let initial_provider_model = provider.model();
+        let provider_session_id = session.provider_session_id.clone();
         let agent = Self {
             provider,
             registry,
@@ -281,7 +282,7 @@ impl Agent {
             active_skill: None,
             allowed_tools,
             disabled_tools,
-            provider_session_id: None,
+            provider_session_id,
             last_upstream_provider: None,
             last_connection_type: None,
             last_status_detail: None,
@@ -387,6 +388,24 @@ impl Agent {
         session: Session,
         allowed_tools: Option<HashSet<String>>,
     ) -> Self {
+        Self::new_with_loaded_session(provider, registry, session, allowed_tools, false)
+    }
+
+    pub fn new_resuming_session(
+        provider: Arc<dyn Provider>,
+        registry: Registry,
+        session: Session,
+    ) -> Self {
+        Self::new_with_loaded_session(provider, registry, session, None, true)
+    }
+
+    fn new_with_loaded_session(
+        provider: Arc<dyn Provider>,
+        registry: Registry,
+        session: Session,
+        allowed_tools: Option<HashSet<String>>,
+        resume: bool,
+    ) -> Self {
         let tool_selection = if let Some(allowed_tools) = allowed_tools {
             crate::config::ToolSelection {
                 allowed_tools: Some(allowed_tools),
@@ -429,9 +448,19 @@ impl Agent {
         agent.restore_reasoning_effort_from_session();
         agent.session.ensure_initial_session_context_message();
         agent.sync_memory_dedup_state_from_session();
+        if resume {
+            agent.restore_persisted_soft_interrupts();
+        }
         agent.seed_compaction_from_session();
-        agent.log_env_snapshot("attach");
-        agent.fire_session_lifecycle_hook("session_start", "attach");
+        let lifecycle_reason = if resume { "resume" } else { "attach" };
+        agent.log_env_snapshot(lifecycle_reason);
+        agent.fire_session_lifecycle_hook("session_start", lifecycle_reason);
+        if resume && let Err(err) = agent.session.save() {
+            logging::error(&format!(
+                "Failed to persist resumed session state for {}: {}",
+                agent.session.id, err
+            ));
+        }
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
             &agent.provider.model(),
