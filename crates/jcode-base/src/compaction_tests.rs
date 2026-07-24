@@ -1682,6 +1682,24 @@ fn lcm_prompt_uses_only_the_structured_schema() {
     );
 }
 
+#[test]
+fn lcm_prompt_omits_opaque_secrets_from_plain_text() {
+    let labeled_secret = "correct horse battery staple";
+    let unlabeled_secret = "q7Vn4Zp9Lx2Kc8Mw5Rt1Hs6Bd3Yf";
+    let messages = vec![make_text_message(
+        Role::User,
+        &format!(
+            "Session credential: {labeled_secret}\nOpaque value {unlabeled_secret}\nKeep this safe line"
+        ),
+    )];
+
+    let prompt = build_lcm_compaction_prompt(&messages, None, 8_000);
+
+    assert!(!prompt.contains(labeled_secret));
+    assert!(!prompt.contains(unlabeled_secret));
+    assert!(prompt.contains("Keep this safe line"));
+}
+
 #[tokio::test]
 async fn lcm_rejects_ungrounded_model_written_secret() {
     let secret = "Authorization: Bearer sk-super-secret-value";
@@ -1697,6 +1715,28 @@ async fn lcm_rejects_ungrounded_model_written_secret() {
     )
     .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn lcm_rejects_grounded_opaque_secret() {
+    for secret_source in [
+        "q7Vn4Zp9Lx2Kc8Mw5Rt1Hs6Bd3Yf",
+        "Session credential: correct horse battery staple",
+    ] {
+        let provider: Arc<dyn Provider> = Arc::new(StaticSummaryProvider {
+            summary: structured_test_summary(secret_source),
+        });
+        let result = generate_lcm_compaction_artifact(
+            provider,
+            vec![make_text_message(Role::User, secret_source)],
+            None,
+            None,
+            LcmJobPriority::Background,
+        )
+        .await;
+
+        assert!(result.is_err(), "secret source must fail closed");
+    }
 }
 
 #[tokio::test]
@@ -1757,8 +1797,9 @@ async fn transfer_compaction_uses_explicit_engine_snapshot() -> Result<()> {
     assert_eq!(captured_prompts.len(), 2);
     for prompt in captured_prompts.iter() {
         assert!(!prompt.contains("credential-that-must-not-leak"));
-        assert!(prompt.contains("[REDACTED_SECRET]"));
     }
+    assert!(captured_prompts[0].contains("[REDACTED_SECRET]"));
+    assert!(captured_prompts[1].contains(LCM_OMITTED_SOURCE));
     Ok(())
 }
 

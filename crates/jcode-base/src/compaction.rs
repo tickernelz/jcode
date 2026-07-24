@@ -2333,7 +2333,7 @@ impl CompactionManager {
         if cutoff == 0 || safe_compaction_cutoff(&all_messages, cutoff) != cutoff {
             return Ok(None);
         }
-        let summary_text = crate::message::redact_secrets(&legacy.summary_text);
+        let summary_text = lcm_redact_uncertain_secrets(&legacy.summary_text);
         let pre_tokens = self.effective_token_count_with(&all_messages) as u64;
         let source = self.capture_lcm_source(
             session,
@@ -3416,9 +3416,107 @@ fn compactor_safe_messages(messages: &[Message]) -> Vec<Message> {
     safe_messages
 }
 
+const LCM_OMITTED_SOURCE: &str = "[LCM sensitive source omitted]";
+
+/// Apply a stricter trust-boundary policy than the general transcript redactor:
+/// omit the entire line when it labels sensitive material or contains an opaque,
+/// mixed-class value. Tool payloads are removed before this classifier runs.
+fn lcm_line_may_contain_secret(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    const SENSITIVE_MARKERS: [&str; 31] = [
+        "[redacted_secret]",
+        "-----begin ",
+        "api key",
+        "api-key",
+        "api_key",
+        "apikey",
+        "access token",
+        "access_token",
+        "auth token",
+        "auth_token",
+        "authorization",
+        "bearer ",
+        "client_secret",
+        "cookie",
+        "credential",
+        "database_url",
+        "mongodb://",
+        "mysql://",
+        "passphrase",
+        "password",
+        "postgres://",
+        "postgresql://",
+        "private key",
+        "private_key",
+        "refresh token",
+        "refresh_token",
+        "secret",
+        "session key",
+        "session token",
+        "session_token",
+        "ssh-rsa ",
+    ];
+    if SENSITIVE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+
+    if lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| matches!(word, "credential" | "credentials" | "token" | "tokens"))
+    {
+        return true;
+    }
+
+    line.split_whitespace().any(|word| {
+        let token = word
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+                )
+            })
+            .trim_end_matches(['.', ':', '!', '?']);
+        if token.len() < 20 {
+            return false;
+        }
+        if token
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return false;
+        }
+        let has_lower = token.bytes().any(|byte| byte.is_ascii_lowercase());
+        let has_upper = token.bytes().any(|byte| byte.is_ascii_uppercase());
+        let has_digit = token.bytes().any(|byte| byte.is_ascii_digit());
+        let has_symbol = token.bytes().any(|byte| !byte.is_ascii_alphanumeric());
+        [has_lower, has_upper, has_digit, has_symbol]
+            .into_iter()
+            .filter(|present| *present)
+            .count()
+            >= 3
+    })
+}
+
+fn lcm_redact_uncertain_secrets(text: &str) -> String {
+    crate::message::redact_secrets(text)
+        .lines()
+        .map(|line| {
+            if lcm_line_may_contain_secret(line) {
+                LCM_OMITTED_SOURCE
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn lcm_safe_source_text(messages: &[Message], existing_summary: Option<&Summary>) -> String {
     let safe_messages = compactor_safe_messages(messages);
-    crate::message::redact_secrets(&build_compaction_conversation_text(
+    lcm_redact_uncertain_secrets(&build_compaction_conversation_text(
         &safe_messages,
         existing_summary,
     ))
@@ -3742,7 +3840,7 @@ async fn complete_lcm_bounded(
     )
     .await
     .map_err(|_| anyhow::anyhow!("LCM compactor provider call timed out"))??;
-    let summary = crate::message::redact_secrets(&summary);
+    let summary = lcm_redact_uncertain_secrets(&summary);
     let concise = lcm_output_is_concise(&summary, source_chars, output_budget_chars);
     let structured = lcm_output_has_required_sections(&summary);
     let grounded = lcm_output_is_grounded(&summary, &canonical_source);
@@ -3803,7 +3901,7 @@ async fn complete_lcm_bounded(
     )
     .await
     .map_err(|_| anyhow::anyhow!("LCM compactor rewrite timed out"))??;
-    let rewritten = crate::message::redact_secrets(&rewritten);
+    let rewritten = lcm_redact_uncertain_secrets(&rewritten);
     let concise = lcm_output_is_concise(&rewritten, source_chars, output_budget_chars);
     let structured = lcm_output_has_required_sections(&rewritten);
     let grounded = lcm_output_is_grounded(&rewritten, &canonical_source);
