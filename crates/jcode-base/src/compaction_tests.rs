@@ -353,7 +353,7 @@ impl Provider for FactPreservingProvider {
         for line in evidence.lines().map(str::trim) {
             for fact in line
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                .filter(|word| word.starts_with("PLANTED_"))
+                .filter(|word| word.starts_with("PLANTED_") || word.starts_with("CANARY_"))
             {
                 let entry = shortest_by_fact
                     .entry(fact.to_string())
@@ -1656,6 +1656,103 @@ async fn lcm_scheduler_reserves_capacity_for_critical_work() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn lcm_scheduler_fairness_scorecard_has_bounded_p95_and_no_starvation() -> Result<()> {
+    const JOBS_PER_CLASS: usize = 24;
+    let shared = Arc::new(tokio::sync::Semaphore::new(4));
+    let background = Arc::new(tokio::sync::Semaphore::new(3));
+    let mut background_holders = Vec::new();
+    for _ in 0..3 {
+        background_holders.push(
+            acquire_lcm_scheduler_from(
+                Arc::clone(&shared),
+                Arc::clone(&background),
+                LcmJobPriority::Background,
+                Duration::from_secs(1),
+            )
+            .await?,
+        );
+    }
+
+    let mut jobs = Vec::with_capacity(JOBS_PER_CLASS * 2);
+    for priority in [LcmJobPriority::Background, LcmJobPriority::Critical] {
+        for sequence in 0..JOBS_PER_CLASS {
+            let shared = Arc::clone(&shared);
+            let background = Arc::clone(&background);
+            jobs.push(tokio::spawn(async move {
+                let queued_at = Instant::now();
+                let permit = acquire_lcm_scheduler_from(
+                    shared,
+                    background,
+                    priority,
+                    Duration::from_secs(2),
+                )
+                .await?;
+                let waited_us = queued_at.elapsed().as_micros();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                drop(permit);
+                Ok::<_, anyhow::Error>((priority, sequence, waited_us))
+            }));
+        }
+    }
+
+    // Critical work must make progress through the reserved fourth slot even
+    // while all three background permits are occupied.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(background_holders);
+
+    let mut background_wait_us = Vec::with_capacity(JOBS_PER_CLASS);
+    let mut critical_wait_us = Vec::with_capacity(JOBS_PER_CLASS);
+    for job in jobs {
+        let (priority, _sequence, waited_us) = job.await??;
+        match priority {
+            LcmJobPriority::Background => background_wait_us.push(waited_us),
+            LcmJobPriority::Critical => critical_wait_us.push(waited_us),
+        }
+    }
+    let percentile_us = |samples: &mut Vec<u128>, percentile: usize| {
+        samples.sort_unstable();
+        samples[(samples.len() * percentile).div_ceil(100) - 1]
+    };
+    let background_p95_us = percentile_us(&mut background_wait_us, 95);
+    let critical_p95_us = percentile_us(&mut critical_wait_us, 95);
+    let passed = background_wait_us.len() == JOBS_PER_CLASS
+        && critical_wait_us.len() == JOBS_PER_CLASS
+        && background_p95_us <= 500_000
+        && critical_p95_us <= 500_000
+        && shared.available_permits() == 4
+        && background.available_permits() == 3;
+    let scorecard = serde_json::json!({
+        "schema_version": 1,
+        "jobs_per_class": JOBS_PER_CLASS,
+        "completed": {
+            "background": background_wait_us.len(),
+            "critical": critical_wait_us.len(),
+        },
+        "queue_p95_us": {
+            "background": background_p95_us,
+            "critical": critical_p95_us,
+        },
+        "thresholds": {
+            "queue_p95_us_max": 500_000,
+            "starved_jobs_max": 0,
+            "shared_permits_restored": 4,
+            "background_permits_restored": 3,
+        },
+        "starved_jobs": 0,
+        "passed": passed,
+    });
+    if let Some(path) = std::env::var_os("JCODE_LCM_SCHEDULER_CERT_OUTPUT") {
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&scorecard)?)?;
+    }
+    assert!(passed, "scheduler scorecard failed: {scorecard}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn lcm_scheduler_recovers_capacity_after_stalls_and_cancellation() -> Result<()> {
     let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1837,38 +1934,48 @@ fn lcm_chunking_preserves_missing_and_orphan_tool_result_evidence() {
 const LCM_CERT_TRACE_COUNT: usize = 30;
 const LCM_CERT_FACTS_PER_TRACE: usize = 5;
 const LCM_CERT_CYCLES: usize = 2;
-const LCM_CERT_MIN_RECALL: f64 = 1.0;
-const LCM_CERT_MAX_OUTPUT_SOURCE_RATIO: f64 = 1.0;
+const LCM_CERT_MIN_RECALL: f64 = 0.95;
+const LCM_CERT_MIN_WILSON_LOWER: f64 = 0.95;
+const LCM_CERT_MAX_OUTPUT_SOURCE_RATIO: f64 = 0.35;
 const LCM_CERT_MAX_P95_US: u128 = 1_000_000;
 
 /// Neutral generator contract for external Hermes: iterate trace `0..30`, then
-/// cycle `0..2`, then kinds `DECISION,CONSTRAINT,CORRECTION,PATH,ERROR`. Plant
-/// `PLANTED_<KIND>_<TRACE:02>` in one user/assistant pair per kind using the
-/// exact format strings below, including four copies of the evidence sentence.
-/// Append the fixed recall pair below. Use UTF-8, LF, and ascending indexes.
-/// This is byte-reproducible and scrubbed: no names, secrets, times, or repo data.
+/// cycle `0..2`, then kinds `DECISION,CONSTRAINT,CORRECTION,PATH,ERROR`. Cycle 0
+/// plants `CANARY_PHASE56_<KIND>_<TRACE:02> = VALUE_PHASE56_<KIND>_<TRACE:02>`;
+/// cycle 1 deliberately does not repeat it, so recall must survive the prior
+/// compaction. Use the exact format strings below, UTF-8, LF, and ascending
+/// indexes. This is byte-reproducible and scrubbed: no secrets or operator data.
 fn lcm_cert_trace(trace: usize, cycle: usize) -> (Vec<String>, Vec<Message>) {
     let kinds = ["DECISION", "CONSTRAINT", "CORRECTION", "PATH", "ERROR"];
     let facts = kinds
         .iter()
-        .map(|kind| format!("PLANTED_{kind}_{trace:02}"))
+        .map(|kind| format!("CANARY_PHASE56_{kind}_{trace:02} = VALUE_PHASE56_{kind}_{trace:02}"))
         .collect::<Vec<_>>();
+    let filler = (0..40)
+        .map(|index| format!("phase56_trace_{trace:02}_coding_filler_{index:03}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut messages: Vec<Message> = facts
         .iter()
         .enumerate()
         .flat_map(|(turn, fact)| {
+            let planted = if cycle == 0 {
+                format!("retain {fact}. ")
+            } else {
+                String::new()
+            };
             [
                 make_text_message(
                     Role::User,
                     &format!(
-                        "trace {trace:02} cycle {cycle} turn {turn}: inspect src/module_{trace:02}.rs and retain {fact}"
+                        "trace {trace:02} cycle {cycle} turn {turn}: {planted}inspect src/module_{trace:02}.rs"
                     ),
                 ),
                 make_text_message(
                     Role::Assistant,
                     &format!(
-                        "Observed {fact}; the coding task remains pending. Evidence: {}",
-                        "source and test output remain canonical. ".repeat(4)
+                        "Observed cycle {cycle} turn {turn}; the coding task remains pending. Evidence: {} {filler}",
+                        "source and test output remain canonical. ".repeat(4),
                     ),
                 ),
             ]
@@ -1885,28 +1992,27 @@ fn lcm_cert_trace(trace: usize, cycle: usize) -> (Vec<String>, Vec<Message>) {
     (facts, messages)
 }
 
-async fn lcm_cert_active_recall(
-    oracle: Arc<dyn Provider>,
-    summary: &str,
-    facts: &[String],
-) -> Result<usize> {
-    let queries = facts
+fn lcm_cert_active_recall(summary: &str, facts: &[String]) -> usize {
+    facts
         .iter()
-        .map(|fact| format!("Is {fact} retained?"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let answer = oracle
-        .complete_simple(&format!("CONTEXT:\n{summary}\nQUERIES:\n{queries}"), "")
-        .await?;
-    Ok(facts
-        .iter()
-        .filter(|fact| answer.contains(fact.as_str()))
-        .count())
+        .filter(|fact| summary.contains(fact.as_str()))
+        .count()
 }
 
 fn lcm_cert_percentile(samples: &mut [u128], percentile: usize) -> u128 {
     samples.sort_unstable();
     samples[(samples.len() * percentile).div_ceil(100) - 1]
+}
+
+fn lcm_cert_wilson_95(successes: usize, total: usize) -> (f64, f64) {
+    let z = 1.959_963_984_540_054_f64;
+    let n = total as f64;
+    let proportion = successes as f64 / n;
+    let denominator = 1.0 + z * z / n;
+    let center = (proportion + z * z / (2.0 * n)) / denominator;
+    let margin =
+        z * ((proportion * (1.0 - proportion) / n + z * z / (4.0 * n * n)).sqrt()) / denominator;
+    (center - margin, center + margin)
 }
 
 #[tokio::test]
@@ -1961,8 +2067,7 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
                 output_chars += summary.len();
                 fabricated_completion_claims += summary.matches("completed successfully").count();
                 if cycle + 1 == LCM_CERT_CYCLES {
-                    recovered +=
-                        lcm_cert_active_recall(Arc::clone(&provider), &summary, &facts).await?;
+                    recovered += lcm_cert_active_recall(&summary, &facts);
                 }
                 prior_summary = Some(summary);
             }
@@ -1970,10 +2075,12 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
 
         let planted = LCM_CERT_TRACE_COUNT * LCM_CERT_FACTS_PER_TRACE;
         let recall = recovered as f64 / planted as f64;
+        let wilson_95 = lcm_cert_wilson_95(recovered, planted);
         let ratio = output_chars as f64 / source_chars as f64;
         let p50 = lcm_cert_percentile(&mut latencies_us.clone(), 50);
         let p95 = lcm_cert_percentile(&mut latencies_us, 95);
         let passed = recall >= LCM_CERT_MIN_RECALL
+            && wilson_95.0 >= LCM_CERT_MIN_WILSON_LOWER
             && ratio <= LCM_CERT_MAX_OUTPUT_SOURCE_RATIO
             && p95 <= LCM_CERT_MAX_P95_US
             && fabricated_completion_claims == 0
@@ -1982,6 +2089,7 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
             strategy.to_string(),
             serde_json::json!({
                 "active_fact_recall": recall,
+                "active_fact_recall_wilson_95": {"lower": wilson_95.0, "upper": wilson_95.1},
                 "source_output_character_ratio": ratio,
                 "latency_p50_us": p50,
                 "latency_p95_us": p95,
@@ -1996,17 +2104,18 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
     let scorecard = serde_json::json!({
         "schema_version": 1,
         "corpus": {
-            "name": "neutral_coding_trace_v1",
+            "name": "neutral_coding_trace_v2",
             "trace_count": LCM_CERT_TRACE_COUNT,
             "cycles_per_trace": LCM_CERT_CYCLES,
             "facts_per_trace": LCM_CERT_FACTS_PER_TRACE,
             "messages_per_cycle": 12,
             "scrubbed": true,
-            "generator": "trace 0..30, cycle 0..2, five fixed kind pairs plus fixed recall pair; exact contract in lcm_cert_trace rustdoc",
+            "generator": "trace 0..30, cycle 0..2, five fixed kind pairs plus fixed recall pair; canaries only in cycle 0; exact contract in lcm_cert_trace rustdoc",
             "oracle": "deterministic-oracle-v1",
         },
         "thresholds": {
             "min_active_fact_recall": LCM_CERT_MIN_RECALL,
+            "min_active_fact_recall_wilson_95_lower": LCM_CERT_MIN_WILSON_LOWER,
             "max_source_output_character_ratio": LCM_CERT_MAX_OUTPUT_SOURCE_RATIO,
             "max_latency_p95_us": LCM_CERT_MAX_P95_US,
             "max_fabricated_completion_claims": 0,
@@ -2016,6 +2125,10 @@ async fn lcm_synthetic_thirty_trace_scorecard_preserves_planted_facts() -> Resul
         "passed": overall_passed,
     });
     if let Some(path) = std::env::var_os("JCODE_LCM_CERT_OUTPUT") {
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(path, serde_json::to_vec_pretty(&scorecard)?)?;
     }
 
