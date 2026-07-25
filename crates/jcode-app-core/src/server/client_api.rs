@@ -182,24 +182,30 @@ impl Client {
         let request = Request::GetHistory { id };
         let json = serde_json::to_string(&request)? + "\n";
         self.writer.write_all(json.as_bytes()).await?;
-        for _ in 0..100 {
-            let event = self.read_socket_event().await?;
-            match &event {
-                ServerEvent::History {
-                    id: response_id, ..
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = self.read_socket_event().await?;
+                match &event {
+                    ServerEvent::History {
+                        id: response_id, ..
+                    }
+                    | ServerEvent::Error {
+                        id: response_id, ..
+                    } if *response_id == id => return Ok(event),
+                    _ => self.pending_events.push_back(event),
                 }
-                | ServerEvent::Error {
-                    id: response_id, ..
-                } if *response_id == id => return Ok(event),
-                _ => self.pending_events.push_back(event),
             }
-        }
-
-        Ok(ServerEvent::Error {
-            id,
-            message: "History response not received".to_string(),
-            retry_after_secs: None,
         })
+        .await;
+
+        match response {
+            Ok(response) => response,
+            Err(_) => Ok(ServerEvent::Error {
+                id,
+                message: "History response timed out".to_string(),
+                retry_after_secs: None,
+            }),
+        }
     }
 
     pub async fn resume_session(&mut self, session_id: &str) -> Result<u64> {
@@ -348,5 +354,68 @@ impl Client {
         let json = serde_json::to_string(&request)? + "\n";
         self.writer.write_all(json.as_bytes()).await?;
         Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn history_response_survives_more_than_100_interleaved_events() {
+        let (client_stream, peer_stream) = crate::transport::stream_pair().expect("stream pair");
+        let (reader, writer) = client_stream.into_split();
+        let mut client = Client {
+            reader: BufReader::new(reader),
+            writer,
+            next_id: 1,
+            pending_events: VecDeque::new(),
+        };
+        let (peer_reader, mut peer_writer) = peer_stream.into_split();
+
+        let server = tokio::spawn(async move {
+            let mut request = String::new();
+            BufReader::new(peer_reader)
+                .read_line(&mut request)
+                .await
+                .expect("read history request");
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).expect("parse history request"),
+                Request::GetHistory { id: 1 }
+            ));
+
+            let mut payload = Vec::new();
+            for _ in 0..101 {
+                serde_json::to_writer(
+                    &mut payload,
+                    &ServerEvent::CompactionModelChanged {
+                        id: 0,
+                        model: None,
+                        error: None,
+                    },
+                )
+                .expect("serialize interleaved event");
+                payload.push(b'\n');
+            }
+            serde_json::to_writer(
+                &mut payload,
+                &ServerEvent::Error {
+                    id: 1,
+                    message: "correlated response".to_string(),
+                    retry_after_secs: None,
+                },
+            )
+            .expect("serialize correlated response");
+            payload.push(b'\n');
+            peer_writer
+                .write_all(&payload)
+                .await
+                .expect("write interleaved response");
+        });
+
+        let response = client.get_history_event().await.expect("history response");
+        assert!(matches!(response, ServerEvent::Error { id: 1, .. }));
+        assert_eq!(client.pending_events.len(), 101);
+        server.await.expect("server task");
     }
 }
