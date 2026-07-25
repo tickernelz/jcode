@@ -98,6 +98,8 @@ class WindowsCargoTimeoutTests(unittest.TestCase):
             "$packages = $tests | ForEach-Object { $_.Package } | Sort-Object -Unique",
             runner,
         )
+        self.assertIn("if ($LASTEXITCODE -ne 0)", runner)
+        self.assertIn('throw "Windows targeted test compilation failed for $package"', runner)
         self.assertIn(execute_command, runner)
         self.assertEqual(re.findall(r"-TimeoutSeconds\s+(\d+)", runner), ["300"])
         self.assertLess(runner.index(compile_command), runner.index(filtered_command))
