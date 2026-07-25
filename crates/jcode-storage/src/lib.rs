@@ -514,21 +514,27 @@ pub fn write_bytes_without_backup(path: &Path, bytes: &[u8]) -> Result<()> {
     write_bytes_inner(path, bytes, true, false, false)
 }
 
+fn sync_file_contents(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    #[cfg(not(windows))]
+    let file = std::fs::File::open(path)?;
+    file.sync_all()
+}
+
 /// Confirm already-published bytes and their directory entry after an atomic
 /// writer reported an ambiguous post-publication error. This never republishes
 /// bytes and is safe to retry.
 pub fn confirm_publication_durable(path: &Path) -> Result<()> {
     #[cfg(any(test, feature = "test-support"))]
     inject_test_confirmation_failure(path)?;
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "Published file {} could not be synchronized: {}",
-                path.display(),
-                error
-            )
-        })?;
+    sync_file_contents(path).map_err(|error| {
+        anyhow::anyhow!(
+            "Published file {} could not be synchronized: {}",
+            path.display(),
+            error
+        )
+    })?;
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         std::fs::File::open(parent)
@@ -749,64 +755,6 @@ fn inject_test_write_failure(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn replace_file(path: &Path, replacement: &Path, backup: Option<&Path>) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    fn wide(path: &Path) -> std::io::Result<Vec<u16>> {
-        let absolute = std::path::absolute(path)?;
-        let path: Vec<u16> = absolute.as_os_str().encode_wide().collect();
-        let mut extended =
-            if path.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
-                path
-            } else if path.starts_with(&[b'\\' as u16, b'\\' as u16]) {
-                "\\\\?\\UNC\\"
-                    .encode_utf16()
-                    .chain(path.into_iter().skip(2))
-                    .collect()
-            } else {
-                "\\\\?\\".encode_utf16().chain(path).collect()
-            };
-        extended.push(0);
-        Ok(extended)
-    }
-
-    let path_wide = wide(path)?;
-    let replacement_wide = wide(replacement)?;
-    let backup_wide = backup.map(wide).transpose()?;
-    let replaced = unsafe {
-        ReplaceFileW(
-            path_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            backup_wide
-                .as_ref()
-                .map_or(std::ptr::null(), |path| path.as_ptr()),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if replaced == 0 {
-        let error = std::io::Error::last_os_error();
-        let partial_move = matches!(error.raw_os_error(), Some(1176 | 1177));
-        if partial_move
-            && !path.exists()
-            && let Some(backup) = backup
-            && backup.exists()
-            && let Err(restore_error) = std::fs::rename(backup, path)
-        {
-            return Err(std::io::Error::other(format!(
-                "{error}; failed to restore replaced file from {}: {restore_error}",
-                backup.display()
-            )));
-        }
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
-
 struct AtomicPathLock(std::fs::File);
 
 impl AtomicPathLock {
@@ -867,8 +815,6 @@ fn write_bytes_inner_locked(
     let nonce: u64 = rand::random();
     let tmp_path = path.with_extension(format!("tmp.{}.{}", pid, nonce));
     let backup_tmp_path = path.with_extension(format!("bak.tmp.{}.{}", pid, nonce));
-    let rotated_backup_tmp_path =
-        path.with_extension(format!("bak.previous.tmp.{}.{}", pid, nonce));
     let destination_existed = path.exists();
 
     let result = (|| -> Result<()> {
@@ -907,19 +853,32 @@ fn write_bytes_inner_locked(
                 std::fs::hard_link(path, &backup_tmp_path)?;
                 std::fs::rename(&backup_tmp_path, &bak_path)?;
             }
-            // ReplaceFileW swaps the files and writes the backup in one
-            // filesystem operation, so concurrent readers never see a missing
-            // primary path. The documented WRITE_THROUGH flag is unsupported,
-            // so durability still comes from syncing the replacement before
-            // publication rather than making a stronger Windows claim.
+            // Stage the old primary before publishing. ReplaceFileW can expose
+            // a transient missing path and fail with ERROR_UNABLE_TO_REMOVE_REPLACED
+            // while readers open the destination. Rust's Windows rename uses
+            // MoveFileExW with MOVEFILE_REPLACE_EXISTING (and a handle-based
+            // fallback), avoiding that remove-then-move window.
             #[cfg(windows)]
             {
-                replace_file(path, &tmp_path, Some(&backup_tmp_path))?;
+                if preserve_backup {
+                    if let Err(link_error) = std::fs::hard_link(path, &backup_tmp_path) {
+                        std::fs::copy(path, &backup_tmp_path).map_err(|copy_error| {
+                            anyhow::anyhow!(
+                                "Unable to stage backup for {}: hard link failed: {}; copy failed: {}",
+                                path.display(),
+                                link_error,
+                                copy_error
+                            )
+                        })?;
+                    }
+                    if durable {
+                        sync_file_contents(&backup_tmp_path)?;
+                    }
+                }
+                std::fs::rename(&tmp_path, path)?;
                 destination_published = true;
                 if preserve_backup && bak_path.exists() {
-                    if let Err(error) =
-                        replace_file(&bak_path, &backup_tmp_path, Some(&rotated_backup_tmp_path))
-                    {
+                    if let Err(error) = std::fs::rename(&backup_tmp_path, &bak_path) {
                         eprintln!(
                             "Atomic write to {} was published, but backup rotation at {} failed: {}",
                             path.display(),
@@ -929,7 +888,6 @@ fn write_bytes_inner_locked(
                     }
                     if bak_path.exists() {
                         drop(std::fs::remove_file(&backup_tmp_path));
-                        drop(std::fs::remove_file(&rotated_backup_tmp_path));
                     }
                 } else if preserve_backup {
                     if let Err(error) = std::fs::rename(&backup_tmp_path, &bak_path) {
@@ -998,7 +956,6 @@ fn write_bytes_inner_locked(
     if result.is_err() {
         if !destination_existed || path.exists() {
             drop(std::fs::remove_file(&backup_tmp_path));
-            drop(std::fs::remove_file(&rotated_backup_tmp_path));
         }
         #[cfg(not(windows))]
         drop(std::fs::remove_file(&tmp_path));
