@@ -405,6 +405,16 @@ fn from_persisted_member(
     let original_status = record.status.as_str();
     let was_terminal_before_recovery =
         super::swarm::member_status_is_terminal(original_status.as_ref());
+    // A stop transaction publishes SessionStatus::Closed before it retires the
+    // swarm snapshot entry. If the process dies in that narrow window, the
+    // closed session is the durable tombstone that completes registry cleanup
+    // on restart. Preserve already-terminal completion records for reporting.
+    if !was_terminal_before_recovery
+        && crate::session::Session::load(&record.session_id)
+            .is_ok_and(|session| matches!(session.status, crate::session::SessionStatus::Closed))
+    {
+        return None;
+    }
     let (status, detail) = recover_member_status(record.status, record.detail, record.is_headless);
     let status_text = status.as_str();
     let terminal_since_unix_ms = super::swarm::member_status_is_terminal(status_text.as_ref())

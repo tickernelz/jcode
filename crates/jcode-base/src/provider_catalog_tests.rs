@@ -845,12 +845,16 @@ fn matrix_openai_compatible_localhost_override_allows_no_auth() {
         "JCODE_OPENAI_COMPAT_API_KEY_NAME",
         "JCODE_OPENAI_COMPAT_ENV_FILE",
         "JCODE_OPENAI_COMPAT_LOCAL_ENABLED",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_OPENROUTER_API_KEY_NAME",
     ]);
 
     crate::env::set_var("JCODE_OPENAI_COMPAT_API_BASE", "http://localhost:11434/v1");
     crate::env::remove_var("JCODE_OPENAI_COMPAT_API_KEY_NAME");
     crate::env::remove_var("JCODE_OPENAI_COMPAT_ENV_FILE");
     crate::env::remove_var("JCODE_OPENAI_COMPAT_LOCAL_ENABLED");
+    crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", "unrelated-profile");
+    crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", "MISSING_UNRELATED_KEY");
 
     let resolved = resolve_openai_compatible_profile(OPENAI_COMPAT_PROFILE);
     assert_eq!(resolved.api_base, "http://localhost:11434/v1");

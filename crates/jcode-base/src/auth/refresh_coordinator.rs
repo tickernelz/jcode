@@ -14,16 +14,95 @@
 //!   rather than the possibly stale one the caller observed.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
+
+use sha2::{Digest, Sha256};
 
 static REFRESH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct AccountCredentialGuard {
+    _process: crate::auth::account_store::CrossProcessFileLock,
+    _transition: Option<crate::session::AccountTransitionFileLock>,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+
+struct CancelTransitionWaitOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelTransitionWaitOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
 
 fn lock_for(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut map = REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+fn cross_process_lock_path(key: &str) -> anyhow::Result<PathBuf> {
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+    Ok(crate::storage::jcode_dir()?
+        .join("state")
+        .join("oauth-refresh")
+        .join(format!("{digest}.lock")))
+}
+
+async fn acquire_account_credential_guard(key: &str) -> anyhow::Result<AccountCredentialGuard> {
+    let local = lock_for(key).lock_owned().await;
+    let transition = if crate::session::account_transition_admission_held() {
+        None
+    } else {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_on_drop = CancelTransitionWaitOnDrop(Arc::clone(&cancelled));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let transition = tokio::task::spawn_blocking(move || {
+            crate::session::AccountTransitionFileLock::acquire_shared_cancellable(&worker_cancelled)
+        })
+        .await??;
+        drop(cancel_on_drop);
+        Some(transition)
+    };
+    let lock_path = cross_process_lock_path(key)?;
+    let process = tokio::task::spawn_blocking(move || {
+        crate::auth::account_store::CrossProcessFileLock::acquire(&lock_path)
+    })
+    .await??;
+    Ok(AccountCredentialGuard {
+        _process: process,
+        _transition: transition,
+        _local: local,
+    })
+}
+
+/// Run a synchronous credential replacement under the same per-account and
+/// account-transition leases used by rotating-token refresh. Login/import can
+/// therefore never be overwritten later by a refresh that started first.
+pub async fn replace_account_credentials<T, Replace>(
+    key: String,
+    replace: Replace,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    Replace: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let _guard = acquire_account_credential_guard(&key).await?;
+    tokio::task::spawn_blocking(replace).await?
+}
+
+pub async fn replace_account_credentials_async<T, Replace, Fut>(
+    key: String,
+    replace: Replace,
+) -> anyhow::Result<T>
+where
+    Replace: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let _guard = acquire_account_credential_guard(&key).await?;
+    replace().await
 }
 
 /// Expiry check shared by refresh freshness probes: a token is considered
@@ -54,8 +133,7 @@ where
     Refresh: FnOnce(Option<T>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let lock = lock_for(&key);
-    let _guard = lock.lock().await;
+    let _guard = acquire_account_credential_guard(&key).await?;
     let current = reload();
     if let Some(current) = current {
         if already_refreshed(&current) {
@@ -70,6 +148,88 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn external_holder_serializes_same_account_refresh() {
+        let _env = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().expect("temp home");
+        crate::env::set_var("JCODE_HOME", home.path());
+        tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(async {
+                let key = "test:cross-process";
+                let path = cross_process_lock_path(key).expect("refresh lock path");
+                std::fs::create_dir_all(path.parent().unwrap()).expect("lock parent");
+                let gate = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .expect("open external lock");
+                gate.lock().expect("hold external lock");
+
+                let mut refresh = tokio::spawn(single_flight(
+                    key.to_string(),
+                    || None::<String>,
+                    |_| false,
+                    |_| async { Ok("refreshed".to_string()) },
+                ));
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), &mut refresh)
+                        .await
+                        .is_err(),
+                    "a second process must wait before redeeming the same rotating token"
+                );
+
+                drop(gate.unlock());
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+                        .await
+                        .expect("refresh unblocked")
+                        .expect("refresh task")
+                        .expect("refresh result"),
+                    "refreshed"
+                );
+            });
+        crate::env::remove_var("JCODE_HOME");
+    }
+
+    #[test]
+    fn account_transition_excludes_target_account_refresh() {
+        let _env = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().expect("temp home");
+        crate::env::set_var("JCODE_HOME", home.path());
+        tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(async {
+                let transition = crate::session::AccountTransitionFileLock::acquire_exclusive()
+                    .expect("hold account transition");
+                let mut refresh = tokio::spawn(single_flight(
+                    "test:transition-target".to_string(),
+                    || None::<String>,
+                    |_| false,
+                    |_| async { Ok("refreshed".to_string()) },
+                ));
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(75), &mut refresh)
+                        .await
+                        .is_err(),
+                    "refresh must not advance a target generation during account transition"
+                );
+
+                drop(transition);
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+                        .await
+                        .expect("refresh unblocked")
+                        .expect("refresh task")
+                        .expect("refresh result"),
+                    "refreshed"
+                );
+            });
+        crate::env::remove_var("JCODE_HOME");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_refreshes_for_same_key_run_once() {

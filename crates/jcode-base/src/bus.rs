@@ -444,6 +444,7 @@ pub enum BusEvent {
     ProviderModelActivated {
         session_id: String,
         model: String,
+        model_request: String,
         provider_key: Option<String>,
         message: String,
         open_picker: bool,

@@ -1,29 +1,25 @@
+#[path = "turn_request_setup.rs"]
+mod turn_request_setup;
 use super::*;
 use crate::message::ToolDefinition;
-
 impl App {
-    pub(super) fn append_current_turn_system_reminder(
-        &self,
-        split: &mut crate::prompt::SplitSystemPrompt,
-    ) {
-        let Some(reminder) = self
-            .current_turn_system_reminder
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        else {
-            return;
-        };
-
-        if !split.dynamic_part.is_empty() {
-            split.dynamic_part.push_str("\n\n");
-        }
-        split.dynamic_part.push_str("# System Reminder\n\n");
-        split.dynamic_part.push_str(reminder);
-    }
-
     /// Run turn with interactive input handling (redraws UI, accepts input during streaming)
     pub(super) async fn run_turn_interactive(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        event_stream: &mut EventStream,
+        bus_receiver: Option<&mut tokio::sync::broadcast::Receiver<crate::bus::BusEvent>>,
+    ) -> Result<()> {
+        let _account_admission = self.acquire_local_model_turn_admission().await?;
+        crate::session::with_account_transition_admission(self.run_turn_interactive_admitted(
+            terminal,
+            event_stream,
+            bus_receiver,
+        ))
+        .await
+    }
+
+    async fn run_turn_interactive_admitted(
         &mut self,
         terminal: &mut DefaultTerminal,
         event_stream: &mut EventStream,
@@ -104,7 +100,8 @@ impl App {
             } else {
                 provider_messages
             };
-            let session_id_clone = self.provider_session_id.clone();
+            self.ensure_local_provider_identity_matches_admission()?;
+            let session_id_clone = self.provider_session_id_for_next_request();
             let static_part = split_prompt.static_part.clone();
             let dynamic_part = split_prompt.dynamic_part.clone();
             self.begin_kv_cache_request(&request_messages, &tools, &static_part, &dynamic_part);
@@ -222,6 +219,7 @@ impl App {
                 }
             };
 
+            self.reconcile_verified_local_provider_identity_transition()?;
             crate::logging::info(&format!(
                 "TUI: API stream opened in {:.2}s",
                 api_start.elapsed().as_secs_f64()
@@ -300,6 +298,7 @@ impl App {
                                         self.interleave_message = None;
                                         self.pending_soft_interrupts.clear();
                                         self.pending_soft_interrupt_requests.clear();
+                                        self.reconcile_verified_local_provider_identity_transition()?;
                                         // Save partial assistant response before clearing
                                         if let Some(tool) = current_tool.take() {
                                             tool_calls.push(tool);
@@ -366,6 +365,7 @@ impl App {
                                     }
                                     // Check for interleave request (Shift+Enter)
                                     if let Some(interleave_msg) = self.interleave_message.take() {
+                                        self.reconcile_verified_local_provider_identity_transition()?;
                                         // Save partial assistant response if any
                                         if !text_content.is_empty() || !tool_calls.is_empty() {
                                             // Complete any pending tool
@@ -724,7 +724,7 @@ impl App {
                                         }
                                     }
                                     StreamEvent::SessionId(sid) => {
-                                        self.provider_session_id = Some(sid);
+                                        self.bind_local_provider_session_id(sid)?;
                                         if saw_message_end {
                                             break;
                                         }
@@ -966,6 +966,7 @@ impl App {
                                         tool_name,
                                         input,
                                     } => {
+                                        self.reconcile_verified_local_provider_identity_transition()?;
                                         // Execute native tool and send result back to SDK bridge
                                         let ctx = crate::tool::ToolContext {
                                             session_id: self.session_id().to_string(),
@@ -1052,6 +1053,8 @@ impl App {
                     }
                 }
             }
+
+            self.reconcile_verified_local_provider_identity_transition()?;
 
             // If we interleaved a message, skip post-processing and go straight to new API call
             if interleaved {

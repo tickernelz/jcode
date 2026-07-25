@@ -433,3 +433,48 @@ fn load_auth_file_renames_existing_labels_to_numbered_scheme() {
     );
     assert_eq!(auth.active_openai_account.as_deref(), Some("openai-2"));
 }
+#[test]
+fn concurrent_account_token_updates_preserve_both_rotated_tokens() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    set_active_account_override(None);
+    let account = |label: &str, access: &str, refresh: &str| OpenAiAccount {
+        label: label.to_string(),
+        access_token: access.to_string(),
+        refresh_token: refresh.to_string(),
+        id_token: None,
+        account_id: None,
+        expires_at: Some(1),
+        email: None,
+    };
+    let first = upsert_account(account("first", "a0", "ra0")).unwrap();
+    let second = upsert_account(account("second", "b0", "rb0")).unwrap();
+
+    let lock_path = jcode_auth_path().unwrap().with_extension("atomic.lock");
+    let gate = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    gate.lock().unwrap();
+    let update_first = std::thread::spawn(move || {
+        update_account_tokens(&first, "a1", "ra1", None, None, Some(2)).unwrap();
+    });
+    let update_second = std::thread::spawn(move || {
+        update_account_tokens(&second, "b1", "rb1", None, None, Some(2)).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!update_first.is_finished());
+    assert!(!update_second.is_finished());
+    drop(gate.unlock());
+    update_first.join().unwrap();
+    update_second.join().unwrap();
+
+    let accounts = list_accounts().unwrap();
+    assert_eq!(accounts.len(), 2);
+    assert!(accounts.iter().any(|account| account.access_token == "a1"));
+    assert!(accounts.iter().any(|account| account.access_token == "b1"));
+}

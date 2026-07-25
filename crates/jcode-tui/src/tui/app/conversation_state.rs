@@ -125,8 +125,7 @@ impl App {
             let ownership = event
                 .ownership
                 .as_deref()
-                .map(|owner| format!(" via {owner}"))
-                .unwrap_or_default();
+                .map_or_else(String::new, |owner| format!(" via {owner}"));
             details.push(format!("engine {engine}{ownership}"));
         }
         if let Some(route) = event.effective_route.as_deref() {
@@ -277,20 +276,46 @@ impl App {
         {
             return;
         }
+        if let Err(error) = self.reseed_compaction_from_provider_messages_strict() {
+            crate::logging::warn(&format!(
+                "Could not reseed compaction from provider messages: {error}"
+            ));
+        }
+    }
+
+    pub(super) fn reseed_compaction_from_provider_messages_strict(&mut self) -> anyhow::Result<()> {
         let provider_messages = self.materialized_provider_messages();
+        let active_stored_messages = self.session.active_stored_messages().into_owned();
         let compaction = self.registry.compaction();
-        if let Ok(mut manager) = compaction.try_write() {
-            manager.reset();
-            manager.set_budget(self.context_limit as usize);
-            if let Some(state) = self.session.compaction.as_ref() {
-                manager.restore_persisted_state_with(state, &provider_messages);
+        let mut manager = compaction.try_write().map_err(|_| {
+            anyhow::anyhow!("compaction state is busy during provider identity transition")
+        })?;
+        manager.reset();
+        manager.set_budget(self.context_limit as usize);
+        if let Some(state) = self.session.compaction.as_ref() {
+            if self.session.has_owned_native_lcm_projection() {
+                manager.restore_native_lcm_stored_state_with(state, &active_stored_messages);
             } else {
-                manager.seed_restored_messages_with(&provider_messages);
+                manager.restore_persisted_state_with(state, &provider_messages);
             }
-            if manager.discard_oversized_openai_native_compaction() {
-                self.sync_session_compaction_state_from_manager(&manager);
-            }
-        };
+        } else {
+            manager.seed_restored_messages_with(&provider_messages);
+        }
+        if manager.discard_oversized_openai_native_compaction() {
+            self.sync_session_compaction_state_from_manager(&manager);
+        }
+        Ok(())
+    }
+
+    pub(super) fn reset_provider_view_after_identity_transition(&mut self) -> anyhow::Result<()> {
+        // Never seed the new identity from `self.messages`: in local mode that
+        // vector may still be the old identity's compacted provider projection.
+        // Re-materialize only from the canonical durable journal after its
+        // projection/frontier were deactivated.
+        self.messages = self.session.messages_for_provider_uncached();
+        self.last_injected_memory_signature = None;
+        self.reset_tool_output_tracking();
+        self.reseed_compaction_from_provider_messages_strict()
     }
 
     pub(super) fn sync_session_compaction_state_from_manager(
@@ -313,10 +338,10 @@ impl App {
         &mut self,
         manager: &mut crate::compaction::CompactionManager,
     ) -> bool {
-        if !manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
+        if !manager.synchronize_engine(crate::config::config().compaction.engine) {
             return false;
         }
-        self.session.clear_context_graph_state();
+        self.session.deactivate_context_graph_state();
         self.invalidate_kv_cache_after_compaction();
         if let Err(error) = self.session.save() {
             crate::logging::error(&format!(
@@ -734,14 +759,23 @@ impl App {
         if let Some(pending_time) = self.quit_pending
             && pending_time.elapsed() < QUIT_TIMEOUT
         {
-            self.session.provider_session_id = self.provider_session_id.clone();
+            let mut candidate = self.session.clone();
+            candidate.provider_session_id = self.provider_session_id.clone();
+            candidate.status = crate::session::SessionStatus::Closed;
+            if let Err(error) = candidate.save() {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Failed to persist session before quit: {error}"
+                )));
+                self.set_status_notice("Quit cancelled: session save failed");
+                return false;
+            }
+            crate::storage::unregister_active_pid(&candidate.id);
+            self.session = candidate;
             crate::telemetry::end_session_with_reason(
                 self.provider.name(),
                 &self.provider.model(),
                 crate::telemetry::SessionEndReason::NormalExit,
             );
-            self.session.mark_closed();
-            let _ = self.session.save();
             self.should_quit = true;
             return true;
         }
@@ -789,6 +823,9 @@ impl App {
             }
         } else {
             for (index, msg) in self.session.messages.iter().enumerate().skip(scan_start) {
+                if self.session.archived_message_ids.contains(&msg.id) {
+                    continue;
+                }
                 match msg.role {
                     Role::User => {
                         for block in &msg.content {
@@ -864,9 +901,8 @@ impl App {
     pub(super) fn repair_missing_tool_outputs(&mut self) -> usize {
         let missing_repairs = self.collect_missing_tool_outputs_since_last_scan();
         let mut repaired = 0usize;
-        let mut inserted = 0usize;
-        for (index, missing_for_message) in missing_repairs {
-            for (offset, id) in missing_for_message.iter().enumerate() {
+        for (_index, missing_for_message) in missing_repairs {
+            for id in &missing_for_message {
                 let tool_block = ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: TOOL_OUTPUT_MISSING_TEXT.to_string(),
@@ -888,15 +924,14 @@ impl App {
                     token_usage: None,
                 };
                 if self.is_remote || !self.messages.is_empty() {
-                    self.messages
-                        .insert(index + 1 + inserted + offset, inserted_message);
+                    self.messages.push(inserted_message);
                 }
-                self.session
-                    .insert_message(index + 1 + inserted + offset, stored_message);
+                // Canonical history is append-only. Provider request builders
+                // normalize delayed tool results back beside their calls.
+                self.session.append_stored_message(stored_message);
                 self.tool_result_ids.insert(id.clone());
                 repaired += 1;
             }
-            inserted += missing_for_message.len();
         }
 
         self.tool_output_scan_index = self.local_transcript_message_count();
@@ -912,15 +947,20 @@ impl App {
     /// Rebuild current session into a new one without tool calls
     pub(super) fn recover_session_without_tools(&mut self) {
         let old_session = self.session.clone();
-        let old_messages = old_session.messages.clone();
+        let old_messages = old_session.active_stored_messages().into_owned();
 
         let new_session_id = format!("session_recovery_{}", id::new_id("rec"));
         let mut new_session =
             Session::create_with_id(new_session_id, Some(old_session.id.clone()), None);
         new_session.title = old_session.title.clone();
         new_session.custom_title = old_session.custom_title.clone();
-        new_session.provider_session_id = old_session.provider_session_id.clone();
+        new_session.provider_session_id = None;
+        new_session.provider_session_identity = None;
+        new_session.exact_runtime_identity = old_session.exact_runtime_identity.clone();
+        new_session.provider_key = old_session.provider_key.clone();
+        new_session.route_api_method = old_session.route_api_method.clone();
         new_session.model = old_session.model.clone();
+        new_session.reasoning_effort = old_session.reasoning_effort.clone();
         new_session.is_canary = old_session.is_canary;
         new_session.testing_build = old_session.testing_build.clone();
         new_session.is_debug = old_session.is_debug;

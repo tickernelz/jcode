@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -53,6 +53,31 @@ pub use jcode_agent_runtime::{
 };
 
 const JCODE_NATIVE_TOOLS: &[&str] = &["selfdev", "communicate"];
+
+static LIVE_AGENT_PROVIDERS: LazyLock<StdMutex<Vec<Weak<dyn Provider>>>> =
+    LazyLock::new(|| StdMutex::new(Vec::new()));
+
+fn register_live_agent_provider(provider: &Arc<dyn Provider>) {
+    let mut providers = LIVE_AGENT_PROVIDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    providers.retain(|provider| provider.strong_count() > 0);
+    providers.push(Arc::downgrade(provider));
+}
+
+pub(crate) async fn invalidate_all_live_agent_credentials() {
+    let providers = {
+        let mut registered = LIVE_AGENT_PROVIDERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let providers: Vec<_> = registered.iter().filter_map(Weak::upgrade).collect();
+        registered.retain(|provider| provider.strong_count() > 0);
+        providers
+    };
+    for provider in providers {
+        provider.invalidate_credentials().await;
+    }
+}
 static RECOVERED_TEXT_WRAPPED_TOOL_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static JCODE_REPO_SOURCE_STATE: LazyLock<(Option<String>, Option<bool>)> = LazyLock::new(|| {
@@ -172,11 +197,13 @@ pub struct TokenUsage {
 
 #[derive(Debug, Clone)]
 struct RewindUndoSnapshot {
-    messages: Vec<StoredMessage>,
+    archived_message_ids: Vec<String>,
+    raw_message_count: usize,
     compaction: Option<crate::session::StoredCompactionState>,
     context_graph: crate::session::ContextGraphState,
     provider_session_id: Option<String>,
     session_provider_session_id: Option<String>,
+    session_provider_session_identity: Option<jcode_provider_core::ExactRuntimeIdentity>,
     visible_message_count: usize,
 }
 
@@ -190,6 +217,9 @@ pub struct Agent {
     disabled_tools: HashSet<String>,
     /// Provider-specific session ID for conversation resume (e.g., Claude Code CLI session)
     provider_session_id: Option<String>,
+    /// Blocks model-facing turns when a loaded session's exact route could not
+    /// be reconstructed. A successful explicit model/route selection clears it.
+    provider_identity_error: Option<String>,
     /// Last upstream provider (OpenRouter) observed for this session
     last_upstream_provider: Option<String>,
     /// Last observed transport/connection type for this session
@@ -271,6 +301,7 @@ impl Agent {
         allowed_tools: Option<HashSet<String>>,
         disabled_tools: HashSet<String>,
     ) -> Self {
+        register_live_agent_provider(&provider);
         let skills = SkillRegistry::shared_snapshot();
         let initial_provider_model = provider.model();
         let provider_session_id = session.provider_session_id.clone();
@@ -283,6 +314,7 @@ impl Agent {
             allowed_tools,
             disabled_tools,
             provider_session_id,
+            provider_identity_error: None,
             last_upstream_provider: None,
             last_connection_type: None,
             last_status_detail: None,
@@ -369,6 +401,7 @@ impl Agent {
         agent.session.model = Some(agent.provider.model());
         agent.session.provider_key =
             crate::session::derive_session_provider_key(agent.provider.name());
+        agent.session.exact_runtime_identity = agent.provider.exact_runtime_identity();
         agent.session.ensure_initial_session_context_message();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("create");
@@ -441,11 +474,15 @@ impl Agent {
                     "Failed to restore session model '{}' via '{}': {}",
                     model, model_request, e
                 ));
+                agent.provider_identity_error = Some(format!(
+                    "Failed to restore exact session model '{model}' via '{model_request}': {e}"
+                ));
             }
         } else {
             agent.session.model = Some(agent.provider.model());
         }
         agent.restore_reasoning_effort_from_session();
+        agent.sync_exact_runtime_identity_from_provider();
         agent.session.ensure_initial_session_context_message();
         agent.sync_memory_dedup_state_from_session();
         if resume {
@@ -456,10 +493,12 @@ impl Agent {
         agent.log_env_snapshot(lifecycle_reason);
         agent.fire_session_lifecycle_hook("session_start", lifecycle_reason);
         if resume && let Err(err) = agent.session.save() {
-            logging::error(&format!(
+            let error = format!(
                 "Failed to persist resumed session state for {}: {}",
                 agent.session.id, err
-            ));
+            );
+            logging::error(&error);
+            agent.provider_identity_error = Some(error);
         }
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
@@ -471,9 +510,10 @@ impl Agent {
     }
 
     fn seed_compaction_from_session(&mut self) {
+        let active_messages = self.session.active_stored_messages().into_owned();
         logging::info(&format!(
             "seed_compaction_from_session: session has {} messages",
-            self.session.messages.len()
+            active_messages.len()
         ));
         let compaction = self.registry.compaction();
         let mut manager = match compaction.try_write() {
@@ -488,27 +528,18 @@ impl Agent {
         manager.reset();
         let budget = self.provider.context_window();
         manager.set_budget(budget);
+        let discard_lcm_projection = self.session.has_owned_native_lcm_projection()
+            && manager.engine() != crate::config::CompactionEngine::Lcm;
         if let Some(state) = self.session.compaction.as_ref() {
-            let native_lcm_owned = state.openai_encrypted_content.is_none()
-                && self
-                    .session
-                    .context_frontier
-                    .as_ref()
-                    .is_some_and(|frontier| {
-                        frontier.covered_message_count == state.compacted_count
-                            && frontier.covered_message_count == state.covers_up_to_turn
-                            && !frontier.active_node_ids.is_empty()
-                            && frontier.active_node_ids.iter().all(|id| {
-                                self.session.context_nodes.iter().any(|node| node.id == *id)
-                            })
-                    });
-            if native_lcm_owned {
-                manager.restore_native_lcm_stored_state_with(state, &self.session.messages);
+            if discard_lcm_projection {
+                manager.seed_restored_stored_messages_with(&active_messages);
+            } else if self.session.has_owned_native_lcm_projection() {
+                manager.restore_native_lcm_stored_state_with(state, &active_messages);
             } else {
-                manager.restore_persisted_stored_state_with(state, &self.session.messages);
+                manager.restore_persisted_stored_state_with(state, &active_messages);
             }
         } else {
-            manager.seed_restored_stored_messages_with(&self.session.messages);
+            manager.seed_restored_stored_messages_with(&active_messages);
         }
         let sanitized_state = if manager.discard_oversized_openai_native_compaction() {
             Some(manager.persisted_state())
@@ -517,9 +548,14 @@ impl Agent {
         };
         logging::info(&format!(
             "seed_compaction_from_session: seeded compaction with {} messages",
-            self.session.messages.len()
+            active_messages.len()
         ));
         drop(manager);
+        if discard_lcm_projection {
+            self.session.compaction = None;
+            self.session.deactivate_context_graph_state();
+            self.persist_session_best_effort("rolling rollback rebuilt from canonical raw history");
+        }
         if let Some(state) = sanitized_state {
             self.session.compaction = state;
             self.persist_session_best_effort("sanitized oversized OpenAI native compaction");
@@ -668,14 +704,12 @@ impl Agent {
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
             manager.set_budget(self.provider.context_window());
-            manager.restore_persisted_stored_state_with(&state, &self.session.messages);
+            let active_messages = self.session.active_stored_messages().into_owned();
+            manager.restore_persisted_stored_state_with(&state, &active_messages);
         }
 
-        self.cache_tracker.reset();
-        self.locked_tools = None;
+        self.note_compaction_applied();
         self.mcp_late_register_resolved = false;
-        self.provider_session_id = None;
-        self.session.provider_session_id = None;
         self.session.save()?;
         crate::runtime_memory_log::emit_event(
             crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
@@ -698,12 +732,12 @@ impl Agent {
             let compaction = self.registry.compaction();
             match compaction.try_write() {
                 Ok(mut manager) => {
-                    let configured_engine = crate::config::config().compaction.engine.clone();
+                    let configured_engine = crate::config::config().compaction.engine;
                     if manager.synchronize_engine(configured_engine) {
                         // The legacy projection remains a safe bootstrap. The old
                         // derived graph belongs to a different engine epoch and
                         // must not be extended after a live policy switch.
-                        self.session.clear_context_graph_state();
+                        self.session.deactivate_context_graph_state();
                         self.note_compaction_applied();
                         self.persist_session_best_effort("compaction engine switch");
                     }
@@ -872,6 +906,9 @@ impl Agent {
         let mut assistant_tool_uses: Vec<(usize, Vec<String>)> = Vec::new();
 
         for (index, msg) in self.session.messages.iter().enumerate().skip(scan_start) {
+            if self.session.archived_message_ids.contains(&msg.id) {
+                continue;
+            }
             match msg.role {
                 Role::User => {
                     for block in &msg.content {
@@ -915,9 +952,8 @@ impl Agent {
         self.tool_output_scan_index = self.session.messages.len();
 
         let mut repaired = 0usize;
-        let mut inserted = 0usize;
-        for (index, missing_for_message) in missing_repairs {
-            for (offset, id) in missing_for_message.iter().enumerate() {
+        for (_index, missing_for_message) in missing_repairs {
+            for id in &missing_for_message {
                 let tool_block = ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: TOOL_OUTPUT_MISSING_TEXT.to_string(),
@@ -932,12 +968,12 @@ impl Agent {
                     tool_duration_ms: None,
                     token_usage: None,
                 };
-                self.session
-                    .insert_message(index + 1 + inserted + offset, stored_message);
+                // Canonical history is append-only. Provider request builders
+                // normalize delayed tool results back beside their calls.
+                self.session.append_stored_message(stored_message);
                 self.tool_result_ids.insert(id.clone());
                 repaired += 1;
             }
-            inserted += missing_for_message.len();
         }
 
         self.tool_output_scan_index = self.session.messages.len();
@@ -970,18 +1006,29 @@ impl Agent {
     }
 
     /// Mark this agent session as closed and persist it.
-    pub fn mark_closed(&mut self) {
+    pub fn try_mark_closed(&mut self) -> Result<()> {
+        self.persist_soft_interrupt_snapshot();
+        let mut candidate = self.session.clone();
+        candidate.status = SessionStatus::Closed;
+        candidate.save()?;
+        crate::storage::unregister_active_pid(&candidate.id);
         crate::telemetry::end_session_with_reason(
             self.provider.name(),
             &self.provider.model(),
             crate::telemetry::SessionEndReason::NormalExit,
         );
-        self.persist_soft_interrupt_snapshot();
-        self.session.mark_closed();
-        if !self.session.messages.is_empty() {
-            self.persist_session_best_effort("session close state");
-        }
+        self.session = candidate;
         self.fire_session_lifecycle_hook("session_end", "close");
+        Ok(())
+    }
+
+    pub fn mark_closed(&mut self) {
+        if let Err(error) = self.try_mark_closed() {
+            logging::error(&format!(
+                "Failed to persist closed state for session {}: {error}",
+                self.session.id
+            ));
+        }
     }
 
     /// Fire a session lifecycle observer hook (`session_start`/`session_end`).
@@ -1000,16 +1047,70 @@ impl Agent {
         crate::hooks::dispatch_observer(event);
     }
 
-    pub fn mark_crashed(&mut self, message: Option<String>) {
+    pub fn try_mark_crashed(&mut self, message: Option<String>) -> Result<()> {
+        self.persist_soft_interrupt_snapshot();
+        let mut candidate = self.session.clone();
+        candidate.status = SessionStatus::Crashed { message };
+        candidate.save()?;
         crate::telemetry::record_crash(
             self.provider.name(),
             &self.provider.model(),
             crate::telemetry::SessionEndReason::Unknown,
         );
-        self.persist_soft_interrupt_snapshot();
-        self.session.mark_crashed(message);
-        if !self.session.messages.is_empty() {
-            self.persist_session_best_effort("session crash state");
+        crate::storage::unregister_active_pid(&candidate.id);
+        self.session = candidate;
+        Ok(())
+    }
+
+    /// Refresh a stale Agent before retrying a terminal lifecycle publication.
+    ///
+    /// Disconnect cleanup is the final owner of this Agent and must not abandon
+    /// the obligation after a CAS conflict. Preserve append-only local messages
+    /// only when the exact credential identity still matches the latest durable
+    /// generation. Across an identity transition the durable generation wins,
+    /// preventing cross-account transcript merging while still allowing the
+    /// session to be marked terminal.
+    pub(crate) fn refresh_session_for_terminal_retry(&mut self) -> Result<()> {
+        let mut latest = Session::load(&self.session.id)?;
+        if latest.exact_runtime_identity == self.session.exact_runtime_identity {
+            let mut durable_ids = latest
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<HashSet<_>>();
+            for message in self.session.messages.iter().cloned() {
+                if durable_ids.insert(message.id.clone()) {
+                    latest.append_stored_message(message);
+                }
+            }
+            let durable_message_ids = latest
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<HashSet<_>>();
+            for archived_id in &self.session.archived_message_ids {
+                if durable_message_ids.contains(archived_id.as_str())
+                    && !latest.archived_message_ids.contains(archived_id)
+                {
+                    latest.archived_message_ids.push(archived_id.clone());
+                }
+            }
+        } else {
+            self.provider_identity_error = Some(format!(
+                "Terminal lifecycle retry for session {} observed a different exact runtime identity; durable state was retained without cross-account merge",
+                self.session.id
+            ));
+        }
+        self.session = latest;
+        Ok(())
+    }
+
+    pub fn mark_crashed(&mut self, message: Option<String>) {
+        if let Err(error) = self.try_mark_crashed(message) {
+            logging::error(&format!(
+                "Failed to persist crashed state for session {}: {error}",
+                self.session.id
+            ));
         }
     }
 

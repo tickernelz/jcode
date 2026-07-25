@@ -350,7 +350,7 @@ pub(super) async fn execute_debug_command(
 
     if trimmed == "clear" || trimmed == "clear_history" {
         let mut agent = agent.lock().await;
-        agent.clear();
+        agent.clear().map_err(|error| anyhow::anyhow!(error))?;
         return Ok(serde_json::json!({
             "status": "cleared",
             "message": "Conversation history cleared"
@@ -681,6 +681,27 @@ mod tests {
 
         fn name(&self) -> &str {
             "test"
+        }
+
+        fn model(&self) -> String {
+            "test-model".to_string()
+        }
+
+        fn exact_runtime_identity(&self) -> Option<jcode_provider_core::ExactRuntimeIdentity> {
+            Some(jcode_provider_core::ExactRuntimeIdentity {
+                provider_key: "test".to_string(),
+                route: jcode_provider_core::RouteSelection {
+                    model: "test-model".to_string(),
+                    runtime_key: jcode_provider_core::RuntimeKey::OpenAIOAuth,
+                    api_method: "test-api".to_string(),
+                    provider_label: "test".to_string(),
+                    detail: String::new(),
+                },
+                account_label: Some("test-account".to_string()),
+                account_id: Some("stable-test-account".to_string()),
+                account_generation: Some(1),
+                reasoning_effort: None,
+            })
         }
 
         fn fork(&self) -> Arc<dyn Provider> {

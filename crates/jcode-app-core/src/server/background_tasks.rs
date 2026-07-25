@@ -457,6 +457,10 @@ fn cap_chars(s: &str, cap: usize) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "keeps focused tests beside the helper they exercise"
+)]
 mod tests {
     use super::*;
     use crate::bus::{BatchProgress, ToolEvent, ToolStatus};
@@ -538,10 +542,11 @@ mod tests {
         };
 
         assert!(update_active_todo_batch_progress(&mut items, &progress));
-        let captured = items[0].tool_intents[0]
-            .progress
-            .as_ref()
-            .expect("progress captured");
+        let captured = items[0].tool_intents[0].progress.as_ref();
+        assert!(captured.is_some(), "progress should be captured");
+        let Some(captured) = captured else {
+            return;
+        };
         assert_eq!((captured.current, captured.total), (27, 43));
         assert!(!update_active_todo_batch_progress(&mut items, &progress));
     }

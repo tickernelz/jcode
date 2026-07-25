@@ -8,17 +8,27 @@ use super::{
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(super) struct SessionJournalMeta {
+    #[serde(default)]
+    pub(super) persistence_revision: Option<u64>,
     pub(super) parent_id: Option<String>,
     pub(super) title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) custom_title: Option<String>,
     pub(super) updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) archived_message_ids: Vec<String>,
     pub(super) compaction: Option<StoredCompactionState>,
     pub(super) provider_session_id: Option<String>,
+    #[serde(default)]
+    pub(super) provider_session_identity: Option<jcode_provider_core::ExactRuntimeIdentity>,
     pub(super) provider_key: Option<String>,
+    #[serde(default)]
+    pub(super) route_api_method: Option<String>,
     pub(super) model: Option<String>,
     #[serde(default)]
     pub(super) reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(super) exact_runtime_identity: Option<jcode_provider_core::ExactRuntimeIdentity>,
     pub(super) subagent_model: Option<String>,
     pub(super) improve_mode: Option<SessionImproveMode>,
     pub(super) autoreview_enabled: Option<bool>,
@@ -86,7 +96,10 @@ pub(super) fn metadata_requires_snapshot(
         || prev.title != current.title
         || prev.custom_title != current.custom_title
         || prev.provider_key != current.provider_key
+        || prev.route_api_method != current.route_api_method
         || prev.reasoning_effort != current.reasoning_effort
+        || prev.exact_runtime_identity != current.exact_runtime_identity
+        || prev.provider_session_identity != current.provider_session_identity
         || prev.subagent_model != current.subagent_model
         || prev.improve_mode != current.improve_mode
         || prev.autoreview_enabled != current.autoreview_enabled

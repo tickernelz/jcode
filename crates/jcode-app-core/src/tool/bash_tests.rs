@@ -29,6 +29,90 @@ fn make_agent_ctx(signal: jcode_agent_runtime::InterruptSignal) -> ToolContext {
     }
 }
 
+#[test]
+fn process_group_guard_kills_detached_process_before_ownership_transfer() {
+    let mut command = build_detached_shell_wrapper("sleep 30");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = crate::platform::spawn_detached(&mut command).expect("spawn detached process");
+    let pid = child.id();
+    let guard = ProcessGroupKillGuard::new(Some(pid));
+
+    drop(guard);
+
+    let status = child.wait().expect("reap killed detached process");
+    assert!(!status.success());
+    assert!(!crate::platform::is_process_running(pid));
+}
+
+#[tokio::test]
+async fn detached_process_group_dies_when_durable_background_registration_fails() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let grandchild_ready_file = temp.path().join("grandchild.ready");
+    let grandchild_survived_file = temp.path().join("grandchild.survived");
+    let command = format!(
+        "(printf ready > {}; sleep 2; printf survived > {}) & wait",
+        grandchild_ready_file.display(),
+        grandchild_survived_file.display(),
+    );
+    let mut shell = build_detached_shell_wrapper(&command);
+    shell
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = crate::platform::spawn_detached(&mut shell).expect("spawn process group");
+    let pid = child.id();
+    let guard = ProcessGroupKillGuard::new(Some(pid));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !grandchild_ready_file.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("grandchild ready marker");
+
+    let blocked_dir = temp.path().join("background-blocked");
+    std::fs::write(&blocked_dir, b"not a directory").expect("block status directory");
+    let manager = crate::background::BackgroundTaskManager::with_output_dir(blocked_dir);
+    let info = manager.reserve_task_info();
+    let registration = manager
+        .register_detached_task(
+            &info,
+            "bash",
+            None,
+            "session",
+            pid,
+            &Utc::now().to_rfc3339(),
+            false,
+            false,
+        )
+        .await;
+    assert!(
+        registration.is_err(),
+        "forced durable registration must fail"
+    );
+
+    drop(guard);
+    let status = child.wait().expect("reap process-group leader");
+    assert!(!status.success());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while crate::platform::is_process_running(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("process-group leader should die");
+    assert!(!crate::platform::is_process_running(pid));
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(
+        !grandchild_survived_file.exists(),
+        "descendant must not survive process-group cleanup"
+    );
+}
+
 #[tokio::test]
 async fn test_basic_command_no_stdin() {
     let tool = BashTool::new();

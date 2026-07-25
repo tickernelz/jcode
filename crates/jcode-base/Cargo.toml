@@ -123,7 +123,7 @@ default = ["embeddings", "bedrock"]
 # `pub` so downstream crates' test targets can reach them. Enabled as a
 # dev-dependency feature by jcode-app-core / jcode / etc.; never in normal
 # (non-test) builds.
-test-support = []
+test-support = ["jcode-storage/test-support"]
 jemalloc = [
     "dep:tikv-jemalloc-ctl",
     "dep:tikv-jemalloc-sys",
@@ -146,6 +146,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 global-hotkey = "0.7"
 
 [dev-dependencies]
+jcode-storage = { path = "../jcode-storage", features = ["test-support"] }
 # Dev-only cycle (cargo permits dev-dependencies on dependents): base's
 # MultiProvider routing tests exercise the real OpenRouter/OpenAI-compatible
 # runtime through the composition-root registry, exactly like the binary.

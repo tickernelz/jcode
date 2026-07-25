@@ -240,7 +240,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc,x86_64-pc-windows-gnu
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.7
@@ -302,6 +302,7 @@ jobs:
             & ./scripts/invoke_cargo_with_timeout.ps1 `
               -Name "Windows targeted test: $testName" `
               -TimeoutSeconds 300 `
+              -RequireTests `
               -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '--lib', $testName, '--', '--nocapture')
           }
 
@@ -311,12 +312,32 @@ jobs:
           & ./scripts/invoke_cargo_with_timeout.ps1 `
             -Name 'Windows setup-hints tests' `
             -TimeoutSeconds 300 `
+            -RequireTests `
             -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', 'jcode-setup-hints', '--lib', '--', '--nocapture')
 
           & ./scripts/invoke_cargo_with_timeout.ps1 `
             -Name 'Windows power-inhibit tests' `
             -TimeoutSeconds 900 `
+            -RequireTests `
             -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', 'jcode-base', '--no-default-features', '--lib', 'power_inhibit::tests::windows_', '--', '--nocapture')
+
+      - name: Run native Windows storage replacement and recovery tests (MSVC)
+        shell: pwsh
+        run: |
+          & ./scripts/invoke_cargo_with_timeout.ps1 `
+            -Name 'Windows MSVC storage replacement/recovery tests' `
+            -TimeoutSeconds 600 `
+            -RequireTests `
+            -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', 'jcode-storage', '--lib', 'atomic_write_tests::', '--', '--nocapture')
+
+      - name: Run native Windows storage replacement and recovery tests (GNU)
+        shell: pwsh
+        run: |
+          & ./scripts/invoke_cargo_with_timeout.ps1 `
+            -Name 'Windows GNU storage replacement/recovery tests' `
+            -TimeoutSeconds 600 `
+            -RequireTests `
+            -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-gnu', '-p', 'jcode-storage', '--lib', 'atomic_write_tests::', '--', '--nocapture')
 
       - name: Run Windows e2e smoke tests
         shell: pwsh
@@ -330,6 +351,7 @@ jobs:
             & ./scripts/invoke_cargo_with_timeout.ps1 `
               -Name "Windows e2e smoke test: $testName" `
               -TimeoutSeconds 420 `
+              -RequireTests `
               -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '--test', 'e2e', $testName, '--', '--exact', '--nocapture')
           }
 
@@ -347,6 +369,7 @@ jobs:
             & ./scripts/invoke_cargo_with_timeout.ps1 `
               -Name "Windows lifecycle e2e test: $testName" `
               -TimeoutSeconds 420 `
+              -RequireTests `
               -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '--test', 'e2e', $testName, '--', '--exact', '--nocapture')
           }
 

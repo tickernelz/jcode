@@ -23,7 +23,7 @@ use crate::protocol::ServerEvent;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
@@ -93,6 +93,7 @@ pub(super) async fn idle_live_agent(
 pub(super) async fn spawn_tracked_live_turn(
     session_id: &str,
     agent: Arc<Mutex<Agent>>,
+    lifecycle_lease: OwnedMutexGuard<()>,
     message: String,
     system_reminder: Option<String>,
     status_detail: Option<String>,
@@ -113,6 +114,10 @@ pub(super) async fn spawn_tracked_live_turn(
     let event_tx = session_event_fanout_sender(session_id.to_string(), Arc::clone(&swarm.members));
     let session_id = session_id.to_string();
     tokio::spawn(async move {
+        // Disconnect cleanup must wait for this independently spawned owner to
+        // finish. Unlike a connection-owned processing task, it is not reachable
+        // through cleanup_client_connection's JoinHandle.
+        let _session_lifecycle_lease = lifecycle_lease;
         let start_message_index = {
             let agent_guard = agent.lock().await;
             agent_guard.message_count()
@@ -180,6 +185,7 @@ pub(super) async fn run_live_turn_if_idle(
     sessions: &SessionAgents,
     swarm: LiveTurnSwarmContext,
 ) -> bool {
+    let lifecycle_lease = super::acquire_session_lifecycle_lease(session_id).await;
     let Some(agent) = idle_live_agent(session_id, sessions, &swarm.members).await else {
         return false;
     };
@@ -187,6 +193,7 @@ pub(super) async fn run_live_turn_if_idle(
     spawn_tracked_live_turn(
         session_id,
         agent,
+        lifecycle_lease,
         message.to_string(),
         system_reminder,
         detail,

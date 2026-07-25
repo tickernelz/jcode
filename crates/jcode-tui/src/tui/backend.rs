@@ -4,7 +4,6 @@
 //! local harnesses and server-backed remote clients.
 //!
 //! Also provides debug socket events for exposing full TUI state.
-
 use crate::message::ToolCall;
 use crate::protocol::{AuthChanged, FeatureToggle, Request, ServerEvent};
 use crate::server;
@@ -16,7 +15,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-
 /// Debug events broadcast by local harnesses via debug socket.
 /// These expose the full internal state for debugging/comparison.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,19 +41,14 @@ pub enum DebugEvent {
         cache_creation_input_tokens: Option<u64>,
         queued_messages: Vec<String>,
     },
-
     /// Text delta appended to streaming_text
     TextDelta { text: String },
-
     /// Tool started
     ToolStart { id: String, name: String },
-
     /// Tool input delta
     ToolInput { delta: String },
-
     /// Tool about to execute
     ToolExec { id: String, name: String },
-
     /// Tool completed
     ToolDone {
         id: String,
@@ -63,19 +56,14 @@ pub enum DebugEvent {
         output: String,
         is_error: bool,
     },
-
     /// Message added to display_messages
     MessageAdded { message: DebugMessage },
-
     /// Streaming text cleared (turn complete)
     StreamingCleared,
-
     /// Processing state changed
     ProcessingChanged { is_processing: bool },
-
     /// Status changed
     StatusChanged { status: String },
-
     /// Token usage update
     TokenUsage {
         input_tokens: u64,
@@ -83,35 +71,25 @@ pub enum DebugEvent {
         cache_read_input_tokens: Option<u64>,
         cache_creation_input_tokens: Option<u64>,
     },
-
     /// Input changed (user typing)
     InputChanged { input: String, cursor_pos: usize },
-
     /// Scroll offset changed
     ScrollChanged { offset: usize },
-
     /// Message queued
     MessageQueued { content: String },
-
     /// Queued message sent
     QueuedMessageSent { index: usize },
-
     /// Session ID set
     SessionId { id: String },
-
     /// Thinking started
     ThinkingStart,
-
     /// Thinking ended
     ThinkingEnd,
-
     /// Compaction occurred
     Compaction { trigger: String, pre_tokens: u64 },
-
     /// Error occurred
     Error { message: String },
 }
-
 /// Simplified message for debug serialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugMessage {
@@ -122,30 +100,25 @@ pub struct DebugMessage {
     pub title: Option<String>,
     pub tool_data: Option<ToolCall>,
 }
-
 /// Events emitted by backends during message processing
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     /// Text content delta from assistant
     TextDelta(String),
-
     /// Tool execution started
     ToolStart {
         id: String,
         name: String,
     },
-
     /// Tool input JSON delta
     ToolInput {
         delta: String,
     },
-
     /// Tool is about to execute (after input complete)
     ToolExec {
         id: String,
         name: String,
     },
-
     /// Tool execution completed
     ToolDone {
         id: String,
@@ -153,7 +126,6 @@ pub enum BackendEvent {
         output: String,
         is_error: bool,
     },
-
     /// Token usage update
     TokenUsage {
         input_tokens: u64,
@@ -161,48 +133,37 @@ pub enum BackendEvent {
         cache_read_input_tokens: Option<u64>,
         cache_creation_input_tokens: Option<u64>,
     },
-
     /// Thinking started (extended thinking mode)
     ThinkingStart,
-
     /// Thinking ended
     ThinkingEnd,
-
     /// Thinking completed with duration
     ThinkingDone {
         duration_secs: f32,
     },
-
     /// Context compaction occurred
     Compaction {
         trigger: String,
         pre_tokens: u64,
     },
-
     /// Session ID assigned/updated
     SessionId(String),
-
     /// Message processing complete
     Done,
-
     /// Error occurred
     Error(String),
-
     /// Server is reloading (remote only)
     Reloading,
-
     /// Connection state changed
     Connected,
     Disconnected,
 }
-
 #[derive(Debug, Clone)]
 pub enum RemoteDisconnectReason {
     PeerClosed,
     Io(String),
     Protocol(String),
 }
-
 #[derive(Debug, Clone)]
 #[expect(
     clippy::large_enum_variant,
@@ -212,7 +173,6 @@ pub enum RemoteRead {
     Event(ServerEvent),
     Disconnected(RemoteDisconnectReason),
 }
-
 /// Classification of a single decoded protocol line read from the server
 /// stream. Used by [`RemoteConnection::next_event`] to keep the cancellation-
 /// safe read loop readable. The event is boxed because [`ServerEvent`] is large.
@@ -221,7 +181,6 @@ enum LineOutcome {
     Skip,
     Disconnect(RemoteDisconnectReason),
 }
-
 /// Information about the backend's provider
 #[derive(Debug, Clone)]
 pub struct BackendInfo {
@@ -230,7 +189,6 @@ pub struct BackendInfo {
     pub mcp_servers: Vec<String>,
     pub skills: Vec<String>,
 }
-
 /// Remote connection to jcode server
 pub struct RemoteConnection {
     reader: BufReader<crate::transport::ReadHalf>,
@@ -257,7 +215,6 @@ pub struct RemoteConnection {
     has_loaded_history: bool,
     call_output_tokens_seen: u64,
 }
-
 const DETACHED_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_STRAY_REMOTE_PROTOCOL_LINES: usize = 32;
 /// Hard cap for one newline-delimited server event. History events can be large
@@ -273,13 +230,11 @@ const READ_BUFFER_SHRINK_THRESHOLD: usize = 256 * 1024;
 /// above typical streaming line sizes so steady-state traffic never causes
 /// grow/shrink thrash.
 const READ_BUFFER_RETAIN_CAPACITY: usize = 64 * 1024;
-
 fn remote_protocol_frame_exceeds_limit(buffered: usize, incoming: usize) -> bool {
     buffered
         .checked_add(incoming)
         .is_none_or(|total| total > MAX_REMOTE_PROTOCOL_FRAME_BYTES)
 }
-
 pub(crate) trait RemoteEventState {
     fn handle_tool_start(&mut self, id: &str, name: &str);
     fn handle_tool_input(&mut self, delta: &str);
@@ -293,7 +248,6 @@ pub(crate) trait RemoteEventState {
     fn has_loaded_history(&self) -> bool;
     fn mark_history_loaded(&mut self);
 }
-
 #[derive(Default)]
 pub(crate) struct ReplayRemoteState {
     tool_diff: RemoteDiffTracker,
@@ -989,25 +943,27 @@ impl RemoteConnection {
     }
 
     /// Ask server to switch active Anthropic account for this process/session.
-    pub async fn switch_anthropic_account(&mut self, label: &str) -> Result<()> {
+    pub async fn switch_anthropic_account(&mut self, label: &str) -> Result<u64> {
         let id = self.next_request_id;
         self.next_request_id += 1;
         self.send_request(Request::SwitchAnthropicAccount {
             id,
             label: label.to_string(),
         })
-        .await
+        .await?;
+        Ok(id)
     }
 
     /// Ask server to switch active OpenAI account for this process/session.
-    pub async fn switch_openai_account(&mut self, label: &str) -> Result<()> {
+    pub async fn switch_openai_account(&mut self, label: &str) -> Result<u64> {
         let id = self.next_request_id;
         self.next_request_id += 1;
         self.send_request(Request::SwitchOpenAiAccount {
             id,
             label: label.to_string(),
         })
-        .await
+        .await?;
+        Ok(id)
     }
 
     /// Send a response for a client debug request

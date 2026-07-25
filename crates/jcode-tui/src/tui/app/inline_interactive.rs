@@ -3224,12 +3224,6 @@ impl App {
                             self.inline_interactive_state = None;
                             self.upstream_provider = None;
                             self.status_detail = None;
-                            // Track the chosen method client-side so post-error
-                            // fallback picks know which credential path the
-                            // active route uses (remote sessions have no other
-                            // route bookkeeping).
-                            self.session.route_api_method =
-                                Some(route_selection.api_method.clone());
                             self.pending_route_selection = Some(route_selection);
                             self.pending_model_switch = Some(spec);
                             // In remote mode `self.provider` is a local
@@ -3241,29 +3235,14 @@ impl App {
                             // "gpt-5.5 (high)" at low effort (issue #427).
                             self.pending_reasoning_effort = effort.clone();
                         } else {
-                            match self.provider.set_route_selection(&route_selection) {
-                                Ok(()) => {
+                            match self
+                                .provider
+                                .set_route_selection(&route_selection)
+                                .and_then(|()| {
+                                    self.finalize_route_selection(&spec, &route_selection)
+                                }) {
+                                Ok(active_model) => {
                                     self.inline_interactive_state = None;
-                                    self.provider_session_id = None;
-                                    self.session.provider_session_id = None;
-                                    self.upstream_provider = None;
-                                    self.status_detail = None;
-                                    self.invalidate_model_picker_cache();
-                                    let active_model = self.provider.model();
-                                    self.update_context_limit_for_model(&active_model);
-                                    self.session.provider_key = crate::provider::MultiProvider::session_provider_key_after_model_switch(
-                                        &spec,
-                                        self.provider.name(),
-                                        self.session.provider_key.as_deref(),
-                                    );
-                                    self.session.model =
-                                        Some(crate::provider::persisted_session_model_for_route(
-                                            &route_selection,
-                                            &active_model,
-                                        ));
-                                    self.session.route_api_method =
-                                        Some(route_selection.api_method.clone());
-                                    let _ = self.session.save();
                                     crate::logging::event_info(
                                         "model_picker_select_applied",
                                         vec![
@@ -3295,8 +3274,15 @@ impl App {
                                 }
                             }
                         }
-                        if let Some(effort) = effort {
-                            let _ = self.provider.set_reasoning_effort(&effort);
+                        if !self.is_remote
+                            && let Some(effort) = effort
+                            && let Err(error) = self.set_reasoning_effort_transactional(&effort)
+                        {
+                            self.push_display_message(DisplayMessage::error(format!(
+                                "Model switched, but effort persistence failed: {error}"
+                            )));
+                            self.set_status_notice("Effort switch failed");
+                            return Ok(());
                         }
                         if !route_detail.is_empty() {
                             self.push_display_message(DisplayMessage::system(format!(

@@ -14,7 +14,7 @@ use crate::message::{
 };
 use crate::provider::Provider;
 use crate::runtime_memory_log::RuntimeMemoryLogController;
-use crate::session::{Session, StoredMessage};
+use crate::session::Session;
 use crate::skill::SkillRegistry;
 use crate::tool::selfdev::ReloadContext;
 use crate::tool::{Registry, ToolContext};
@@ -38,7 +38,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppRuntimeMode {
     /// Normal product TUI. The client renders state owned by the jcode server.
@@ -48,7 +47,6 @@ pub enum AppRuntimeMode {
     /// Local in-process harness used by unit tests and transitional UI fixtures only.
     TestHarness,
 }
-
 mod auth;
 mod auth_account_picker_saved_accounts;
 mod catchup;
@@ -104,22 +102,17 @@ mod turn;
 mod turn_memory;
 mod turn_notify;
 mod ui_prefs;
-
 pub(crate) use self::state_ui_storage::compact_display_messages_for_storage;
-
 pub(crate) fn extract_input_shell_command(input: &str) -> Option<&str> {
     self::input::extract_input_shell_command(input)
 }
-
 pub(crate) const COMMAND_SUGGESTION_VISIBLE_LIMIT: usize = 8;
-
 fn active_runtime_provider_key() -> Option<String> {
     std::env::var("JCODE_RUNTIME_PROVIDER")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
 }
-
 #[derive(Debug, Clone)]
 struct PendingRemoteMessage {
     content: String,
@@ -130,17 +123,20 @@ struct PendingRemoteMessage {
     retry_attempts: u8,
     retry_at: Option<Instant>,
 }
-
+#[derive(Debug, Clone)]
+struct PendingRemoteAccountSwitch {
+    id: u64,
+    provider_id: String,
+    label: String,
+}
 #[derive(Debug, Clone)]
 struct PendingSplitPrompt {
     content: String,
     images: Vec<(String, String)>,
 }
-
 struct PendingLocalTransfer {
     receiver: mpsc::Receiver<anyhow::Result<PreparedTransferSession>>,
 }
-
 /// A reasoning trace anchored in the transcript during the current turn
 /// (`current` display mode). `wrapped_lines_at_anchor` snapshots the
 /// transcript's total wrapped-line count when the trace anchored; once the
@@ -151,24 +147,23 @@ struct TurnReasoningTrace {
     display_index: usize,
     wrapped_lines_at_anchor: usize,
 }
-
 #[derive(Debug, Clone)]
 struct LocalRewindUndoSnapshot {
-    messages: Vec<StoredMessage>,
+    archived_message_ids: Vec<String>,
+    raw_message_count: usize,
     compaction: Option<crate::session::StoredCompactionState>,
     context_graph: crate::session::ContextGraphState,
     provider_session_id: Option<String>,
     session_provider_session_id: Option<String>,
+    session_provider_session_identity: Option<jcode_provider_core::ExactRuntimeIdentity>,
     visible_message_count: usize,
 }
-
 #[derive(Debug, Clone)]
 struct PendingRemoteRewindNotice {
     undo: bool,
     message_index: Option<usize>,
     changed_messages: usize,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::tui::app) struct KvCacheRequestSignature {
     pub(in crate::tui::app) system_static_hash: u64,
@@ -1318,6 +1313,7 @@ pub struct App {
     pending_prompt_before_history: Option<input::PreparedInput>,
     // Pending account switch from inline picker (for remote mode async processing)
     pending_account_picker_action: Option<crate::tui::AccountPickerAction>,
+    pending_remote_account_switch: Option<PendingRemoteAccountSwitch>,
     // Keybindings for model switching
     model_switch_keys: ModelSwitchKeys,
     // Keybindings for effort switching

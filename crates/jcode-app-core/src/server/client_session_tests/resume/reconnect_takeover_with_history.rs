@@ -1,10 +1,83 @@
 #[tokio::test]
 async fn handle_resume_session_allows_reconnect_takeover_with_local_history() -> Result<()> {
-    let _guard = crate::storage::lock_test_env();
-    let (_runtime, prev_runtime) = setup_runtime_dir()?;
+    assert_reconnect_takeover_behavior(false, true).await
+}
 
-    let target_session_id = "session_existing_live_takeover";
-    let temp_session_id = "session_temp_connecting_takeover";
+#[tokio::test]
+async fn handle_resume_session_does_not_take_over_processing_owner() -> Result<()> {
+    assert_reconnect_takeover_behavior(true, false).await
+}
+
+#[tokio::test]
+async fn reconnect_takeover_waits_for_stale_dispatch_and_revokes_future_dispatch() -> Result<()> {
+    let client_connections = Arc::new(RwLock::new(HashMap::new()));
+    let now = Instant::now();
+    let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
+    client_connections.write().await.insert(
+        "conn-stale".to_string(),
+        ClientConnectionInfo {
+            client_id: "conn-stale".to_string(),
+            session_id: "session-takeover-barrier".to_string(),
+            client_instance_id: None,
+            debug_client_id: None,
+            connected_at: now,
+            last_seen: now,
+            is_processing: false,
+            current_tool_name: None,
+            terminal_env: Vec::new(),
+            disconnect_tx,
+        },
+    );
+    let barrier = crate::server::client_lifecycle::connection_dispatch_barrier("conn-stale");
+    let stale_dispatch = barrier.lock().await;
+
+    let takeover_connections = Arc::clone(&client_connections);
+    let takeover_barrier = Arc::clone(&barrier);
+    let takeover = tokio::spawn(async move {
+        let _revocation = takeover_barrier.lock().await;
+        takeover_connections.write().await.remove("conn-stale");
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !takeover.is_finished(),
+        "takeover must wait for admitted dispatch"
+    );
+
+    drop(stale_dispatch);
+    takeover.await.expect("takeover task");
+
+    assert!(
+        crate::server::client_lifecycle::acquire_connection_dispatch_lease(
+            &client_connections,
+            "conn-stale",
+            "session-takeover-barrier",
+        )
+        .await
+        .is_none(),
+        "production admission must reject stale owner after takeover returns"
+    );
+    crate::server::client_lifecycle::remove_connection_dispatch_barrier("conn-stale");
+    Ok(())
+}
+
+async fn assert_reconnect_takeover_behavior(
+    existing_is_processing: bool,
+    expect_takeover: bool,
+) -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let _runtime = setup_runtime_dir()?;
+
+    let (target_session_id, temp_session_id) = if existing_is_processing {
+        (
+            "session_existing_live_processing_takeover",
+            "session_temp_connecting_processing_takeover",
+        )
+    } else {
+        (
+            "session_existing_live_takeover_guarded",
+            "session_temp_connecting_takeover_guarded",
+        )
+    };
 
     let mut persisted = crate::session::Session::create_with_id(
         target_session_id.to_string(),
@@ -15,11 +88,11 @@ async fn handle_resume_session_allows_reconnect_takeover_with_local_history() ->
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let existing_registry = Registry::new(provider.clone()).await;
-    let existing_agent = Arc::new(Mutex::new(build_test_agent_with_id(
+    let existing_agent = Arc::new(Mutex::new(Agent::new_with_session(
         provider.clone(),
         existing_registry,
-        target_session_id,
-        Vec::new(),
+        persisted,
+        None,
     )));
 
     let new_registry = Registry::new(provider.clone()).await;
@@ -48,8 +121,8 @@ async fn handle_resume_session_allows_reconnect_takeover_with_local_history() ->
                 debug_client_id: Some("debug_existing".to_string()),
                 connected_at: now,
                 last_seen: now,
-                is_processing: false,
-                current_tool_name: None,
+                is_processing: existing_is_processing,
+                current_tool_name: existing_is_processing.then(|| "bash".to_string()),
                 terminal_env: Vec::new(),
                 disconnect_tx,
             },
@@ -140,14 +213,25 @@ async fn handle_resume_session_allows_reconnect_takeover_with_local_history() ->
     }
     assert_eq!(client_session_id, target_session_id);
 
-    let disconnect_signal = disconnect_rx.recv().await;
-    assert!(
-        disconnect_signal.is_some(),
-        "old client should be told to disconnect"
-    );
-
     let connections = client_connections.read().await;
-    assert!(!connections.contains_key("conn_existing"));
+    if expect_takeover {
+        let disconnect_signal = disconnect_rx.recv().await;
+        assert!(
+            disconnect_signal.is_some(),
+            "idle old client should be told to disconnect"
+        );
+        assert!(!connections.contains_key("conn_existing"));
+    } else {
+        assert!(
+            disconnect_rx.try_recv().is_err(),
+            "processing old client must retain ownership of its task"
+        );
+        let owner = connections
+            .get("conn_existing")
+            .expect("processing owner must stay connected");
+        assert!(owner.is_processing);
+        assert_eq!(owner.current_tool_name.as_deref(), Some("bash"));
+    }
     assert_eq!(
         connections
             .get("conn_new")
@@ -155,6 +239,5 @@ async fn handle_resume_session_allows_reconnect_takeover_with_local_history() ->
         Some(target_session_id)
     );
 
-    restore_runtime_dir(prev_runtime);
     Ok(())
 }

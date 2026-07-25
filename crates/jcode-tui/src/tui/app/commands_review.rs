@@ -264,13 +264,49 @@ fn apply_judge_visible_context_if_needed(session: &mut Session, title_override: 
     let transcript = build_judge_visible_transcript_messages(&parent_session);
     session.replace_messages(transcript);
     session.compaction = None;
-    session.clear_context_graph_state();
     session.provider_session_id = None;
+    session.provider_session_identity = None;
 }
 
-pub(super) fn reset_current_session(app: &mut App) {
-    app.session.mark_closed();
-    let _ = app.session.save();
+pub(super) fn reset_current_session(app: &mut App) -> anyhow::Result<()> {
+    let old_session_id = app.session.id.clone();
+    let mut session = Session::create(None, None);
+    session.model = Some(app.provider.model());
+    session.provider_key = crate::session::derive_session_provider_key(app.provider.name());
+    session.autoreview_enabled = Some(app.autoreview_enabled);
+    session.autojudge_enabled = Some(app.autojudge_enabled);
+    session.ensure_initial_session_context_message();
+    session.status = crate::session::SessionStatus::Closed;
+    session.last_pid = None;
+    session.save()?;
+
+    let mut closed_old = app.session.clone();
+    closed_old.status = crate::session::SessionStatus::Closed;
+    closed_old.save()?;
+
+    session.status = crate::session::SessionStatus::Active;
+    session.last_pid = Some(std::process::id());
+    session.last_active_at = Some(chrono::Utc::now());
+    if let Err(error) = session.save() {
+        closed_old.status = crate::session::SessionStatus::Active;
+        closed_old.last_pid = Some(std::process::id());
+        let rollback = closed_old.save();
+        if rollback.is_ok() {
+            app.session = closed_old;
+        } else {
+            crate::storage::unregister_active_pid(&old_session_id);
+        }
+        anyhow::bail!(
+            "failed to activate cleared session: {error}; old-session rollback: {}",
+            rollback
+                .err()
+                .map_or_else(|| "ok".to_string(), |rollback| rollback.to_string())
+        );
+    }
+
+    crate::storage::unregister_active_pid(&old_session_id);
+    session.publish_active_presence();
+    app.session = session;
     app.clear_provider_messages();
     app.clear_display_messages();
     // A streaming mermaid preview (STREAMING_PREVIEW_DIAGRAM) belongs to the
@@ -293,18 +329,11 @@ pub(super) fn reset_current_session(app: &mut App) {
     app.pending_images.clear();
     app.active_skill = None;
     app.improve_mode = None;
-    let mut session = Session::create(None, None);
-    session.mark_active();
-    session.model = Some(app.provider.model());
-    session.provider_key = crate::session::derive_session_provider_key(app.provider.name());
-    session.autoreview_enabled = Some(app.autoreview_enabled);
-    session.autojudge_enabled = Some(app.autojudge_enabled);
-    session.ensure_initial_session_context_message();
-    app.session = session;
     app.set_side_panel_snapshot(crate::side_panel::SidePanelSnapshot::default());
     app.last_side_panel_focus_id = None;
     app.diff_pane_scroll_x = 0;
     app.provider_session_id = None;
+    Ok(())
 }
 
 fn observe_status_message(app: &App) -> String {
@@ -618,7 +647,7 @@ fn current_judge_model_override() -> (Option<String>, Option<String>) {
         .unwrap_or_else(|| (current_autojudge_model_override(), None))
 }
 
-fn clone_session_for_review(
+pub(super) fn clone_session_for_review(
     app: &App,
     session_title: &str,
     initial_model: String,
@@ -626,8 +655,7 @@ fn clone_session_for_review(
 ) -> anyhow::Result<(String, String)> {
     let parent_session_id = current_feedback_target_session_id(app);
     let mut child = Session::create(Some(parent_session_id), Some(session_title.to_string()));
-    child.replace_messages(app.session.messages.clone());
-    child.compaction = app.session.compaction.clone();
+    child.inherit_context_continuity_from(&app.session)?;
     child.working_dir = app.session.working_dir.clone();
     child.model = Some(initial_model);
     child.provider_key = provider_key_override.or_else(|| app.session.provider_key.clone());
@@ -639,11 +667,10 @@ fn clone_session_for_review(
     Ok((child.id.clone(), child.display_name().to_string()))
 }
 
-fn clone_session_for_prompt(app: &App) -> anyhow::Result<(String, String)> {
+pub(super) fn clone_session_for_prompt(app: &App) -> anyhow::Result<(String, String)> {
     let parent_session_id = active_session_id(app);
     let mut child = Session::create(Some(parent_session_id.clone()), None);
-    child.replace_messages(app.session.messages.clone());
-    child.compaction = app.session.compaction.clone();
+    child.inherit_context_continuity_from(&app.session)?;
     child.working_dir = app.session.working_dir.clone();
     child.model = app.session.model.clone();
     child.provider_key = app.session.provider_key.clone();

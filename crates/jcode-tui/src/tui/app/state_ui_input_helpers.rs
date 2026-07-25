@@ -2,7 +2,6 @@ use super::*;
 use crate::tui::core;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
 #[derive(Clone, Copy)]
 struct RegisteredCommand {
     name: &'static str,

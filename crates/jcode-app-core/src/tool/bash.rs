@@ -93,24 +93,15 @@ fn progress_percent_regex() -> Result<&'static regex::Regex> {
 
 #[derive(Deserialize)]
 struct ProgressMarker {
-    #[serde(default)]
     percent: Option<f32>,
-    #[serde(default)]
     message: Option<String>,
-    #[serde(default)]
     current: Option<u64>,
-    #[serde(default)]
     total: Option<u64>,
-    #[serde(default)]
     unit: Option<String>,
-    #[serde(default)]
     eta_seconds: Option<u64>,
-    #[serde(default)]
     kind: Option<String>,
-    #[serde(default)]
     checkpoint: Option<bool>,
 }
-
 fn task_id_from_output_path(path: &Path) -> Option<&str> {
     path.file_stem()?.to_str()
 }
@@ -470,12 +461,10 @@ fn configure_tool_scratch(command: &mut TokioCommand) {
     }
 }
 
-#[cfg(unix)]
 struct ProcessGroupKillGuard {
     pid: Option<u32>,
 }
 
-#[cfg(unix)]
 impl ProcessGroupKillGuard {
     fn new(pid: Option<u32>) -> Self {
         Self { pid }
@@ -486,11 +475,14 @@ impl ProcessGroupKillGuard {
     }
 }
 
-#[cfg(unix)]
 impl Drop for ProcessGroupKillGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.pid {
-            let _ = crate::platform::signal_detached_process_group(pid, libc::SIGKILL);
+            #[cfg(unix)]
+            let signal = libc::SIGKILL;
+            #[cfg(windows)]
+            let signal = 0;
+            let _ = crate::platform::signal_detached_process_group(pid, signal);
         }
     }
 }
@@ -872,7 +864,7 @@ impl BashTool {
                         params.wake,
                         work_handle,
                     )
-                    .await;
+                    .await?;
 
                 let output = format!(
                     "Command exceeded the foreground timeout after {:.1}s and is continuing in background (not killed).\n\n\
@@ -944,10 +936,16 @@ impl BashTool {
 
         let mut child = crate::platform::spawn_detached(&mut cmd)?;
         let pid = child.id();
+        // `spawn_detached` creates a process group that outlives a dropped
+        // `Child`. Keep an armed kill guard from the first instruction after
+        // spawn until either the process exits or durable background ownership
+        // has been recorded. Cancellation can therefore never orphan the gap.
+        let mut process_group_guard = ProcessGroupKillGuard::new(Some(pid));
         let shutdown_signal = ctx.graceful_shutdown_signal.clone();
 
         loop {
             if let Some(status) = child.try_wait()? {
+                process_group_guard.disarm();
                 let output = tokio::fs::read_to_string(&info.output_file)
                     .await
                     .unwrap_or_default();
@@ -976,7 +974,8 @@ impl BashTool {
                         params.notify,
                         params.wake,
                     )
-                    .await;
+                    .await?;
+                process_group_guard.disarm();
 
                 let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
                 let output = format!(
@@ -1033,7 +1032,8 @@ impl BashTool {
                         params.notify,
                         params.wake,
                     )
-                    .await;
+                    .await?;
+                process_group_guard.disarm();
                 let output = format!(
                     "Command continued in background due to reload.\n\nTask ID: {}\nOutput file: {}\nStatus file: {}\n\nUse `bg` with action=\"wait\" and task_id=\"{}\" after reload to wait for completion or the next progress checkpoint.",
                     info.task_id,

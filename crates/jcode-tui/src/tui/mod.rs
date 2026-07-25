@@ -1,6 +1,5 @@
 pub mod account_picker;
 pub(crate) mod app;
-
 #[derive(Clone)]
 pub struct ContextSnapshot {
     pub info: Option<crate::prompt::ContextInfo>,

@@ -125,6 +125,16 @@ fn clone_split_session_uses_persisted_session_state() {
             cache_control: None,
         }],
     );
+    parent.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "archived parent branch".to_string(),
+            cache_control: None,
+        }],
+    );
+    parent
+        .rewind_active_branch_through(0)
+        .expect("rewind parent before split");
     parent.compaction = Some(crate::session::StoredCompactionState {
         summary_text: "summary".to_string(),
         openai_encrypted_content: None,
@@ -159,6 +169,26 @@ fn clone_split_session_uses_persisted_session_state() {
         "fork notice should mention the parent session: {fork_notice_text}"
     );
     assert_eq!(child.compaction, parent.compaction);
+    assert_eq!(child.archived_message_ids, parent.archived_message_ids);
+    assert!(
+        child
+            .messages
+            .iter()
+            .any(|message| { message.content_preview() == "archived parent branch" })
+    );
+    assert!(
+        child
+            .messages_for_provider_uncached()
+            .iter()
+            .all(|message| {
+                message.content.iter().all(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Text { text, .. } if text.contains("archived parent branch")
+                    )
+                })
+            })
+    );
     assert_eq!(child.working_dir, parent.working_dir);
     assert_eq!(child.model, parent.model);
     assert_eq!(child.status, crate::session::SessionStatus::Closed);

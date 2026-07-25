@@ -128,145 +128,8 @@ static WEBSOCKET_FAILURE_STREAKS: LazyLock<Arc<RwLock<HashMap<String, u32>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 static WEBSOCKET_PING_ID: AtomicU64 = AtomicU64::new(1);
 
-#[expect(
-    clippy::upper_case_acronyms,
-    reason = "transport names mirror user-facing configuration values like https and websocket"
-)]
-#[derive(Clone, Copy)]
-enum OpenAITransportMode {
-    Auto,
-    WebSocket,
-    HTTPS,
-}
-
-impl OpenAITransportMode {
-    fn from_config(raw: Option<&str>) -> Self {
-        let Some(raw) = raw else {
-            return Self::Auto;
-        };
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" | "" => Self::Auto,
-            "websocket" | "ws" | "wss" => Self::WebSocket,
-            "https" | "http" | "sse" => Self::HTTPS,
-            other => {
-                jcode_base::logging::warn(&format!(
-                    "Unknown JCODE_OPENAI_TRANSPORT '{}'; using auto. Use: auto, websocket, or https.",
-                    other
-                ));
-                Self::Auto
-            }
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::WebSocket => "websocket",
-            Self::HTTPS => "https",
-        }
-    }
-}
-
-#[derive(Debug)]
-enum OpenAIStreamFailure {
-    FallbackToHttps(anyhow::Error),
-    Other(anyhow::Error),
-}
-
-impl From<anyhow::Error> for OpenAIStreamFailure {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Other(err)
-    }
-}
-
-#[expect(
-    clippy::upper_case_acronyms,
-    reason = "transport names mirror user-facing configuration values like https and websocket"
-)]
-#[derive(Clone, Copy)]
-enum OpenAITransport {
-    WebSocket,
-    HTTPS,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenAINativeCompactionMode {
-    Auto,
-    Explicit,
-    Off,
-}
-
-/// Shared dual-auth credential pin (see `jcode_provider_core::CredentialMode`).
-/// The OpenAI-specific alias is kept so existing call sites read naturally.
-pub(crate) use jcode_provider_core::CredentialMode as OpenAICredentialMode;
-
-/// Load Codex credentials for the given credential pin.
-pub(crate) fn load_credentials_for_mode(mode: OpenAICredentialMode) -> Result<CodexCredentials> {
-    match mode {
-        OpenAICredentialMode::Auto => jcode_base::auth::codex::load_credentials(),
-        OpenAICredentialMode::OAuth => jcode_base::auth::codex::load_oauth_credentials(),
-        OpenAICredentialMode::ApiKey => jcode_base::auth::codex::load_api_key_credentials(),
-    }
-}
-
-impl OpenAINativeCompactionMode {
-    fn from_config(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" | "" => Self::Auto,
-            "explicit" | "manual" => Self::Explicit,
-            "off" | "disabled" | "none" => Self::Off,
-            other => {
-                jcode_base::logging::warn(&format!(
-                    "Unknown OpenAI native compaction mode '{}'; using auto. Use: auto, explicit, or off.",
-                    other
-                ));
-                Self::Auto
-            }
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Explicit => "explicit",
-            Self::Off => "off",
-        }
-    }
-}
-
-impl OpenAITransport {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::WebSocket => "websocket",
-            Self::HTTPS => "https",
-        }
-    }
-}
-
-fn log_openai_stream_lifecycle(
-    level: jcode_base::logging::LogLevel,
-    phase: &str,
-    fields: Vec<(&str, String)>,
-) {
-    let mut owned = vec![
-        ("phase".to_string(), phase.to_string()),
-        ("provider".to_string(), "openai".to_string()),
-    ];
-    owned.extend(
-        fields
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value)),
-    );
-    jcode_base::logging::event(level, "PROVIDER_STREAM_LIFECYCLE", owned);
-}
-
-fn openai_request_model(request: &Value) -> String {
-    request
-        .get("model")
-        .and_then(|model| model.as_str())
-        .unwrap_or("unknown")
-        .to_string()
-}
+mod runtime_config;
+use runtime_config::*;
 
 /// Persistent WebSocket connection state for incremental continuation.
 /// Keeps the connection alive across turns so we can use `previous_response_id`
@@ -274,6 +137,10 @@ fn openai_request_model(request: &Value) -> String {
 struct PersistentWsState {
     ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     last_response_id: String,
+    /// Exact provider/runtime identity generation under which
+    /// `last_response_id` was created. A mismatch must discard the chain before
+    /// the ID can be sent back to OpenAI.
+    response_chain_generation: u64,
     connected_at: Instant,
     last_activity_at: Instant,
     /// Last completed model response. Unlike `last_activity_at`, background
@@ -714,6 +581,10 @@ pub struct OpenAIProvider {
     websocket_failure_streaks: Arc<RwLock<HashMap<String, u32>>>,
     /// Persistent WebSocket connection for incremental continuation
     persistent_ws: Arc<Mutex<Option<PersistentWsState>>>,
+    /// Advances synchronously whenever an input that defines provider-session
+    /// identity changes. This remains authoritative even when best-effort
+    /// socket cleanup cannot acquire the async state lock.
+    response_chain_generation: Arc<AtomicU64>,
     /// Browser-backed ChatGPT state for web-only models such as GPT-5.6 Pro.
     chatgpt_web: Arc<chatgpt_web::ChatGptWebState>,
     /// True when this runtime was created without API credentials. It can still
@@ -858,6 +729,7 @@ impl OpenAIProvider {
             websocket_cooldowns: Arc::clone(&WEBSOCKET_COOLDOWNS),
             websocket_failure_streaks: Arc::clone(&WEBSOCKET_FAILURE_STREAKS),
             persistent_ws: Arc::new(Mutex::new(None)),
+            response_chain_generation: Arc::new(AtomicU64::new(0)),
             chatgpt_web: Arc::new(chatgpt_web::ChatGptWebState::new()),
             browser_only: Arc::new(AtomicBool::new(browser_only)),
         };
@@ -890,34 +762,27 @@ impl OpenAIProvider {
             }
         }
 
-        self.clear_persistent_ws_try("credentials reloaded");
+        self.invalidate_response_chain_try("credentials reloaded");
     }
 
     pub(crate) fn set_credential_mode(&self, mode: OpenAICredentialMode) -> Result<()> {
         let credentials = load_credentials_for_mode(mode)?;
-        match self.credentials.try_write() {
-            Ok(mut guard) => {
-                *guard = credentials;
-                self.browser_only.store(false, AtomicOrdering::Release);
-                self.reload_cached_reasoning_efforts();
-            }
-            Err(_) => {
-                anyhow::bail!(
-                    "Cannot change OpenAI credential mode while a request is in progress"
-                );
-            }
-        }
-        match self.credential_mode.try_write() {
-            Ok(mut guard) => {
-                *guard = mode;
-            }
-            Err(_) => {
-                anyhow::bail!(
-                    "Cannot change OpenAI credential mode while a request is in progress"
-                );
-            }
-        }
-        self.clear_persistent_ws_try("OpenAI credential mode changed");
+        // Acquire both guards before mutating either field. A partial update can
+        // otherwise install credentials for one mode, fail to update the mode,
+        // and return before advancing the response-chain generation.
+        let mut credential_guard = self.credentials.try_write().map_err(|_| {
+            anyhow::anyhow!("Cannot change OpenAI credential mode while a request is in progress")
+        })?;
+        let mut mode_guard = self.credential_mode.try_write().map_err(|_| {
+            anyhow::anyhow!("Cannot change OpenAI credential mode while a request is in progress")
+        })?;
+        *credential_guard = credentials;
+        *mode_guard = mode;
+        self.browser_only.store(false, AtomicOrdering::Release);
+        drop(mode_guard);
+        drop(credential_guard);
+        self.reload_cached_reasoning_efforts();
+        self.invalidate_response_chain_try("OpenAI credential mode changed");
         // Keep the runtime provider identity in sync with the explicit credential
         // choice so UI surfaces report the auth method requests will actually use.
         // `Auto` leaves the existing identity untouched.
@@ -948,7 +813,9 @@ impl OpenAIProvider {
             .unwrap_or(OpenAICredentialMode::Auto)
     }
 
-    fn clear_persistent_ws_try(&self, reason: &str) {
+    fn invalidate_response_chain_try(&self, reason: &str) {
+        self.response_chain_generation
+            .fetch_add(1, AtomicOrdering::AcqRel);
         if let Ok(mut persistent_ws) = self.persistent_ws.try_lock() {
             if persistent_ws.is_some() {
                 jcode_base::logging::info(&format!(
@@ -958,6 +825,12 @@ impl OpenAIProvider {
             }
             *persistent_ws = None;
         }
+    }
+
+    async fn invalidate_response_chain(&self, reason: &str) {
+        self.response_chain_generation
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        self.clear_persistent_ws(reason).await;
     }
 
     async fn clear_persistent_ws(&self, reason: &str) {
@@ -1033,6 +906,9 @@ impl OpenAIProvider {
             Ok(mut effort) => *effort = None,
             Err(poisoned) => *poisoned.into_inner() = None,
         }
+        self.invalidate_response_chain_try(
+            "OpenAI reasoning effort revalidation reset the response chain",
+        );
     }
 
     /// Translate a stored reasoning effort into the value sent to the API.
@@ -1310,45 +1186,30 @@ impl OpenAIProvider {
 
         current.strip_suffix("[1m]").unwrap_or(&current).to_string()
     }
-
-    fn diagnostic_persistent_ws_summary(&self) -> String {
-        match self.persistent_ws.try_lock() {
-            Ok(guard) => guard
-                .as_ref()
-                .map(|state| state.diag_snapshot().log_fields())
-                .unwrap_or_else(|| PersistentWsDiagSnapshot::absent().log_fields()),
-            Err(_) => "persistent_ws=busy".to_string(),
-        }
-    }
-
-    pub fn diagnostic_state_summary(&self) -> String {
-        let transport_mode = self
-            .transport_mode
-            .try_read()
-            .map(|mode| mode.as_str().to_string())
-            .unwrap_or_else(|_| "busy".to_string());
-        format!(
-            "transport_mode={} {}",
-            transport_mode,
-            self.diagnostic_persistent_ws_summary()
-        )
-    }
 }
 
 #[path = "openai/stream.rs"]
 mod stream;
 
+use self::openai_stream_errors::is_retryable_error;
 #[cfg(test)]
 use self::openai_stream_runtime::try_persistent_ws_continuation;
-use self::openai_stream_runtime::{PersistentWsResult, is_retryable_error, openai_access_token};
+use self::openai_stream_runtime::{PersistentWsResult, openai_access_token};
 
 use self::stream::{OpenAIResponsesStream, parse_openai_response_event};
 #[cfg(test)]
 use self::stream::{handle_openai_output_item, parse_text_wrapped_tool_call};
 
 mod chatgpt_web;
+mod diagnostics;
+mod provider_helpers;
+use provider_helpers::*;
+#[path = "openai_native_compaction.rs"]
+mod openai_native_compaction;
 #[path = "openai_provider_impl.rs"]
 mod openai_provider_impl;
+#[path = "openai_stream_errors.rs"]
+mod openai_stream_errors;
 #[path = "openai_stream_runtime.rs"]
 mod openai_stream_runtime;
 
@@ -1374,3 +1235,6 @@ use self::websocket_health::{
 #[cfg(test)]
 #[path = "openai_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod openai_provider_impl_tests;

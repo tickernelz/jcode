@@ -1,0 +1,729 @@
+#[test]
+fn test_submit_input_adds_message() {
+    let mut app = create_test_app();
+
+    // Type and submit
+    app.handle_key(KeyCode::Char('h'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('i'), KeyModifiers::empty())
+        .unwrap();
+    app.submit_input();
+
+    // Check message was added to display
+    assert_eq!(app.display_messages().len(), 1);
+    assert_eq!(app.display_messages()[0].role, "user");
+    assert_eq!(app.display_messages()[0].content, "hi");
+
+    // Check processing state
+    assert!(app.is_processing());
+    assert!(app.pending_turn);
+    assert!(app.session_save_pending);
+    assert!(matches!(app.status(), ProcessingStatus::Sending));
+    assert!(app.elapsed().is_some());
+
+    // Input should be cleared
+    assert!(app.input().is_empty());
+}
+
+#[test]
+fn test_submit_input_commits_pending_streaming_assistant_text_before_user_message() {
+    let mut app = create_test_app();
+    app.display_messages.push(DisplayMessage::tool(
+        "file contents",
+        crate::message::ToolCall {
+            id: "tool_read".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"file_path": "src/main.rs"}),
+            intent: None, thought_signature: None, },
+    ));
+    app.bump_display_messages_version();
+    app.streaming.streaming_text = "Here is the final paragraph".to_string();
+    // Mirror the real streaming caller: append any paced chunk the buffer reveals.
+    // The paced StreamBuffer may reveal part of the text immediately, so commit
+    // (below) must still flush the remainder.
+    let ops = app.stream_buffer.push_text(" that was still buffered.");
+    app.apply_stream_ops(ops);
+
+    app.input = "follow up".to_string();
+    app.cursor_pos = app.input.len();
+    app.submit_input();
+
+    assert_eq!(app.display_messages().len(), 3);
+    assert_eq!(app.display_messages()[0].role, "tool");
+    assert_eq!(app.display_messages()[1].role, "assistant");
+    assert_eq!(
+        app.display_messages()[1].content,
+        "Here is the final paragraph that was still buffered."
+    );
+    assert_eq!(app.display_messages()[2].role, "user");
+    assert_eq!(app.display_messages()[2].content, "follow up");
+    assert!(app.streaming_text().is_empty());
+    assert!(app.stream_buffer.is_empty());
+}
+
+#[test]
+fn test_queue_message_while_processing() {
+    let mut app = create_test_app();
+    app.queue_mode = true;
+
+    // Simulate processing state
+    app.is_processing = true;
+
+    // Type a message
+    app.handle_key(KeyCode::Char('t'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('e'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('s'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('t'), KeyModifiers::empty())
+        .unwrap();
+
+    // Press Enter should queue, not submit
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.queued_count(), 1);
+    assert!(app.input().is_empty());
+
+    // Queued messages are stored in queued_messages, not display_messages
+    assert_eq!(app.queued_messages()[0], "test");
+    assert!(app.display_messages().is_empty());
+}
+
+#[test]
+fn test_ctrl_tab_toggles_queue_mode() {
+    let mut app = create_test_app();
+
+    assert!(!app.queue_mode);
+
+    app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert!(app.queue_mode);
+
+    app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert!(!app.queue_mode);
+}
+
+#[test]
+fn test_auto_poke_starts_enabled_by_default() {
+    let app = create_test_app();
+
+    assert!(app.auto_poke_incomplete_todos);
+}
+
+#[test]
+fn test_ctrl_p_toggles_auto_poke_locally() {
+    let mut app = create_test_app();
+
+    assert!(app.auto_poke_incomplete_todos);
+
+    app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert!(!app.auto_poke_incomplete_todos);
+    assert_eq!(app.status_notice(), Some("Poke: OFF".to_string()));
+
+    app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert!(app.auto_poke_incomplete_todos);
+    assert_eq!(app.status_notice(), Some("Poke: ON".to_string()));
+    assert!(app.display_messages().iter().any(|msg| {
+        msg.content
+            .contains("Auto-poke enabled. No incomplete todos found right now.")
+    }));
+}
+
+#[test]
+fn test_transfer_command_queues_pause_while_processing_locally() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    super::commands::handle_transfer_command_local(&mut app);
+
+    assert!(app.pending_transfer_request);
+    let pause_message = super::commands::transfer_pause_message();
+    assert_eq!(
+        app.interleave_message.as_deref(),
+        Some(pause_message.as_str())
+    );
+    assert_eq!(
+        app.status_notice(),
+        Some("Transfer queued after current turn".to_string())
+    );
+}
+
+#[test]
+fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_context_only() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.session.working_dir = Some("/tmp".to_string());
+        app.session.model = Some("test-model".to_string());
+        app.session.provider_key = Some("test-provider".to_string());
+        app.session.messages.push(crate::session::StoredMessage {
+            id: "msg-1".to_string(),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "full transcript should not be copied".to_string(),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+        let transfer_compaction = crate::session::StoredCompactionState {
+            summary_text: "Compacted handoff summary".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 1,
+            original_turn_count: 1,
+            compacted_count: 0,
+        };
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                group: None,
+                id: "todo-1".to_string(),
+                content: "Carry this forward".to_string(),
+                status: "pending".to_string(),
+                priority: "high".to_string(),
+                blocked_by: Vec::new(),
+                assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
+                confidence_history: Vec::new(),
+            }],
+        )
+        .expect("save todos");
+
+        let (child_id, _) = super::commands::create_transfer_session_from_parent(
+            &app.session.id,
+            &app.session,
+            Some(transfer_compaction.clone()),
+            None,
+            crate::config::CompactionEngine::Rolling,
+        )
+        .expect("create transfer session");
+        let child = crate::session::Session::load(&child_id).expect("load child session");
+        let child_todos = crate::todo::load_todos(&child_id).expect("load child todos");
+
+        assert_eq!(child.parent_id.as_deref(), Some(app.session.id.as_str()));
+        assert!(child.messages.is_empty());
+        assert_eq!(child.compaction, Some(transfer_compaction));
+        assert_eq!(child.model.as_deref(), Some("test-model"));
+        assert_eq!(child.provider_key.as_deref(), Some("test-provider"));
+        assert_eq!(child.working_dir.as_deref(), Some("/tmp"));
+        assert_eq!(child_todos.len(), 1);
+        assert_eq!(child_todos[0].content, "Carry this forward");
+    });
+}
+
+#[test]
+fn test_shift_enter_inserts_newline() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    app.handle_key(KeyCode::Char('h'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::SHIFT).unwrap();
+    app.handle_key(KeyCode::Char('i'), KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.input(), "h\ni");
+    assert_eq!(app.queued_count(), 0);
+    assert_eq!(app.interleave_message.as_deref(), None);
+}
+
+#[test]
+fn test_alt_enter_inserts_newline() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    app.handle_key(KeyCode::Char('h'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::ALT).unwrap();
+    app.handle_key(KeyCode::Char('i'), KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.input(), "h\ni");
+    assert_eq!(app.queued_count(), 0);
+    assert_eq!(app.interleave_message.as_deref(), None);
+}
+#[test]
+fn test_ctrl_enter_opposite_send_mode() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    // Default immediate mode: Ctrl+Enter should queue
+    app.handle_key(KeyCode::Char('h'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('i'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL)
+        .unwrap();
+
+    assert_eq!(app.queued_count(), 1);
+    assert_eq!(app.interleave_message.as_deref(), None);
+    assert!(app.input().is_empty());
+
+    // Queue mode: Ctrl+Enter should interleave (sets interleave_message, not queued)
+    app.queue_mode = true;
+    app.handle_key(KeyCode::Char('y'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('o'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL)
+        .unwrap();
+
+    // Interleave now sets interleave_message instead of adding to queue
+    assert_eq!(app.queued_count(), 1); // Still just "hi" in queue
+    assert_eq!(app.interleave_message.as_deref(), Some("yo")); // "yo" is for interleave
+}
+
+#[test]
+fn test_cmd_enter_opposite_send_mode() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    // Default immediate mode: Cmd+Enter should queue, matching Ctrl+Enter
+    app.handle_key(KeyCode::Char('h'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('i'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::SUPER).unwrap();
+
+    assert_eq!(app.queued_count(), 1);
+    assert_eq!(app.interleave_message.as_deref(), None);
+    assert!(app.input().is_empty());
+
+    // Queue mode: Cmd+Enter should interleave (sets interleave_message, not queued)
+    app.queue_mode = true;
+    app.handle_key(KeyCode::Char('y'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('o'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::SUPER).unwrap();
+
+    assert_eq!(app.queued_count(), 1); // Still just "hi" in queue
+    assert_eq!(app.interleave_message.as_deref(), Some("yo")); // "yo" is for interleave
+}
+
+#[test]
+fn test_typing_during_processing() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    // Should still be able to type
+    app.handle_key(KeyCode::Char('a'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('b'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.input(), "abc");
+}
+
+#[test]
+fn test_ctrl_c_requests_cancel_while_processing() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.interleave_message = Some("queued interrupt".to_string());
+    app.pending_soft_interrupts
+        .push("pending soft interrupt".to_string());
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    assert!(app.cancel_requested);
+    assert!(app.interleave_message.is_none());
+    assert!(app.pending_soft_interrupts.is_empty());
+    assert_eq!(app.status_notice(), Some("Interrupting...".to_string()));
+}
+
+#[test]
+fn test_escape_interrupt_disables_auto_poke_while_processing() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.auto_poke_incomplete_todos = true;
+    app.queued_messages
+        .push(super::commands::build_poke_message(&[
+            crate::todo::TodoItem {
+                group: None,
+                id: "todo-1".to_string(),
+                content: "keep going".to_string(),
+                status: "pending".to_string(),
+                priority: "high".to_string(),
+                blocked_by: Vec::new(),
+                assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
+                confidence_history: Vec::new(),
+            },
+        ]));
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::empty()).unwrap();
+
+    assert!(app.cancel_requested);
+    assert!(!app.auto_poke_incomplete_todos);
+    assert!(app.queued_messages.is_empty());
+    assert_eq!(
+        app.status_notice(),
+        Some("Interrupting... Auto-poke OFF".to_string())
+    );
+}
+
+#[test]
+fn test_ctrl_c_still_arms_quit_when_idle() {
+    let mut app = create_test_app();
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    assert!(!app.cancel_requested);
+    assert!(app.quit_pending.is_some());
+    assert_eq!(
+        app.status_notice(),
+        Some("Press Ctrl+C again to quit".to_string())
+    );
+}
+
+#[test]
+fn test_ctrl_x_cuts_entire_input_line_to_clipboard() {
+    let mut app = create_test_app();
+    app.input = "hello world".to_string();
+    app.cursor_pos = 5;
+
+    let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let copied_for_closure = copied.clone();
+
+    let cut = super::input::cut_input_line_to_clipboard_with(&mut app, |text| {
+        *copied_for_closure.lock().unwrap() = text.to_string();
+        true
+    });
+
+    assert!(cut);
+    assert_eq!(&*copied.lock().unwrap(), "hello world");
+    assert!(app.input().is_empty());
+    assert_eq!(app.cursor_pos(), 0);
+    assert_eq!(app.status_notice(), Some("✂ Cut input line".to_string()));
+
+    app.handle_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert_eq!(app.input(), "hello world");
+    assert_eq!(app.cursor_pos(), 5);
+}
+
+#[test]
+fn test_ctrl_x_preserves_input_when_clipboard_copy_fails() {
+    let mut app = create_test_app();
+    app.input = "hello world".to_string();
+    app.cursor_pos = 5;
+
+    let cut = super::input::cut_input_line_to_clipboard_with(&mut app, |_text| false);
+
+    assert!(!cut);
+    assert_eq!(app.input(), "hello world");
+    assert_eq!(app.cursor_pos(), 5);
+    assert_eq!(
+        app.status_notice(),
+        Some("Failed to copy input line".to_string())
+    );
+}
+
+#[test]
+fn test_ctrl_a_keeps_home_behavior_when_input_present() {
+    let mut app = create_test_app();
+    app.input = "hello world".to_string();
+    app.cursor_pos = app.input.len();
+
+    app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    assert_eq!(app.input(), "hello world");
+    assert_eq!(app.cursor_pos(), 0);
+}
+
+#[test]
+fn test_retrieve_pending_message_edits_queued_message() {
+    let mut app = create_test_app();
+    app.queue_mode = true;
+    app.is_processing = true;
+
+    // Type and queue a message
+    app.handle_key(KeyCode::Char('h'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('e'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('l'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('l'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('o'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.queued_count(), 1);
+    assert!(app.input().is_empty());
+
+    app.handle_key(KeyCode::Up, KeyModifiers::CONTROL).unwrap();
+
+    assert_eq!(app.queued_count(), 0);
+    assert_eq!(app.input(), "hello");
+    assert_eq!(app.cursor_pos(), 5); // Cursor at end
+}
+
+#[test]
+fn test_retrieve_pending_message_with_alt_and_super_up() {
+    // Ctrl+Up, Alt(Option)+Up and Cmd(Super)+Up must all recall a queued message
+    // so the gesture works regardless of which modifier the terminal forwards.
+    for modifier in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
+        let mut app = create_test_app();
+        app.queue_mode = true;
+        app.is_processing = true;
+
+        for c in "hello".chars() {
+            app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+                .unwrap();
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(app.queued_count(), 1, "modifier {modifier:?}");
+        assert!(app.input().is_empty(), "modifier {modifier:?}");
+
+        app.handle_key(KeyCode::Up, modifier).unwrap();
+
+        assert_eq!(app.queued_count(), 0, "modifier {modifier:?}");
+        assert_eq!(app.input(), "hello", "modifier {modifier:?}");
+        assert_eq!(app.cursor_pos(), 5, "modifier {modifier:?}");
+    }
+}
+
+#[test]
+fn test_retrieve_pending_message_prefers_pending_interleave_for_editing() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.queue_mode = false; // Enter=interleave, Ctrl+Enter=queue
+
+    for c in "urgent".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    for c in "later".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::CONTROL)
+        .unwrap();
+
+    assert_eq!(app.interleave_message.as_deref(), Some("urgent"));
+    assert_eq!(app.queued_count(), 1);
+
+    app.retrieve_pending_message_for_edit();
+
+    assert_eq!(app.input(), "urgent\n\nlater");
+    assert_eq!(app.interleave_message.as_deref(), None);
+    assert_eq!(app.queued_count(), 0);
+}
+
+#[test]
+fn test_send_action_modes() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.queue_mode = false;
+
+    assert_eq!(app.send_action(false), SendAction::Interleave);
+    assert_eq!(app.send_action(true), SendAction::Queue);
+
+    app.queue_mode = true;
+    assert_eq!(app.send_action(false), SendAction::Queue);
+    assert_eq!(app.send_action(true), SendAction::Interleave);
+
+    app.is_processing = false;
+    assert_eq!(app.send_action(false), SendAction::Submit);
+}
+
+#[test]
+fn test_send_action_submits_bang_commands_while_processing() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.input = "!pwd".to_string();
+
+    assert_eq!(app.send_action(false), SendAction::Submit);
+    assert_eq!(app.send_action(true), SendAction::Submit);
+}
+
+#[test]
+fn test_handle_input_shell_completed_renders_markdown_blocks() {
+    let mut app = create_test_app();
+    let event = BusEvent::InputShellCompleted(InputShellCompleted {
+        session_id: app.session.id.clone(),
+        result: crate::message::InputShellResult {
+            command: "ls -la".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            output: "Cargo.toml\nsrc\n".to_string(),
+            exit_code: Some(0),
+            duration_ms: 42,
+            truncated: false,
+            failed_to_start: false,
+        },
+    });
+
+    super::local::handle_bus_event(&mut app, Ok(event));
+
+    let rendered = app.display_messages().last().expect("shell result message");
+    assert_eq!(rendered.role, "system");
+    assert!(rendered.content.contains("Shell command"));
+    assert!(rendered.content.contains("ls -la"));
+    assert!(rendered.content.contains("Cargo.toml"));
+    assert_eq!(
+        app.status_notice(),
+        Some("Shell command completed".to_string())
+    );
+}
+
+/// Regression for issue #427: selecting an effort-variant model row (e.g.
+/// "gpt-5.5 (high)") in the remote model picker must stage the chosen effort
+/// alongside the pending model switch. Previously only the model spec was
+/// staged, so the server kept its configured default effort (low) and the
+/// session silently ran gpt-5.5 at low effort.
+#[test]
+fn test_model_picker_effort_variant_selection_stages_effort_in_remote_mode() {
+    let mut app = create_test_app();
+    configure_test_remote_models_with_openai_recommendations(&mut app);
+
+    app.open_model_picker();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("model picker should be open");
+
+    let entry_idx = picker
+        .entries
+        .iter()
+        .position(|m| m.name == "gpt-5.5 (high)")
+        .expect("gpt-5.5 (high) should be in picker");
+    assert_eq!(
+        picker.entries[entry_idx].effort.as_deref(),
+        Some("high"),
+        "effort variant rows must carry their effort"
+    );
+
+    let filtered_pos = picker
+        .filtered
+        .iter()
+        .position(|&i| i == entry_idx)
+        .expect("gpt-5.5 (high) should be in filtered list");
+    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(app.inline_interactive_state.is_none(), "picker should close");
+    assert!(
+        app.pending_route_selection.is_some(),
+        "model switch should be staged for the remote dispatcher"
+    );
+    assert_eq!(
+        app.pending_reasoning_effort.as_deref(),
+        Some("high"),
+        "the picked effort variant must be staged so it reaches the server (issue #427)"
+    );
+}
+
+#[test]
+fn test_model_picker_effort_variants_follow_each_route_vocabulary() {
+    let mut app = create_test_app();
+    configure_test_remote_models_with_openai_recommendations(&mut app);
+    app.remote_model_options.push(crate::provider::ModelRoute {
+        model: "gpt-5.5".to_string(),
+        provider: "OpenRouter".to_string(),
+        api_method: "openrouter".to_string(),
+        available: true,
+        detail: String::new(),
+        cheapness: None,
+    });
+
+    app.open_model_picker();
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("model picker should be open");
+    let has_route_effort = |api_method: &str, effort: &str| {
+        picker.entries.iter().any(|entry| {
+            entry.name.starts_with("gpt-5.5 (")
+                && entry.effort.as_deref() == Some(effort)
+                && entry
+                    .options
+                    .first()
+                    .is_some_and(|route| route.api_method == api_method)
+        })
+    };
+
+    assert!(has_route_effort("openai-oauth", "max"));
+    assert!(has_route_effort("openai-oauth", "minimal"));
+    assert!(has_route_effort("openrouter", "xhigh"));
+    assert!(has_route_effort("openrouter", "minimal"));
+    assert!(
+        !has_route_effort("openrouter", "max"),
+        "OpenRouter must not advertise max as a distinct rung because it aliases xhigh"
+    );
+}
+
+/// Plain model rows (no effort suffix) must not stage a reasoning effort.
+/// Routes whose runtime cannot apply a reasoning effort (e.g. Copilot) get
+/// plain rows even for models that have an effort ladder elsewhere.
+#[test]
+fn test_model_picker_plain_selection_stages_no_effort_in_remote_mode() {
+    let mut app = create_test_app();
+    configure_test_remote_models_with_openai_recommendations(&mut app);
+    // A Copilot-backed route cannot apply per-request reasoning effort, so it
+    // must render as a plain row (issue #458 route gating).
+    app.remote_model_options.push(crate::provider::ModelRoute {
+        model: "claude-opus-4-8".to_string(),
+        provider: "Copilot".to_string(),
+        api_method: "copilot".to_string(),
+        available: true,
+        detail: String::new(),
+        cheapness: None,
+    });
+
+    app.open_model_picker();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("model picker should be open");
+
+    let entry_idx = picker
+        .entries
+        .iter()
+        .position(|m| m.name == "claude-opus-4-8" && m.effort.is_none())
+        .expect("claude-opus-4-8 should be in picker without an effort variant");
+
+    let filtered_pos = picker
+        .filtered
+        .iter()
+        .position(|&i| i == entry_idx)
+        .expect("claude-opus-4-8 should be in filtered list");
+    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(app.inline_interactive_state.is_none(), "picker should close");
+    assert!(
+        app.pending_reasoning_effort.is_none(),
+        "plain rows must not override the server's effort"
+    );
+}

@@ -1,6 +1,31 @@
 use super::*;
 use crate::tui::connection_type_icon;
 
+fn restore_provider_identity(
+    provider: &dyn Provider,
+    route_request: &str,
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<()> {
+    let route_result = crate::provider::set_model_with_auth_refresh(provider, route_request)
+        .map_err(|error| anyhow::anyhow!("route rollback via '{route_request}' failed: {error}"));
+    let rollback_effort = reasoning_effort.unwrap_or("");
+    let effort_result = if reasoning_effort.is_some() || provider.reasoning_effort().is_some() {
+        provider
+            .set_reasoning_effort(rollback_effort)
+            .map_err(|error| {
+                anyhow::anyhow!("reasoning rollback to '{rollback_effort}' failed: {error}")
+            })
+    } else {
+        Ok(())
+    };
+    match (route_result, effort_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(route), Ok(())) => Err(route),
+        (Ok(()), Err(effort)) => Err(effort),
+        (Err(route), Err(effort)) => Err(anyhow::anyhow!("{route}; {effort}")),
+    }
+}
+
 impl App {
     /// Create an App instance for replay mode (playing back a saved session)
     pub fn new_for_replay(session: crate::session::Session) -> Self {
@@ -296,10 +321,114 @@ impl App {
 
     /// Restore a previous session (for hot-reload)
     pub fn restore_session(&mut self, session_id: &str) {
-        if let Some(restored) = Self::restore_input_for_reload(session_id) {
-            self.apply_restored_reload_input(restored);
-        }
-        if let Ok(session) = Session::load(session_id) {
+        if let Ok(mut session) = Session::load(session_id) {
+            let previous_session_id = self.session.id.clone();
+            let previous_model = self
+                .session
+                .model
+                .clone()
+                .unwrap_or_else(|| self.provider.model());
+            let previous_route_request =
+                crate::provider::MultiProvider::model_switch_request_for_session_route(
+                    &previous_model,
+                    self.session.provider_key.as_deref(),
+                    self.session.route_api_method.as_deref(),
+                );
+            let previous_effort = self.provider.reasoning_effort();
+
+            // Provider-side resumable IDs do not survive a local process
+            // restart. Persist the cleared ID and exact route before publishing
+            // any restored state or success UI.
+            session.provider_session_id = None;
+            let mut closed_previous = None;
+            let restore_identity = (|| -> anyhow::Result<String> {
+                if let Some(model) = session.model.clone() {
+                    let model_request =
+                        crate::provider::MultiProvider::model_switch_request_for_session_route(
+                            &model,
+                            session.provider_key.as_deref(),
+                            session.route_api_method.as_deref(),
+                        );
+                    crate::provider::set_model_with_auth_refresh(
+                        self.provider.as_ref(),
+                        &model_request,
+                    )?;
+                } else {
+                    session.model = Some(self.provider.model());
+                }
+                let target_effort = session.reasoning_effort.as_deref().unwrap_or("");
+                if session.reasoning_effort.is_some()
+                    || previous_effort.is_some()
+                    || !self.provider.available_efforts().is_empty()
+                {
+                    self.provider.set_reasoning_effort(target_effort)?;
+                }
+                let active_model = self.provider.model();
+                if previous_session_id != session.id {
+                    crate::session::begin_session_handoff(&self.session, &session)?;
+                    let mut candidate = self.session.clone();
+                    candidate.status = crate::session::SessionStatus::Closed;
+                    candidate.last_active_at = Some(chrono::Utc::now());
+                    if let Err(error) = candidate.save() {
+                        crate::session::finish_session_handoff(&previous_session_id);
+                        return Err(error);
+                    }
+                    closed_previous = Some(candidate);
+                }
+                session.status = crate::session::SessionStatus::Active;
+                session.last_pid = Some(std::process::id());
+                session.last_active_at = Some(chrono::Utc::now());
+                if let Err(error) = session.save() {
+                    let rollback = if let Some(mut previous) = closed_previous.take() {
+                        previous.status = self.session.status.clone();
+                        previous.last_pid = self.session.last_pid;
+                        previous.last_active_at = self.session.last_active_at;
+                        match previous.save() {
+                            Ok(()) => {
+                                self.session = previous;
+                                "ok".to_string()
+                            }
+                            Err(rollback_error) => {
+                                crate::storage::unregister_active_pid(&previous_session_id);
+                                rollback_error.to_string()
+                            }
+                        }
+                    } else {
+                        "not needed".to_string()
+                    };
+                    crate::session::finish_session_handoff(&previous_session_id);
+                    anyhow::bail!(
+                        "Failed to activate restored session: {error}; previous-session rollback: {rollback}"
+                    );
+                }
+                Ok(active_model)
+            })();
+            let active_model = match restore_identity {
+                Ok(model) => model,
+                Err(error) => {
+                    let rollback = restore_provider_identity(
+                        self.provider.as_ref(),
+                        &previous_route_request,
+                        previous_effort.as_deref(),
+                    );
+                    let rollback_failed = rollback.is_err();
+                    self.push_display_message(DisplayMessage::error(format!(
+                        "Failed to restore exact durable session identity: {error}; provider rollback: {}",
+                        rollback.map_or_else(
+                            |rollback| rollback.to_string(),
+                            |()| "ok".to_string()
+                        )
+                    )));
+                    if rollback_failed {
+                        self.set_status_notice(
+                            "Unsafe provider identity after restore failure; shutting down",
+                        );
+                        self.should_quit = true;
+                    }
+                    return;
+                }
+            };
+
             // Count stats before restoring
             let mut user_turns = 0;
             let mut assistant_turns = 0;
@@ -318,51 +447,19 @@ impl App {
                 self.push_display_message(item);
             }
 
-            // Don't restore provider_session_id - Claude sessions don't persist across
-            // process restarts. The messages are restored, so Claude will get full context.
             self.provider_session_id = None;
             self.session = session;
+            crate::storage::unregister_active_pid(&previous_session_id);
+            self.session.publish_active_presence();
+            crate::session::finish_session_handoff(&previous_session_id);
+            if let Some(restored) = Self::restore_input_for_reload(session_id) {
+                self.apply_restored_reload_input(restored);
+            }
             crate::memory::sync_injected_memories(
                 &self.session.id,
                 &self.session.injected_memory_ids(),
             );
-            // Clear the saved provider_session_id since it's no longer valid
-            self.session.provider_session_id = None;
-            let mut restored_model = false;
-            if let Some(model) = self.session.model.clone() {
-                let model_request =
-                    crate::provider::MultiProvider::model_switch_request_for_session_route(
-                        &model,
-                        self.session.provider_key.as_deref(),
-                        self.session.route_api_method.as_deref(),
-                    );
-                if let Err(e) = crate::provider::set_model_with_auth_refresh(
-                    self.provider.as_ref(),
-                    &model_request,
-                ) {
-                    self.push_display_message(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!(
-                            "⚠ Failed to restore model '{}' via '{}': {}",
-                            model, model_request, e
-                        ),
-                        tool_calls: vec![],
-                        duration_secs: None,
-                        title: None,
-                        tool_data: None,
-                    });
-                } else {
-                    restored_model = true;
-                }
-            }
-
-            let active_model = self.provider.model();
-            if restored_model || self.session.model.is_none() {
-                self.session.model = Some(active_model.clone());
-            }
             self.update_context_limit_for_model(&active_model);
-            // Mark session as active now that it's being used again
-            self.session.mark_active();
             self.set_side_panel_snapshot(
                 crate::side_panel::snapshot_for_session(session_id).unwrap_or_default(),
             );
@@ -479,11 +576,10 @@ impl App {
     /// 2. Last assistant message ends with "[generation interrupted - server reloading]"
     pub(super) fn was_interrupted_by_reload(&self) -> bool {
         use crate::message::{ContentBlock, Role};
-        let messages = &self.session.messages;
-        if messages.is_empty() {
+        let messages = self.session.active_stored_messages();
+        let Some(last) = messages.last() else {
             return false;
-        }
-        let last = &messages[messages.len() - 1];
+        };
         match last.role {
             Role::User => last.content.iter().any(|block| match block {
                 ContentBlock::ToolResult {

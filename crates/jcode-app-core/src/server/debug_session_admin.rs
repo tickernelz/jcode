@@ -111,12 +111,15 @@ pub(super) async fn maybe_handle_session_admin_command(
             return Err(anyhow::anyhow!("destroy_session: requires a session_id"));
         }
 
-        let removed_agent = super::remove_session_entry(sessions, target_id).await;
-        remove_session_interrupt_queue(soft_interrupt_queues, target_id).await;
-        remove_background_tool_signal(target_id);
-        if let Some(ref agent_arc) = removed_agent {
+        let agent_arc = sessions
+            .read()
+            .await
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown session_id '{}'", target_id))?;
+        {
             let mut agent = agent_arc.lock().await;
-            agent.mark_closed();
+            agent.try_mark_closed()?;
             let memory_enabled = agent.memory_enabled();
             let transcript = if memory_enabled {
                 Some(agent.build_transcript_for_extraction())
@@ -134,10 +137,9 @@ pub(super) async fn maybe_handle_session_admin_command(
                 );
             }
         }
-
-        if removed_agent.is_none() {
-            return Err(anyhow::anyhow!("Unknown session_id '{}'", target_id));
-        }
+        super::remove_session_entry(sessions, target_id).await;
+        remove_session_interrupt_queue(soft_interrupt_queues, target_id).await;
+        remove_background_tool_signal(target_id);
 
         let (swarm_id, friendly_name) = {
             let mut members = swarm_members.write().await;

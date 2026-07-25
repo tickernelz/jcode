@@ -1,7 +1,7 @@
 #[tokio::test]
-async fn handle_resume_session_registers_live_events_before_history_replay() -> Result<()> {
+async fn fallback_resume_preserves_shared_source_and_registers_events_before_replay() -> Result<()> {
     let _guard = crate::storage::lock_test_env();
-    let (_runtime, prev_runtime) = setup_runtime_dir()?;
+    let _runtime = setup_runtime_dir()?;
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let target_session_id = format!("session_restore_target_{suffix}");
@@ -30,21 +30,38 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     let shutdown_signals = Arc::new(RwLock::new(HashMap::<String, InterruptSignal>::new()));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     let now = Instant::now();
-    let client_connections = Arc::new(RwLock::new(HashMap::from([(
-        "conn_restore".to_string(),
-        ClientConnectionInfo {
-            client_id: "conn_restore".to_string(),
-            session_id: temp_session_id.clone(),
-            client_instance_id: None,
-            debug_client_id: Some("debug_restore".to_string()),
-            connected_at: now,
-            last_seen: now,
-            is_processing: false,
-            current_tool_name: None,
-            terminal_env: Vec::new(),
-            disconnect_tx: mpsc::unbounded_channel().0,
-        },
-    )])));
+    let client_connections = Arc::new(RwLock::new(HashMap::from([
+        (
+            "conn_restore".to_string(),
+            ClientConnectionInfo {
+                client_id: "conn_restore".to_string(),
+                session_id: temp_session_id.clone(),
+                client_instance_id: None,
+                debug_client_id: Some("debug_restore".to_string()),
+                connected_at: now,
+                last_seen: now,
+                is_processing: false,
+                current_tool_name: None,
+                terminal_env: Vec::new(),
+                disconnect_tx: mpsc::unbounded_channel().0,
+            },
+        ),
+        (
+            "conn_source_peer".to_string(),
+            ClientConnectionInfo {
+                client_id: "conn_source_peer".to_string(),
+                session_id: temp_session_id.clone(),
+                client_instance_id: None,
+                debug_client_id: Some("debug_source_peer".to_string()),
+                connected_at: now,
+                last_seen: now,
+                is_processing: false,
+                current_tool_name: None,
+                terminal_env: Vec::new(),
+                disconnect_tx: mpsc::unbounded_channel().0,
+            },
+        ),
+    ])));
     let client_debug_state = Arc::new(RwLock::new(ClientDebugState::default()));
     let (placeholder_event_tx, _placeholder_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
@@ -84,7 +101,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     >::new()));
     let swarm_plans = Arc::new(RwLock::new(HashMap::<String, VersionedPlan>::new()));
     let swarm_coordinators = Arc::new(RwLock::new(HashMap::<String, String>::new()));
-    let client_count = Arc::new(RwLock::new(1usize));
+    let client_count = Arc::new(RwLock::new(2usize));
     let (writer, _peer_stream) = test_writer()?;
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let event_history = Arc::new(RwLock::new(VecDeque::<SwarmEvent>::new()));
@@ -93,8 +110,21 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     let mcp_pool = Arc::new(crate::mcp::SharedMcpPool::from_default_config());
 
     let mut client_selfdev = false;
+    let expected_temp_session_id = temp_session_id.clone();
     let mut client_session_id = temp_session_id;
     let writer_guard = writer.lock().await;
+    // Model cleanup after it has removed the target Agent but before terminal
+    // publication. The persisted target exists, while the managed map contains
+    // only the incoming connection's temporary source Agent.
+    let cleanup_lease =
+        crate::server::client_session_lifecycle::acquire_session_lifecycle_lease(
+            &target_session_id,
+        )
+        .await;
+    let resume_waiting_for_cleanup =
+        crate::server::client_session_lifecycle::observe_next_session_lifecycle_acquire(
+            &target_session_id,
+        );
 
     let resume_task = tokio::spawn({
         let agent = Arc::clone(&agent);
@@ -160,6 +190,28 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         }
     });
 
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        resume_waiting_for_cleanup,
+    )
+    .await
+    .map_err(|_| anyhow!("fallback resume did not reach target lifecycle acquisition"))?
+    .map_err(|_| anyhow!("fallback resume lifecycle acquisition observer dropped"))?;
+    assert_eq!(
+        client_connections.read().await["conn_restore"].session_id,
+        expected_temp_session_id,
+        "fallback resume must not publish connection ownership before terminal cleanup releases the target"
+    );
+    assert!(
+        !sessions.read().await.contains_key(&target_session_id),
+        "fallback resume must not restore the target Agent while cleanup owns its lifecycle"
+    );
+    assert!(
+        !resume_task.is_finished(),
+        "fallback resume must wait after cleanup claim and before terminal publication"
+    );
+    drop(cleanup_lease);
+
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             let registered = {
@@ -203,6 +255,37 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         "restore resume should not emit error events: {events:?}"
     );
 
-    restore_runtime_dir(prev_runtime);
+    let sessions_guard = sessions.read().await;
+    let restored_agent = sessions_guard
+        .get(&target_session_id)
+        .ok_or_else(|| anyhow!("fallback resume should publish a restored target Agent"))?;
+    assert!(
+        !Arc::ptr_eq(restored_agent, &agent),
+        "fallback resume must not rebind a source Agent shared by another connection"
+    );
+    let source_agent = sessions_guard
+        .get(&expected_temp_session_id)
+        .ok_or_else(|| anyhow!("shared source Agent must remain published"))?;
+    assert!(Arc::ptr_eq(source_agent, &agent));
+    drop(sessions_guard);
+
+    assert_eq!(
+        agent.lock().await.session_id(),
+        expected_temp_session_id,
+        "fallback resume must not mutate the shared source Agent identity"
+    );
+    assert_eq!(
+        client_connections.read().await["conn_source_peer"].session_id,
+        expected_temp_session_id,
+        "fallback resume must not move the source peer connection"
+    );
+    assert!(
+        swarm_members
+            .read()
+            .await
+            .contains_key(&expected_temp_session_id),
+        "fallback resume must preserve support state for a still-live source session"
+    );
+
     Ok(())
 }

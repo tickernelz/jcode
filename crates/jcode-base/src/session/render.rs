@@ -107,7 +107,7 @@ fn stored_message_is_user_turn(msg: &super::StoredMessage) -> bool {
 }
 
 fn compacted_history_render_window(
-    messages: &[super::StoredMessage],
+    messages: &[(usize, &super::StoredMessage)],
     compacted_count: usize,
     requested_visible: usize,
 ) -> (usize, RenderedCompactedHistoryInfo) {
@@ -115,11 +115,11 @@ fn compacted_history_render_window(
     let compacted_prefix = &messages[..compacted_count];
     let total_renderable = compacted_prefix
         .iter()
-        .filter(|msg| stored_message_renders_visible_message(msg))
+        .filter(|(_, msg)| stored_message_renders_visible_message(msg))
         .count();
     let total_turns = compacted_prefix
         .iter()
-        .filter(|msg| stored_message_is_user_turn(msg))
+        .filter(|(_, msg)| stored_message_is_user_turn(msg))
         .count();
 
     // Guardrails: only truncate when the prefix is BOTH very long AND has more
@@ -142,7 +142,7 @@ fn compacted_history_render_window(
     } else {
         let mut seen = 0usize;
         let mut start_idx = compacted_count;
-        for (idx, msg) in compacted_prefix.iter().enumerate().rev() {
+        for (idx, (_, msg)) in compacted_prefix.iter().enumerate().rev() {
             if stored_message_renders_visible_message(msg) {
                 seen += 1;
                 if seen >= visible_renderable {
@@ -159,10 +159,10 @@ fn compacted_history_render_window(
     // coherent (we never render a half turn at the top).
     if render_start_idx > 0 && render_start_idx < compacted_count {
         let mut boundary = render_start_idx;
-        while boundary > 0 && !stored_message_is_user_turn(&compacted_prefix[boundary]) {
+        while boundary > 0 && !stored_message_is_user_turn(compacted_prefix[boundary].1) {
             boundary -= 1;
         }
-        if stored_message_is_user_turn(&compacted_prefix[boundary]) {
+        if stored_message_is_user_turn(compacted_prefix[boundary].1) {
             render_start_idx = boundary;
         }
     }
@@ -171,12 +171,12 @@ fn compacted_history_render_window(
     // match what is actually rendered.
     let visible_renderable = compacted_prefix[render_start_idx..]
         .iter()
-        .filter(|msg| stored_message_renders_visible_message(msg))
+        .filter(|(_, msg)| stored_message_renders_visible_message(msg))
         .count();
     let remaining_renderable = total_renderable.saturating_sub(visible_renderable);
     let hidden_user_prompts = compacted_prefix[..render_start_idx]
         .iter()
-        .filter(|msg| stored_message_is_user_turn(msg))
+        .filter(|(_, msg)| stored_message_is_user_turn(msg))
         .count();
 
     (
@@ -257,7 +257,7 @@ pub fn render_images(session: &Session) -> Vec<RenderedImage> {
 }
 
 pub fn has_rendered_images(session: &Session) -> bool {
-    session.messages.iter().any(|msg| {
+    session.active_stored_messages().iter().any(|msg| {
         msg.content
             .iter()
             .any(|block| matches!(block, ContentBlock::Image { .. }))
@@ -270,7 +270,7 @@ pub fn summarize_tool_calls(
 ) -> Vec<crate::protocol::ToolCallSummary> {
     let mut calls: Vec<crate::protocol::ToolCallSummary> = Vec::new();
 
-    for msg in session.messages.iter().rev() {
+    for msg in session.active_stored_messages().iter().rev() {
         if calls.len() >= limit {
             break;
         }
@@ -335,16 +335,17 @@ pub fn render_messages_and_images_with_compacted_history(
     let mut rendered: Vec<RenderedMessage> = Vec::new();
     let mut images: Vec<RenderedImage> = Vec::new();
     let mut tool_map: HashMap<String, ToolCall> = HashMap::new();
+    let active_messages = session.active_stored_message_entries();
     // 0-based ordinal of the next rendered user prompt, used to anchor pasted
     // user images to their prompt in the transcript.
     let mut user_prompt_count = 0usize;
     let compacted_count = session
         .compaction
         .as_ref()
-        .map(|state| state.compacted_count.min(session.messages.len()))
+        .map(|state| state.compacted_count.min(active_messages.len()))
         .unwrap_or(0);
     let (render_start_idx, compacted_info) = compacted_history_render_window(
-        &session.messages,
+        &active_messages,
         compacted_count,
         compacted_history_visible,
     );
@@ -388,7 +389,7 @@ pub fn render_messages_and_images_with_compacted_history(
         });
     }
 
-    for (stored_index, msg) in session.messages.iter().enumerate().skip(render_start_idx) {
+    for (stored_index, msg) in active_messages.into_iter().skip(render_start_idx) {
         if is_internal_system_reminder(msg) {
             continue;
         }

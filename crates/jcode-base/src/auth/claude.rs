@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub const CLAUDE_CODE_AUTH_SOURCE_ID: &str = "claude_code_credentials";
@@ -80,6 +81,8 @@ pub struct JcodeAuthFile {
     pub anthropic_accounts: Vec<AnthropicAccount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_anthropic_account: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub account_identities: HashMap<String, crate::auth::account_store::StoredAccountIdentity>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anthropic: Option<LegacyAnthropicAuth>,
@@ -297,15 +300,31 @@ pub fn jcode_path() -> Result<PathBuf> {
 
 /// Read the jcode auth file, auto-migrating from legacy format if needed.
 pub fn load_auth_file() -> Result<JcodeAuthFile> {
+    let (auth, changed) = load_auth_file_unpersisted()?;
+    if !changed {
+        return Ok(auth);
+    }
+    let _lock = crate::auth::account_store::CrossProcessFileLock::acquire(
+        &jcode_path()?.with_extension("mutation.lock"),
+    )?;
+    let (auth, changed) = load_auth_file_unpersisted()?;
+    if changed {
+        save_auth_file(&auth)?;
+    }
+    Ok(auth)
+}
+
+fn load_auth_file_unpersisted() -> Result<(JcodeAuthFile, bool)> {
     let path = jcode_path()?;
     if !path.exists() {
-        return Ok(JcodeAuthFile::default());
+        return Ok((JcodeAuthFile::default(), false));
     }
 
     crate::storage::harden_secret_file_permissions(&path);
 
     let mut auth: JcodeAuthFile = crate::storage::read_json(&path)
         .with_context(|| format!("Could not read jcode credentials from {:?}", path))?;
+    let mut changed = false;
 
     if auth.anthropic_accounts.is_empty()
         && let Some(legacy) = auth.anthropic.take()
@@ -322,17 +341,22 @@ pub fn load_auth_file() -> Result<JcodeAuthFile> {
             scopes: Vec::new(),
         });
         auth.active_anthropic_account = Some("default".to_string());
-        let _ = save_auth_file(&auth);
+        changed = true;
     }
 
     if relabel_accounts(&mut auth) {
         crate::logging::info(
             "Renaming Claude accounts to numbered labels (claude-1, claude-2, ...)",
         );
-        save_auth_file(&auth)?;
+        changed = true;
     }
-
-    Ok(auth)
+    changed |= crate::auth::account_store::ensure_account_identities(
+        auth.anthropic_accounts
+            .iter()
+            .map(|account| account.label.as_str()),
+        &mut auth.account_identities,
+    );
+    Ok((auth, changed))
 }
 
 /// Write the jcode auth file (multi-account format).
@@ -342,11 +366,22 @@ pub fn save_auth_file(auth: &JcodeAuthFile) -> Result<()> {
     let clean = JcodeAuthFile {
         anthropic_accounts: auth.anthropic_accounts.clone(),
         active_anthropic_account: auth.active_anthropic_account.clone(),
+        account_identities: auth.account_identities.clone(),
         anthropic: None,
     };
 
     crate::storage::write_json_secret(&auth_path, &clean)?;
     Ok(())
+}
+
+fn mutate_auth_file<T>(mutate: impl FnOnce(&mut JcodeAuthFile) -> Result<T>) -> Result<T> {
+    let _lock = crate::auth::account_store::CrossProcessFileLock::acquire(
+        &jcode_path()?.with_extension("mutation.lock"),
+    )?;
+    let (mut auth, _) = load_auth_file_unpersisted()?;
+    let output = mutate(&mut auth)?;
+    save_auth_file(&auth)?;
+    Ok(output)
 }
 
 /// List all configured Anthropic accounts.
@@ -366,53 +401,199 @@ pub fn active_account_label() -> Option<String> {
     )
 }
 
-/// Persist the active account choice to disk (and set the runtime override).
-pub fn set_active_account(label: &str) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    crate::auth::account_store::set_active_account(
-        label,
+/// Stable non-secret identity of the currently selected OAuth account.
+pub fn active_account_identity() -> Option<(String, String, u64)> {
+    let auth = match load_auth_file() {
+        Ok(auth) => auth,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Failed to load Anthropic account identity: {error}"
+            ));
+            return None;
+        }
+    };
+    let label = crate::auth::account_store::active_account_label(
+        get_active_account_override(),
+        auth.active_anthropic_account.clone(),
         &auth.anthropic_accounts,
-        &mut auth.active_anthropic_account,
-        "No account with label '{}' found",
         |account| account.label.as_str(),
     )?;
-    save_auth_file(&auth)?;
+    let identity = auth.account_identities.get(&label)?;
+    Some((label, identity.id.clone(), identity.generation))
+}
+
+/// Persist the active account choice to disk (and set the runtime override).
+pub fn set_active_account(label: &str) -> Result<()> {
+    mutate_auth_file(|auth| {
+        crate::auth::account_store::set_active_account(
+            label,
+            &auth.anthropic_accounts,
+            &mut auth.active_anthropic_account,
+            "No account with label '{}' found",
+            |account| account.label.as_str(),
+        )
+    })?;
     set_active_account_override(Some(label.to_string()));
     Ok(())
 }
 
 /// Add or update an account. Returns the label used.
 pub fn upsert_account(account: AnthropicAccount) -> Result<String> {
-    let mut auth = load_auth_file()?;
-    let label = crate::auth::account_store::upsert_account(
-        ACCOUNT_LABEL_PREFIX,
-        &mut auth.anthropic_accounts,
-        &mut auth.active_anthropic_account,
-        account,
-        |account| account.label.as_str(),
-        |account, label| account.label = label,
-    );
-    save_auth_file(&auth)?;
-    Ok(label)
+    mutate_auth_file(|auth| {
+        let replacing = auth
+            .anthropic_accounts
+            .iter()
+            .any(|existing| existing.label == account.label);
+        let label = crate::auth::account_store::upsert_account(
+            ACCOUNT_LABEL_PREFIX,
+            &mut auth.anthropic_accounts,
+            &mut auth.active_anthropic_account,
+            account,
+            |account| account.label.as_str(),
+            |account, label| account.label = label,
+        );
+        crate::auth::account_store::ensure_account_identities(
+            auth.anthropic_accounts
+                .iter()
+                .map(|account| account.label.as_str()),
+            &mut auth.account_identities,
+        );
+        if replacing && let Some(identity) = auth.account_identities.get_mut(&label) {
+            identity.generation = identity.generation.saturating_add(1);
+        }
+        Ok(label)
+    })
+}
+
+/// Add or replace OAuth token fields while preserving profile metadata from
+/// the fresh account record read under the auth-file mutation lock.
+pub fn upsert_account_tokens(
+    label: &str,
+    access: &str,
+    refresh: &str,
+    expires: i64,
+    scopes: &[String],
+) -> Result<String> {
+    mutate_auth_file(|auth| {
+        if let Some(account) = auth
+            .anthropic_accounts
+            .iter_mut()
+            .find(|account| account.label == label)
+        {
+            account.access = access.to_string();
+            account.refresh = refresh.to_string();
+            account.expires = expires;
+            if !scopes.is_empty() {
+                account.scopes = scopes.to_vec();
+            }
+            if let Some(identity) = auth.account_identities.get_mut(label) {
+                identity.generation = identity.generation.saturating_add(1);
+            }
+            return Ok(label.to_string());
+        }
+
+        let stored_label = crate::auth::account_store::upsert_account(
+            ACCOUNT_LABEL_PREFIX,
+            &mut auth.anthropic_accounts,
+            &mut auth.active_anthropic_account,
+            AnthropicAccount {
+                label: label.to_string(),
+                access: access.to_string(),
+                refresh: refresh.to_string(),
+                expires,
+                email: None,
+                subscription_type: None,
+                scopes: scopes.to_vec(),
+            },
+            |account| account.label.as_str(),
+            |account, label| account.label = label,
+        );
+        crate::auth::account_store::ensure_account_identities(
+            auth.anthropic_accounts
+                .iter()
+                .map(|account| account.label.as_str()),
+            &mut auth.account_identities,
+        );
+        Ok(stored_label)
+    })
+}
+
+pub fn replace_account_tokens_and_profile(
+    label: &str,
+    access: &str,
+    refresh: &str,
+    expires: i64,
+    scopes: &[String],
+    email: Option<String>,
+) -> Result<String> {
+    mutate_auth_file(|auth| {
+        if let Some(account) = auth
+            .anthropic_accounts
+            .iter_mut()
+            .find(|account| account.label == label)
+        {
+            let same_verified_profile =
+                account.email.as_ref().zip(email.as_ref()).is_some_and(
+                    |(existing, replacement)| existing.eq_ignore_ascii_case(replacement),
+                );
+            account.access = access.to_string();
+            account.refresh = refresh.to_string();
+            account.expires = expires;
+            account.scopes = scopes.to_vec();
+            account.email = email;
+            if !same_verified_profile {
+                account.subscription_type = None;
+            }
+            if let Some(identity) = auth.account_identities.get_mut(label) {
+                identity.generation = identity.generation.saturating_add(1);
+            }
+            return Ok(label.to_string());
+        }
+
+        let stored_label = crate::auth::account_store::upsert_account(
+            ACCOUNT_LABEL_PREFIX,
+            &mut auth.anthropic_accounts,
+            &mut auth.active_anthropic_account,
+            AnthropicAccount {
+                label: label.to_string(),
+                access: access.to_string(),
+                refresh: refresh.to_string(),
+                expires,
+                email,
+                subscription_type: None,
+                scopes: scopes.to_vec(),
+            },
+            |account| account.label.as_str(),
+            |account, label| account.label = label,
+        );
+        crate::auth::account_store::ensure_account_identities(
+            auth.anthropic_accounts
+                .iter()
+                .map(|account| account.label.as_str()),
+            &mut auth.account_identities,
+        );
+        Ok(stored_label)
+    })
 }
 
 /// Remove an account by label.
 pub fn remove_account(label: &str) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    let before = auth.anthropic_accounts.len();
-    auth.anthropic_accounts.retain(|a| a.label != label);
-    if auth.anthropic_accounts.len() == before {
-        anyhow::bail!("No account with label '{}' found", label);
-    }
-
-    if auth.active_anthropic_account.as_deref() == Some(label) {
-        auth.active_anthropic_account = auth.anthropic_accounts.first().map(|a| a.label.clone());
-    }
-
-    save_auth_file(&auth)?;
+    let active = mutate_auth_file(|auth| {
+        let before = auth.anthropic_accounts.len();
+        auth.anthropic_accounts.retain(|a| a.label != label);
+        if auth.anthropic_accounts.len() == before {
+            anyhow::bail!("No account with label '{}' found", label);
+        }
+        auth.account_identities.remove(label);
+        if auth.active_anthropic_account.as_deref() == Some(label) {
+            auth.active_anthropic_account =
+                auth.anthropic_accounts.first().map(|a| a.label.clone());
+        }
+        Ok(auth.active_anthropic_account.clone())
+    })?;
 
     if get_active_account_override().as_deref() == Some(label) {
-        set_active_account_override(auth.active_anthropic_account.clone());
+        set_active_account_override(active);
     }
 
     Ok(())
@@ -420,47 +601,52 @@ pub fn remove_account(label: &str) -> Result<()> {
 
 /// Remove every stored Anthropic account in one write.
 pub fn clear_accounts() -> Result<usize> {
-    let mut auth = load_auth_file()?;
-    let removed = auth.anthropic_accounts.len();
-    auth.anthropic_accounts.clear();
-    auth.active_anthropic_account = None;
-    save_auth_file(&auth)?;
+    let removed = mutate_auth_file(|auth| {
+        let removed = auth.anthropic_accounts.len();
+        auth.anthropic_accounts.clear();
+        auth.active_anthropic_account = None;
+        auth.account_identities.clear();
+        Ok(removed)
+    })?;
     set_active_account_override(None);
     Ok(removed)
 }
 
 /// Update tokens for a specific account (called after token refresh).
 pub fn update_account_tokens(label: &str, access: &str, refresh: &str, expires: i64) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    if let Some(account) = auth
-        .anthropic_accounts
-        .iter_mut()
-        .find(|a| a.label == label)
-    {
-        account.access = access.to_string();
-        account.refresh = refresh.to_string();
-        account.expires = expires;
-        save_auth_file(&auth)?;
-        Ok(())
-    } else {
-        anyhow::bail!("No account with label '{}' found for token update", label);
-    }
+    mutate_auth_file(|auth| {
+        if let Some(account) = auth
+            .anthropic_accounts
+            .iter_mut()
+            .find(|a| a.label == label)
+        {
+            account.access = access.to_string();
+            account.refresh = refresh.to_string();
+            account.expires = expires;
+            if let Some(identity) = auth.account_identities.get_mut(label) {
+                identity.generation = identity.generation.saturating_add(1);
+            }
+            Ok(())
+        } else {
+            anyhow::bail!("No account with label '{}' found for token update", label);
+        }
+    })
 }
 
 /// Update profile metadata for a specific account.
 pub fn update_account_profile(label: &str, email: Option<String>) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    if let Some(account) = auth
-        .anthropic_accounts
-        .iter_mut()
-        .find(|a| a.label == label)
-    {
-        account.email = email;
-        save_auth_file(&auth)?;
-        Ok(())
-    } else {
-        anyhow::bail!("No account with label '{}' found for profile update", label);
-    }
+    mutate_auth_file(|auth| {
+        if let Some(account) = auth
+            .anthropic_accounts
+            .iter_mut()
+            .find(|a| a.label == label)
+        {
+            account.email = email;
+            Ok(())
+        } else {
+            anyhow::bail!("No account with label '{}' found for profile update", label);
+        }
+    })
 }
 
 // ---- Credential loading (used by provider) ----

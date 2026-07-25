@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 #[cfg(any(unix, windows))]
 use std::fs::OpenOptions;
@@ -10,6 +10,10 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::time::Instant;
 
+use super::account_transition_persistence::{
+    ACCOUNT_RECONCILIATION_FILE, AccountTransitionFileLock, account_transition_state_path,
+    load_completed_account_transitions,
+};
 use super::journal::{PersistVectorMode, SessionJournalEntry, metadata_requires_snapshot};
 use super::storage_paths::{file_len_or_zero, session_journal_path_from_snapshot, session_path};
 use super::{
@@ -24,6 +28,7 @@ struct JournalReplayStats {
     entries: usize,
     skipped_lines: usize,
     salvaged_entries: usize,
+    sequence_gap: bool,
 }
 
 #[cfg(unix)]
@@ -38,6 +43,7 @@ impl SessionWriterLock {
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -52,7 +58,12 @@ impl SessionWriterLock {
 #[cfg(unix)]
 impl Drop for SessionWriterLock {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            crate::logging::warn(&format!(
+                "Failed to release session writer lock: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
 }
 
@@ -71,6 +82,7 @@ impl SessionWriterLock {
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -99,7 +111,12 @@ impl Drop for SessionWriterLock {
         use windows_sys::Win32::System::IO::OVERLAPPED;
 
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-        let _ = unsafe { UnlockFileEx(self.0.as_raw_handle() as _, 0, 1, 0, &mut overlapped) };
+        if unsafe { UnlockFileEx(self.0.as_raw_handle() as _, 0, 1, 0, &mut overlapped) } == 0 {
+            crate::logging::warn(&format!(
+                "Failed to release session writer lock: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
 }
 
@@ -144,17 +161,18 @@ fn salvage_glued_journal_entries(line: &str, mut apply: impl FnMut(SessionJourna
     salvaged
 }
 
-/// Replay every parseable entry from a session journal, tolerating corrupt
-/// lines instead of truncating the transcript at the first bad byte.
+/// Replay every contiguous parseable entry from a session journal, tolerating
+/// corrupt tail lines but failing closed on later non-contiguous records.
 ///
-/// Journals are append-only JSONL written by `append_json_line_fast`. A crash,
+/// Journals are append-only JSONL written by `append_json_line_durable`. A crash,
 /// full disk, or (historically) interleaved multi-write appends can leave a
 /// torn or glued line behind. The old replay loop stopped at the first parse
 /// failure, silently dropping every later entry, which surfaced as "my last
-/// prompt is missing" after resuming a long session. Skipping only the bad
-/// line preserves the rest of the transcript; per-entry `meta` snapshots make
-/// later entries self-sufficient for metadata, and appended messages after a
-/// gap are far better than losing the whole tail.
+/// prompt is missing" after resuming a long session. We can still heal a
+/// corrupt tail because no later durable record depends on it. Once a later
+/// valid record appears with a sequence gap, accepting and checkpointing that
+/// tail would seal data loss, so replay quarantines the original bytes and
+/// returns an error instead.
 fn replay_journal_lines(
     journal_path: &Path,
     snapshot_watermark: u64,
@@ -188,9 +206,12 @@ fn replay_journal_lines(
                     }
                     entry.sequence = current_sequence.saturating_add(1);
                 }
-                if entry.sequence > snapshot_watermark && entry.sequence > current_sequence {
+                if entry.sequence > snapshot_watermark && entry.sequence == current_sequence + 1 {
                     current_sequence = entry.sequence;
                     apply(entry);
+                } else if entry.sequence > current_sequence + 1 {
+                    stats.sequence_gap = true;
+                    break;
                 }
             }
             Err(err) => {
@@ -202,9 +223,12 @@ fn replay_journal_lines(
                         }
                         entry.sequence = current_sequence.saturating_add(1);
                     }
-                    if entry.sequence > snapshot_watermark && entry.sequence > current_sequence {
+                    if entry.sequence > snapshot_watermark && entry.sequence == current_sequence + 1
+                    {
                         current_sequence = entry.sequence;
                         apply(entry);
+                    } else if entry.sequence > current_sequence + 1 {
+                        stats.sequence_gap = true;
                     }
                 });
                 stats.entries += salvaged;
@@ -219,6 +243,23 @@ fn replay_journal_lines(
                 ));
             }
         }
+    }
+
+    if stats.sequence_gap {
+        let repair_path = journal_path.with_extension("repair-required.jsonl");
+        if let Err(err) = std::fs::copy(journal_path, &repair_path) {
+            crate::logging::warn(&format!(
+                "Failed to preserve session journal with sequence gap {} to {}: {}",
+                journal_path.display(),
+                repair_path.display(),
+                err
+            ));
+        }
+        bail!(
+            "session journal {} has a non-contiguous sequence after snapshot watermark {}; repair required",
+            journal_path.display(),
+            snapshot_watermark
+        );
     }
 
     if stats.is_corrupt() {
@@ -242,7 +283,11 @@ impl Session {
         if !snapshot_path.exists() {
             return Ok(());
         }
-        let durable = Session::load(&self.id)?;
+        // Compare with the graph generation actually stored on disk. Running
+        // provenance validation here would derive the same fail-closed frontier
+        // transition that this writer is trying to checkpoint, making a single
+        // writer appear stale against its own deterministic repair.
+        let durable = Session::load_from_path_locked_with_validation(snapshot_path, false)?;
         let durable_generation = durable
             .context_frontier
             .as_ref()
@@ -250,13 +295,13 @@ impl Session {
         let writer_generation = self.persist_state.context_generation;
         let stale_graph = durable_generation != writer_generation
             || durable.last_context_op_id != self.persist_state.context_op_id;
-        if durable.journal_sequence != self.journal_sequence || stale_graph {
+        if durable.persistence_revision != self.persistence_revision || stale_graph {
             anyhow::bail!(
-                "stale session writer rejected for {} (durable journal/generation {}/{}, writer {}/{})",
+                "stale session writer rejected for {} (durable revision/generation {}/{}, writer {}/{})",
                 self.id,
-                durable.journal_sequence,
+                durable.persistence_revision,
                 durable_generation,
-                self.journal_sequence,
+                self.persistence_revision,
                 writer_generation
             );
         }
@@ -281,6 +326,15 @@ impl Session {
         transaction: ContextGraphTransaction,
         compaction: Option<super::StoredCompactionState>,
     ) -> Result<bool> {
+        if !self
+            .exact_runtime_identity
+            .as_ref()
+            .is_some_and(|identity| identity.has_verifiable_account_binding())
+        {
+            anyhow::bail!(
+                "Context graph publication is disabled because exact account identity is opaque or incomplete"
+            );
+        }
         if let Some(state) = compaction.as_ref()
             && (state.compacted_count != transaction.frontier.covered_message_count
                 || state.openai_encrypted_content.is_some())
@@ -288,51 +342,163 @@ impl Session {
             anyhow::bail!("LCM projection does not match graph frontier");
         }
         let snapshot_path = session_path(&self.id)?;
-        let _writer_lock = SessionWriterLock::acquire(&snapshot_path)?;
-        self.verify_writer_base_is_current(&snapshot_path)?;
+        if !self.persist_state.snapshot_exists || !snapshot_path.exists() {
+            // Establish the canonical raw-session baseline before appending a
+            // derived graph delta. A graph transaction must never be the only
+            // record from which the raw session can be reconstructed.
+            self.save()?;
+        }
         let mut candidate = self.clone();
-        if !candidate.apply_context_transaction_inner(&transaction, false)? {
+        if !candidate.apply_context_transaction_inner(&transaction, true)? {
             return Ok(false);
         }
         if let Some(state) = compaction {
             candidate.compaction = Some(state);
         }
-
-        candidate.updated_at = Utc::now();
-        let journal_path = session_journal_path_from_snapshot(&snapshot_path);
-        candidate.checkpoint_snapshot(&snapshot_path, &journal_path)?;
+        // `save` verifies the same durable writer base again under the
+        // cross-process writer lock. With a pending context transaction it uses
+        // one durable journal entry containing the node delta, frontier, and
+        // paired projection. Only then may the candidate become live.
+        candidate.save()?;
         *self = candidate;
         Ok(true)
     }
 
     fn apply_journal_entry(&mut self, entry: SessionJournalEntry) {
         self.journal_sequence = self.journal_sequence.max(entry.sequence);
+        let previous_compaction = self.compaction.clone();
+        let has_context_transaction = entry.context_transaction.is_some();
+        let paired_compaction = entry.meta.compaction.clone();
         self.apply_journal_meta(entry.meta);
+        if has_context_transaction {
+            // Projection and graph are one logical journal transaction. Keep
+            // the previous projection until the graph delta has validated.
+            self.compaction = previous_compaction;
+        }
         self.messages.extend(entry.append_messages);
         self.env_snapshots.extend(entry.append_env_snapshots);
         self.memory_injections
             .extend(entry.append_memory_injections);
         self.replay_events.extend(entry.append_replay_events);
         if let Some(transaction) = entry.context_transaction {
-            if let Err(err) = self.apply_context_transaction_inner(&transaction, false) {
-                crate::logging::warn(&format!(
-                    "Ignoring invalid context transaction {} for session {}: {}",
+            match self.apply_context_transaction_inner(&transaction, false) {
+                Ok(_) => self.compaction = paired_compaction,
+                Err(err) => crate::logging::warn(&format!(
+                    "Ignoring invalid context transaction {} and its paired projection for session {}: {}",
                     transaction.op_id, self.id, err
-                ));
+                )),
             }
         }
         self.mark_memory_profile_dirty();
     }
 
     fn checkpoint_snapshot(&mut self, snapshot_path: &Path, journal_path: &Path) -> Result<()> {
+        let previous_revision = self.persistence_revision;
         let previous_watermark = self.journal_watermark;
+        self.persistence_revision = self.persistence_revision.saturating_add(1);
         self.journal_watermark = self.journal_sequence;
-        if let Err(err) = storage::write_json(snapshot_path, self) {
-            self.journal_watermark = previous_watermark;
-            return Err(err);
+        // Publish the authoritative snapshot before refreshing its recovery
+        // copy. Writing the new generation to `.bak` first is unsafe: if the
+        // primary write then fails, generic recovery can expose a generation
+        // whose save returned Err.
+        //
+        // The storage primitive can report a parent-directory fsync error after
+        // its atomic rename has already published the exact bytes. Detect that
+        // outcome and explicitly reconfirm either the primary or recovery copy.
+        // If neither can be confirmed, return an ambiguous-publication error so
+        // callers do not acknowledge or install the candidate live.
+        let snapshot_bytes = serde_json::to_vec(self)?;
+        let mut primary_confirmation_error = None;
+        let primary_durability_confirmed = if let Err(err) =
+            storage::write_bytes(snapshot_path, &snapshot_bytes)
+        {
+            if !std::fs::read(snapshot_path).is_ok_and(|published| published == snapshot_bytes) {
+                self.persistence_revision = previous_revision;
+                self.journal_watermark = previous_watermark;
+                return Err(err);
+            }
+            crate::logging::warn(&format!(
+                "Session {} checkpoint bytes were published at {}, but final durability confirmation failed: {}",
+                self.id,
+                snapshot_path.display(),
+                err
+            ));
+            match jcode_storage::confirm_publication_durable(snapshot_path) {
+                Ok(()) => true,
+                Err(confirm_error) => {
+                    crate::logging::error(&format!(
+                        "Session {} checkpoint is visible but primary durability remains unconfirmed: {}",
+                        self.id, confirm_error
+                    ));
+                    primary_confirmation_error = Some(confirm_error);
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        // Recovery redundancy is refreshed only after primary commit. Failure
+        // here leaves storage::write_bytes' previous acknowledged generation as
+        // `.bak`; it is cleanup/redundancy debt, not a failed primary commit.
+        let backup_path = snapshot_path.with_extension("bak");
+        let mut backup_durability_confirmed = false;
+        let mut last_backup_error = None;
+        for _ in 0..3 {
+            match storage::write_bytes_without_backup(&backup_path, &snapshot_bytes) {
+                Ok(()) => {
+                    backup_durability_confirmed = true;
+                    break;
+                }
+                Err(error) => last_backup_error = Some(error),
+            }
         }
-        if journal_path.exists() {
-            let _ = std::fs::remove_file(journal_path);
+        if !backup_durability_confirmed {
+            crate::logging::warn(&format!(
+                "Session {} checkpoint committed, but recovery snapshot {} could not be refreshed after retries: {}",
+                self.id,
+                backup_path.display(),
+                last_backup_error
+                    .as_ref()
+                    .map_or_else(|| "unknown error".to_string(), ToString::to_string)
+            ));
+        }
+        if !primary_durability_confirmed && !backup_durability_confirmed {
+            crate::logging::error(&format!(
+                "Session {} checkpoint is published but neither primary nor recovery durability could be confirmed; retaining the journal",
+                self.id
+            ));
+            self.persistence_revision = previous_revision;
+            self.journal_watermark = previous_watermark;
+            anyhow::bail!(
+                "Session {} checkpoint publication is ambiguous: neither primary ({}) nor recovery ({}) durability was confirmed",
+                self.id,
+                primary_confirmation_error.as_ref().map_or_else(
+                    || "unknown confirmation error".to_string(),
+                    ToString::to_string
+                ),
+                last_backup_error
+                    .as_ref()
+                    .map_or_else(|| "unknown write error".to_string(), ToString::to_string)
+            );
+        } else if backup_durability_confirmed && journal_path.exists() {
+            // Both primary and recovery snapshots now cover the journal. A
+            // retirement failure is cleanup debt, not a failed commit. Replay
+            // ignores entries through `journal_watermark`, and a later
+            // checkpoint will retry removal.
+            if let Err(error) = std::fs::remove_file(journal_path) {
+                crate::logging::warn(&format!(
+                    "Session {} checkpoint committed, but covered journal {} could not be retired: {}",
+                    self.id,
+                    journal_path.display(),
+                    error
+                ));
+            }
+        } else if journal_path.exists() {
+            crate::logging::warn(&format!(
+                "Session {} retained covered journal {} until a current-generation recovery snapshot is durable",
+                self.id,
+                journal_path.display()
+            ));
         }
         self.reset_persist_state(true);
         Ok(())
@@ -363,11 +529,22 @@ impl Session {
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self> {
+        let _writer_lock = SessionWriterLock::acquire(path)?;
+        Self::load_from_path_locked(path)
+    }
+
+    fn load_from_path_locked(path: &Path) -> Result<Self> {
+        Self::load_from_path_locked_with_validation(path, true)
+    }
+
+    fn load_from_path_locked_with_validation(
+        path: &Path,
+        validate_context_graph: bool,
+    ) -> Result<Self> {
         let load_start = Instant::now();
         let snapshot_bytes = file_len_or_zero(path);
         let snapshot_start = Instant::now();
         let mut session: Session = storage::read_json(path)?;
-        session.discard_invalid_context_graph();
         let snapshot_ms = snapshot_start.elapsed().as_millis();
         let journal_path = session_journal_path_from_snapshot(path);
         let journal_bytes = file_len_or_zero(&journal_path);
@@ -380,6 +557,11 @@ impl Session {
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
         session.reset_persist_state(path.exists());
+        if validate_context_graph {
+            // Validate after establishing the durable baseline so fail-closed graph
+            // deactivation remains marked for a full checkpoint on the next save.
+            session.discard_invalid_context_graph();
+        }
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
         if replay_stats.is_corrupt() {
@@ -441,6 +623,7 @@ impl Session {
 
     pub fn load_for_remote_startup(session_id: &str) -> Result<Self> {
         let path = session_path(session_id)?;
+        let _writer_lock = SessionWriterLock::acquire(&path)?;
         let load_start = Instant::now();
         let snapshot_bytes = file_len_or_zero(&path);
         let snapshot_start = Instant::now();
@@ -448,7 +631,6 @@ impl Session {
         let snapshot: RemoteStartupSessionSnapshot = serde_json::from_reader(reader)?;
         let snapshot_ms = snapshot_start.elapsed().as_millis();
         let mut session = Self::session_from_remote_startup_snapshot(snapshot);
-        session.discard_invalid_context_graph();
         let journal_path = session_journal_path_from_snapshot(&path);
         let journal_bytes = file_len_or_zero(&journal_path);
         let journal_start = Instant::now();
@@ -456,21 +638,32 @@ impl Session {
         replay_journal_lines(&journal_path, session.journal_watermark, |entry| {
             journal_entries += 1;
             session.journal_sequence = session.journal_sequence.max(entry.sequence);
+            let previous_compaction = session.compaction.clone();
+            let has_context_transaction = entry.context_transaction.is_some();
+            let paired_compaction = entry.meta.compaction.clone();
             session.apply_journal_meta(entry.meta);
+            if has_context_transaction {
+                session.compaction = previous_compaction;
+            }
             session.messages.extend(entry.append_messages);
             session.replay_events.extend(entry.append_replay_events);
             if let Some(transaction) = entry.context_transaction {
-                if let Err(err) = session.apply_context_transaction_inner(&transaction, false) {
-                    crate::logging::warn(&format!(
-                        "Ignoring invalid context transaction {} for remote session {}: {}",
+                match session.apply_context_transaction_inner(&transaction, false) {
+                    Ok(_) => session.compaction = paired_compaction,
+                    Err(err) => crate::logging::warn(&format!(
+                        "Ignoring invalid context transaction {} and its paired projection for remote session {}: {}",
                         transaction.op_id, session.id, err
-                    ));
+                    )),
                 }
             }
         })?;
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
         session.reset_persist_state(path.exists());
+        // As with the authoritative loader, provenance validation must happen
+        // after the durable baseline reset. Otherwise snapshot-resident invalid
+        // roots are deactivated in memory and then incorrectly marked clean.
+        session.discard_invalid_context_graph();
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
         let finalize_ms = finalize_start.elapsed().as_millis();
@@ -507,6 +700,78 @@ impl Session {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        let _account_admission = if super::account_transition_admission_held() {
+            None
+        } else {
+            Some(AccountTransitionFileLock::acquire_shared()?)
+        };
+        if account_transition_state_path(ACCOUNT_RECONCILIATION_FILE)?.exists() {
+            bail!("cannot save session while provider account reconciliation is pending");
+        }
+        self.reconcile_completed_account_transitions()?;
+        self.save_during_account_transition()
+    }
+
+    fn reconcile_completed_account_transitions(&mut self) -> Result<()> {
+        let state = load_completed_account_transitions()?;
+        for transition in state.transitions {
+            let exact_applies = self
+                .exact_runtime_identity
+                .as_ref()
+                .is_some_and(|identity| identity.route.runtime_key == transition.runtime_key);
+            let bound_applies = self
+                .provider_session_identity
+                .as_ref()
+                .is_some_and(|identity| identity.route.runtime_key == transition.runtime_key);
+            let legacy_applies = self.exact_runtime_identity.is_none()
+                && self.provider_session_identity.is_none()
+                && legacy_session_may_use_runtime(self, &transition.runtime_key);
+            if !exact_applies && !bound_applies && !legacy_applies {
+                continue;
+            }
+
+            let exact_is_stale = exact_applies
+                && self
+                    .exact_runtime_identity
+                    .as_ref()
+                    .is_some_and(|identity| {
+                        identity.account_label.as_deref() != Some(transition.account_label.as_str())
+                            || identity.account_id.as_deref()
+                                != Some(transition.account_id.as_str())
+                            || identity
+                                .account_generation
+                                .is_none_or(|generation| generation < transition.account_generation)
+                    });
+            let opaque_or_cross_runtime_binding =
+                !exact_applies && (bound_applies || legacy_applies);
+            let resume_binding_is_stale = match (
+                self.provider_session_id.as_ref(),
+                self.provider_session_identity.as_ref(),
+            ) {
+                (None, None) => false,
+                (Some(_), Some(binding)) => Some(binding) != self.exact_runtime_identity.as_ref(),
+                _ => true,
+            };
+            if !exact_is_stale && !opaque_or_cross_runtime_binding && !resume_binding_is_stale {
+                continue;
+            }
+
+            if exact_is_stale && let Some(identity) = self.exact_runtime_identity.as_mut() {
+                identity.account_label = Some(transition.account_label.clone());
+                identity.account_id = Some(transition.account_id.clone());
+                identity.account_generation = Some(transition.account_generation);
+            }
+            self.provider_session_id = None;
+            self.provider_session_identity = None;
+            self.reset_context_graph_for_identity_transition();
+        }
+        Ok(())
+    }
+
+    /// Persist while the caller already owns the exclusive account-transition
+    /// file lock. Ordinary callers must use [`Session::save`].
+    #[doc(hidden)]
+    pub fn save_during_account_transition(&mut self) -> Result<()> {
         self.updated_at = Utc::now();
         let path = session_path(&self.id)?;
         let _writer_lock = SessionWriterLock::acquire(&path)?;
@@ -549,6 +814,7 @@ impl Session {
             .replay_events
             .len()
             .saturating_sub(self.persist_state.replay_events_len);
+        let strict_context_append = self.persist_state.pending_context_transaction.is_some();
         let (
             result,
             save_mode,
@@ -573,9 +839,12 @@ impl Session {
             )
         } else {
             let entry_build_start = Instant::now();
+            let next_revision = self.persistence_revision.saturating_add(1);
+            let mut entry_meta = current_meta.clone();
+            entry_meta.persistence_revision = Some(next_revision);
             let entry = SessionJournalEntry {
                 sequence: self.journal_sequence.saturating_add(1),
-                meta: current_meta.clone(),
+                meta: entry_meta,
                 append_messages: self.messages[self.persist_state.messages_len..].to_vec(),
                 append_env_snapshots: self.env_snapshots[self.persist_state.env_snapshots_len..]
                     .to_vec(),
@@ -588,22 +857,28 @@ impl Session {
             };
             let entry_build_ms = entry_build_start.elapsed().as_millis();
             let append_start = Instant::now();
-            let append_result = storage::append_json_line_fast(&journal_path, &entry);
+            let append_result = storage::append_json_line_durable(&journal_path, &entry);
             let append_ms = append_start.elapsed().as_millis();
             match append_result {
                 Ok(()) => {
                     self.journal_sequence = entry.sequence;
+                    self.persistence_revision = next_revision;
                     self.reset_persist_state(true);
                     let journal_stat_start = Instant::now();
                     let journal_bytes_after = file_len_or_zero(&journal_path);
                     let journal_stat_ms = journal_stat_start.elapsed().as_millis();
                     if journal_bytes_after > MAX_SESSION_JOURNAL_BYTES {
                         let checkpoint_start = Instant::now();
-                        let result = self.checkpoint_snapshot(&path, &journal_path);
+                        if let Err(error) = self.checkpoint_snapshot(&path, &journal_path) {
+                            crate::logging::warn(&format!(
+                                "Session {} journal is durable, but deferred checkpoint failed: {}",
+                                self.id, error
+                            ));
+                        }
                         let checkpoint_ms = checkpoint_start.elapsed().as_millis();
                         let journal_bytes_after = file_len_or_zero(&journal_path);
                         (
-                            result,
+                            Ok(()),
                             "append+checkpoint",
                             entry_build_ms,
                             append_ms,
@@ -622,6 +897,21 @@ impl Session {
                             journal_bytes_after,
                         )
                     }
+                }
+                Err(err) if strict_context_append => {
+                    crate::logging::warn(&format!(
+                        "Strict context journal append failed for {}: {}",
+                        self.id, err
+                    ));
+                    (
+                        Err(err),
+                        "context_append_failed",
+                        entry_build_ms,
+                        append_ms,
+                        0,
+                        0,
+                        file_len_or_zero(&journal_path),
+                    )
                 }
                 Err(err) => {
                     crate::logging::warn(&format!(
@@ -702,6 +992,36 @@ impl Session {
             crate::logging::event_info("SESSION_PERSISTENCE", fields);
         }
         result
+    }
+}
+
+fn legacy_session_may_use_runtime(
+    session: &Session,
+    runtime_key: &jcode_provider_core::RuntimeKey,
+) -> bool {
+    let provider = session
+        .provider_key
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let api_method = session
+        .route_api_method
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match runtime_key {
+        jcode_provider_core::RuntimeKey::OpenAIOAuth => {
+            matches!(provider.as_str(), "openai" | "openai-codex")
+                || api_method.contains("openai-oauth")
+                || api_method.contains("codex")
+        }
+        jcode_provider_core::RuntimeKey::ClaudeOAuth => {
+            matches!(provider.as_str(), "claude" | "claude-code" | "anthropic")
+                || api_method.contains("claude-oauth")
+        }
+        _ => false,
     }
 }
 

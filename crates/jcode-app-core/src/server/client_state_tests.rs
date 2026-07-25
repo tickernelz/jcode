@@ -1,3 +1,4 @@
+use super::handle_get_compacted_history;
 use super::handle_get_history;
 use super::handle_get_model_catalog;
 use super::session_activity_snapshot;
@@ -206,6 +207,103 @@ async fn handle_get_history_falls_back_to_persisted_snapshot_when_agent_is_busy(
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "test intentionally keeps the agent busy while both persisted history endpoints replay a corrupt journal"
+)]
+async fn busy_history_endpoints_propagate_journal_repair_required() {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().expect("create temp home");
+    let previous_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    let session_id = "session_busy_history_corrupt_journal";
+    let mut session = crate::session::Session::create_with_id(
+        session_id.to_string(),
+        None,
+        Some("corrupt busy history".to_string()),
+    );
+    for (id, text) in [("first", "one"), ("second", "two"), ("third", "three")] {
+        session.append_stored_message(crate::session::StoredMessage {
+            id: id.to_string(),
+            role: crate::message::Role::User,
+            content: vec![crate::message::ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+        session.save().expect("save journal fixture step");
+    }
+    let journal_path = crate::session::session_journal_path(session_id).unwrap();
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    let lines = journal.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    let torn = &lines[0][..lines[0].len() / 2];
+    std::fs::write(&journal_path, format!("{torn}\n{}\n", lines[1])).unwrap();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let agent = Arc::new(Mutex::new(Agent::new_with_session(
+        provider.clone(),
+        Registry::empty(),
+        session,
+        None,
+    )));
+    let busy_guard = agent.lock().await;
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        session_id.to_string(),
+        Arc::clone(&agent),
+    )])));
+    let client_connections = Arc::new(RwLock::new(HashMap::<String, ClientConnectionInfo>::new()));
+    let client_count = Arc::new(RwLock::new(1usize));
+
+    let (history_stream, _peer) = crate::transport::stream_pair().expect("history stream pair");
+    let (_reader, history_writer) = history_stream.into_split();
+    let history_writer = Arc::new(Mutex::new(history_writer));
+    let history_error = handle_get_history(
+        51,
+        session_id,
+        true,
+        &agent,
+        &provider,
+        &sessions,
+        &client_connections,
+        &client_count,
+        &history_writer,
+        "server-name",
+        "🔥",
+        None,
+    )
+    .await
+    .expect_err("History must not hide journal repair failure");
+    assert!(history_error.to_string().contains("repair required"));
+
+    let (compacted_stream, _peer) = crate::transport::stream_pair().expect("compacted stream pair");
+    let (_reader, compacted_writer) = compacted_stream.into_split();
+    let compacted_writer = Arc::new(Mutex::new(compacted_writer));
+    let compacted_error =
+        handle_get_compacted_history(52, session_id, &agent, &compacted_writer, 20)
+            .await
+            .expect_err("CompactedHistory must not hide journal repair failure");
+    assert!(compacted_error.to_string().contains("repair required"));
+    assert!(
+        journal_path
+            .with_extension("repair-required.jsonl")
+            .exists()
+    );
+
+    drop(busy_guard);
+    if let Some(previous_home) = previous_home {
+        crate::env::set_var("JCODE_HOME", previous_home);
     } else {
         crate::env::remove_var("JCODE_HOME");
     }

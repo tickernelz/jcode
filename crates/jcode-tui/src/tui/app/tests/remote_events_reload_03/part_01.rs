@@ -142,6 +142,7 @@ fn test_handle_server_event_history_with_interruption_queues_continuation() {
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
+            exact_runtime_identity: None,
             subagent_model: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
@@ -215,6 +216,7 @@ fn test_handle_server_event_history_uses_server_owned_reload_recovery_directive(
         images: vec![],
         provider_name: Some("claude".to_string()),
         provider_model: Some("claude-sonnet-4-20250514".to_string()),
+        exact_runtime_identity: None,
         subagent_model: None,
         autoreview_enabled: None,
         autojudge_enabled: None,
@@ -296,6 +298,7 @@ fn test_handle_server_event_history_without_interruption_does_not_queue() {
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
+            exact_runtime_identity: None,
             subagent_model: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
@@ -359,6 +362,7 @@ fn test_handle_server_event_history_after_reload_reports_no_continuation_needed(
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
+            exact_runtime_identity: None,
             subagent_model: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
@@ -463,7 +467,8 @@ fn test_reload_persisted_background_tasks_note_mentions_running_task() {
         &started_at,
         true,
         false,
-    ));
+    ))
+    .expect("register detached task");
 
     let note = reload_persisted_background_tasks_note(&session_id);
 
@@ -501,7 +506,8 @@ fn test_finalize_reload_reconnect_mentions_persisted_background_task() {
         &started_at,
         true,
         false,
-    ));
+    ))
+    .expect("register detached task");
 
     remote::finalize_reload_reconnect(
         &mut app,
@@ -660,6 +666,7 @@ fn test_handle_server_event_history_restores_side_panel_snapshot() {
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
+            exact_runtime_identity: None,
             subagent_model: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
@@ -717,6 +724,7 @@ fn test_handle_server_event_history_restores_active_resume_processing_state() {
             images: vec![],
             provider_name: Some("openai".to_string()),
             provider_model: Some("gpt-5.4".to_string()),
+            exact_runtime_identity: None,
             subagent_model: None,
             autoreview_enabled: None,
             autojudge_enabled: None,

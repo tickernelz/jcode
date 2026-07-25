@@ -547,278 +547,459 @@ fn test_account_switch_shorthand_switches_openai_account_by_label() {
     });
 }
 
-#[test]
-fn test_account_picker_prompt_new_openai_label_cancel_clears_prompt() {
-    let mut app = create_test_app();
-    app.prompt_new_account_label(crate::tui::account_picker::AccountProviderKind::OpenAi);
-
-    assert!(matches!(
-        app.pending_account_input,
-        Some(super::auth::PendingAccountInput::NewAccountLabel { ref provider_id, .. }) if provider_id == "openai"
-    ));
-
-    app.input = "/cancel".to_string();
-    app.submit_input();
-
-    assert!(app.pending_account_input.is_none());
-    assert!(app.pending_login.is_none());
+fn local_oauth_identity(
+    runtime_key: jcode_provider_core::RuntimeKey,
+    provider_key: &str,
+    account: (String, String, u64),
+) -> jcode_provider_core::ExactRuntimeIdentity {
+    jcode_provider_core::ExactRuntimeIdentity {
+        provider_key: provider_key.to_string(),
+        route: jcode_provider_core::RouteSelection {
+            model: "account-switch-model".to_string(),
+            runtime_key,
+            api_method: "oauth-test".to_string(),
+            provider_label: provider_key.to_string(),
+            detail: "exact account-switch route".to_string(),
+        },
+        account_label: Some(account.0),
+        account_id: Some(account.1),
+        account_generation: Some(account.2),
+        reasoning_effort: Some("high".to_string()),
+    }
 }
 
-#[test]
-fn test_login_command_opens_inline_login_picker() {
-    let mut app = create_test_app();
-    app.input = "/login".to_string();
-    app.submit_input();
-
-    let picker = app
-        .inline_interactive_state
-        .as_ref()
-        .expect("/login should open inline login picker");
-    assert_eq!(picker.kind, crate::tui::PickerKind::Login);
-    assert!(app.pending_login.is_none());
+#[derive(Clone)]
+struct RefreshingLocalAccountProvider {
+    identity: std::sync::Arc<std::sync::Mutex<jcode_provider_core::ExactRuntimeIdentity>>,
 }
 
-#[test]
-fn test_account_openai_compatible_settings_renders_provider_settings() {
-    let mut app = create_test_app();
-    app.input = "/account openai-compatible settings".to_string();
-    app.submit_input();
+#[async_trait::async_trait]
+impl Provider for RefreshingLocalAccountProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> anyhow::Result<crate::provider::EventStream> {
+        unimplemented!("identity admission test does not open a provider request")
+    }
 
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing settings output");
-    assert_eq!(msg.role, "system");
-    assert!(msg.content.contains("OpenAI-compatible"));
-    assert!(msg.content.contains("API base"));
-    assert!(msg.content.contains("default-model"));
-}
+    fn name(&self) -> &str {
+        "openai"
+    }
 
-#[test]
-fn test_account_default_provider_command_saves_config() {
-    let _guard = crate::storage::lock_test_env();
-    let mut app = create_test_app();
-    app.input = "/account default-provider openai".to_string();
-    app.submit_input();
+    fn model(&self) -> String {
+        "account-switch-model".to_string()
+    }
 
-    let cfg = crate::config::Config::load();
-    assert_eq!(cfg.provider.default_provider.as_deref(), Some("openai"));
-}
+    fn exact_runtime_identity(&self) -> Option<jcode_provider_core::ExactRuntimeIdentity> {
+        Some(self.identity.lock().unwrap().clone())
+    }
 
-#[test]
-fn test_commands_alias_shows_help() {
-    let mut app = create_test_app();
-    app.input = "/commands".to_string();
-    app.submit_input();
-
-    assert!(
-        app.help_scroll.is_some(),
-        "/commands should open help overlay"
-    );
-}
-
-#[test]
-fn test_improve_command_starts_improvement_loop() {
-    let mut app = create_test_app();
-    app.input = "/improve".to_string();
-    app.submit_input();
-
-    assert_eq!(app.improve_mode, Some(ImproveMode::ImproveRun));
-    assert_eq!(
-        app.session.improve_mode,
-        Some(crate::session::SessionImproveMode::ImproveRun)
-    );
-    assert!(app.is_processing());
-
-    let msg = app.session.messages.last().expect("missing improve prompt");
-    assert!(matches!(
-        &msg.content[0],
-        ContentBlock::Text { text, .. }
-            if text.contains("You are entering improvement mode for this repository")
-                && text.contains("write a concise ranked todo list using `todo`")
-    ));
-
-    let display = app
-        .display_messages()
-        .last()
-        .expect("missing improve launch notice");
-    assert!(display.content.contains("Starting improvement loop"));
-}
-
-#[test]
-fn test_improve_plan_command_is_plan_only_and_accepts_focus() {
-    let mut app = create_test_app();
-    app.input = "/improve plan startup performance".to_string();
-    app.submit_input();
-
-    assert_eq!(app.improve_mode, Some(ImproveMode::ImprovePlan));
-    assert_eq!(
-        app.session.improve_mode,
-        Some(crate::session::SessionImproveMode::ImprovePlan)
-    );
-    assert!(app.is_processing());
-
-    let msg = app
-        .session
-        .messages
-        .last()
-        .expect("missing improve plan prompt");
-    assert!(matches!(
-        &msg.content[0],
-        ContentBlock::Text { text, .. }
-            if text.contains("improvement planning mode")
-                && text.contains("This is plan-only mode")
-                && text.contains("Focus area: startup performance")
-    ));
-}
-
-#[test]
-fn test_improve_status_summarizes_current_todos() {
-    with_temp_jcode_home(|| {
-        let mut app = create_test_app();
-        crate::todo::save_todos(
-            &app.session.id,
-            &[
-                crate::todo::TodoItem {
-                    group: None,
-                    id: "one".to_string(),
-                    content: "Profile startup path".to_string(),
-                    status: "in_progress".to_string(),
-                    priority: "high".to_string(),
-                    blocked_by: Vec::new(),
-                    assigned_to: None,
-                    confidence: Some(82),
-                    completion_confidence: None,
-                    confidence_history: Vec::new(),
-                },
-                crate::todo::TodoItem {
-                    group: None,
-                    id: "two".to_string(),
-                    content: "Add regression test".to_string(),
-                    status: "completed".to_string(),
-                    priority: "medium".to_string(),
-                    blocked_by: Vec::new(),
-                    assigned_to: None,
-                    confidence: None,
-                    completion_confidence: None,
-                    confidence_history: Vec::new(),
-                },
-            ],
-        )
-        .expect("save todos");
-
-        app.improve_mode = Some(ImproveMode::ImproveRun);
-        app.input = "/improve status".to_string();
-        app.submit_input();
-
-        let msg = app
-            .display_messages()
-            .last()
-            .expect("missing improve status");
-        assert!(msg.content.contains("Improve status"));
-        assert!(
-            msg.content
-                .contains("1 incomplete · 1 completed · 0 cancelled")
+    async fn ensure_credentials_current(&self) -> anyhow::Result<()> {
+        *self.identity.lock().unwrap() = local_oauth_identity(
+            jcode_provider_core::RuntimeKey::OpenAIOAuth,
+            "openai",
+            crate::auth::codex::active_account_identity()
+                .ok_or_else(|| anyhow::anyhow!("active OpenAI test account is missing"))?,
         );
-        assert!(msg.content.contains("Profile startup path"));
-        assert!(msg.content.contains("confidence 82%"));
+        Ok(())
+    }
+
+    fn fork(&self) -> std::sync::Arc<dyn Provider> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
+fn install_local_account_projection(
+    app: &mut App,
+    identity: jcode_provider_core::ExactRuntimeIdentity,
+) -> (String, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut parent = crate::session::Session::create(None, None);
+    parent.exact_runtime_identity = Some(identity.clone());
+    parent.add_message(
+        crate::message::Role::User,
+        vec![ContentBlock::Text {
+            text: "canonical raw account history".to_string(),
+            cache_control: None,
+        }],
+    );
+    parent.save().unwrap();
+    let parent_id = parent.id.clone();
+    let canonical_raw = serde_json::to_vec(&parent.messages).unwrap();
+
+    let mut session = crate::session::Session::create(Some(parent_id.clone()), None);
+    session.provider_key = Some(identity.provider_key.clone());
+    session.model = Some(identity.route.model.clone());
+    session.route_api_method = Some(identity.route.api_method.clone());
+    session.reasoning_effort = identity.reasoning_effort.clone();
+    session.exact_runtime_identity = Some(identity.clone());
+    session.provider_session_id = Some("old-durable-resume".to_string());
+    session.provider_session_identity = Some(identity.clone());
+    session
+        .install_imported_context_root(
+            &parent,
+            crate::session::StoredCompactionState {
+                summary_text: "old-account imported projection".to_string(),
+                openai_encrypted_content: None,
+                covers_up_to_turn: 0,
+                original_turn_count: 1,
+                compacted_count: 1,
+            },
+            &identity,
+        )
+        .unwrap();
+    session.add_message(
+        crate::message::Role::User,
+        vec![ContentBlock::Text {
+            text: "current session raw bytes must survive account transition".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save().unwrap();
+    let immutable_nodes = serde_json::to_vec(&session.context_nodes).unwrap();
+    let current_raw = serde_json::to_vec(&session.messages).unwrap();
+    let old_projected_provider_view = session.messages_for_provider_uncached();
+    app.session = session;
+    app.messages = old_projected_provider_view;
+    app.provider_session_id = Some("old-runtime-resume".to_string());
+    (parent_id, canonical_raw, immutable_nodes, current_raw)
+}
+
+async fn wait_for_local_account_switch_completion() {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if crate::server::ensure_no_pending_account_reconciliation().is_ok()
+                && crate::provider::ensure_no_account_transition().is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("local account switch completion");
+}
+
+#[test]
+fn test_openai_account_switch_rebinds_exact_identity_and_deactivates_old_projection() {
+    with_temp_jcode_home(|| {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let account = |label: &str| crate::auth::codex::OpenAiAccount {
+            label: label.to_string(),
+            access_token: format!("access-{label}"),
+            refresh_token: format!("refresh-{label}"),
+            id_token: None,
+            account_id: Some(format!("acct-{label}")),
+            expires_at: Some(now_ms + 60_000),
+            email: None,
+        };
+        let first = crate::auth::codex::upsert_account(account("first")).unwrap();
+        let second = crate::auth::codex::upsert_account(account("second")).unwrap();
+        crate::auth::codex::set_active_account(&first).unwrap();
+        let old_identity = local_oauth_identity(
+            jcode_provider_core::RuntimeKey::OpenAIOAuth,
+            "openai",
+            crate::auth::codex::active_account_identity().unwrap(),
+        );
+
+        let mut app = create_test_app();
+        let (parent_id, canonical_raw, immutable_nodes, current_raw) =
+            install_local_account_projection(&mut app, old_identity.clone());
+        let session_id = app.session.id.clone();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            app.switch_openai_account(&second);
+            wait_for_local_account_switch_completion().await;
+        });
+
+        let target = crate::auth::codex::active_account_identity().unwrap();
+        assert_eq!(target.0, second);
+        let rebound = app
+            .session
+            .exact_runtime_identity
+            .as_ref()
+            .expect("destination exact identity");
+        assert_eq!(rebound.route, old_identity.route);
+        assert_eq!(rebound.account_label.as_deref(), Some(target.0.as_str()));
+        assert_eq!(rebound.account_id.as_deref(), Some(target.1.as_str()));
+        assert_eq!(rebound.account_generation, Some(target.2));
+        assert!(app.provider_session_id.is_none());
+        assert!(
+            app.provider_session_id_for_next_request().is_none(),
+            "the next provider request must not reuse the old account's resume ID"
+        );
+        assert!(app.session.provider_session_id.is_none());
+        assert!(app.session.provider_session_identity.is_none());
+        assert!(app.session.compaction.is_none());
+        assert!(app.session.context_frontier.as_ref().is_some_and(|frontier| {
+            frontier.active_node_ids.is_empty() && frontier.covered_message_count == 0
+        }));
+        assert!(
+            runtime
+                .block_on(async { app.registry.compaction().read().await.persisted_state() })
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_vec(&app.session.context_nodes).unwrap(),
+            immutable_nodes,
+            "account switch must deactivate, not delete, immutable forensic nodes"
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &crate::session::Session::load(&parent_id)
+                    .unwrap()
+                    .messages
+            )
+            .unwrap(),
+            canonical_raw,
+            "account switch must not mutate canonical ancestor history"
+        );
+        assert_eq!(
+            serde_json::to_vec(&app.session.messages).unwrap(),
+            current_raw,
+            "account switch must preserve current-session canonical raw bytes"
+        );
+        assert_eq!(
+            serde_json::to_vec(&app.messages).unwrap(),
+            serde_json::to_vec(&app.session.messages_for_provider_uncached()).unwrap(),
+            "the next request must use the raw canonical view, not the old account projection"
+        );
+        let persisted = crate::session::Session::load(&session_id).unwrap();
+        assert_eq!(persisted.exact_runtime_identity, app.session.exact_runtime_identity);
+        assert!(persisted.provider_session_id.is_none());
+        assert_eq!(serde_json::to_vec(&persisted.messages).unwrap(), current_raw);
     });
 }
 
 #[test]
-fn test_improve_stop_without_active_run_reports_idle() {
-    let mut app = create_test_app();
-    app.session.improve_mode = None;
-    app.input = "/improve stop".to_string();
-    app.submit_input();
-
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing improve stop idle message");
-    assert!(msg.content.contains("No active improve loop to stop"));
-}
-
-#[test]
-fn test_improve_stop_queues_stop_prompt_and_clears_mode() {
-    let mut app = create_test_app();
-    app.improve_mode = Some(ImproveMode::ImproveRun);
-    app.session.improve_mode = Some(crate::session::SessionImproveMode::ImproveRun);
-    app.input = "/improve stop".to_string();
-    app.submit_input();
-
-    assert_eq!(app.improve_mode, None);
-    assert_eq!(app.session.improve_mode, None);
-    assert!(app.is_processing());
-
-    let msg = app
-        .session
-        .messages
-        .last()
-        .expect("missing improve stop prompt");
-    assert!(matches!(
-        &msg.content[0],
-        ContentBlock::Text { text, .. }
-            if text.contains("Stop improvement mode after the current safe point")
-    ));
-}
-
-#[test]
-fn test_improve_resume_requires_saved_mode() {
-    let mut app = create_test_app();
-    app.input = "/improve resume".to_string();
-    app.submit_input();
-
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing improve resume idle message");
-    assert!(msg.content.contains("No saved improve run found"));
-}
-
-#[test]
-fn test_improve_resume_uses_saved_mode_and_current_todos() {
+fn test_anthropic_account_switch_rebinds_exact_identity_and_deactivates_old_projection() {
     with_temp_jcode_home(|| {
-        let mut app = create_test_app();
-        app.session.improve_mode = Some(crate::session::SessionImproveMode::ImproveRun);
-        app.session.save().expect("save session");
-        crate::todo::save_todos(
-            &app.session.id,
-            &[crate::todo::TodoItem {
-                group: None,
-                id: "resume1".to_string(),
-                content: "Refactor command parsing".to_string(),
-                status: "in_progress".to_string(),
-                priority: "high".to_string(),
-                blocked_by: Vec::new(),
-                assigned_to: None,
-                confidence: None,
-                completion_confidence: None,
-                confidence_history: Vec::new(),
-            }],
-        )
-        .expect("save todos");
-
-        app.input = "/improve resume".to_string();
-        app.submit_input();
-
-        assert_eq!(app.improve_mode, Some(ImproveMode::ImproveRun));
-        assert_eq!(
-            app.session.improve_mode,
-            Some(crate::session::SessionImproveMode::ImproveRun)
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let account = |label: &str| crate::auth::claude::AnthropicAccount {
+            label: label.to_string(),
+            access: format!("access-{label}"),
+            refresh: format!("refresh-{label}"),
+            expires: now_ms + 60_000,
+            email: None,
+            scopes: Vec::new(),
+            subscription_type: Some("max".to_string()),
+        };
+        let first = crate::auth::claude::upsert_account(account("first")).unwrap();
+        let second = crate::auth::claude::upsert_account(account("second")).unwrap();
+        crate::auth::claude::set_active_account(&first).unwrap();
+        let old_identity = local_oauth_identity(
+            jcode_provider_core::RuntimeKey::ClaudeOAuth,
+            "anthropic",
+            crate::auth::claude::active_account_identity().unwrap(),
         );
-        assert!(app.is_processing());
 
-        let msg = app
+        let mut app = create_test_app();
+        let (parent_id, canonical_raw, immutable_nodes, current_raw) =
+            install_local_account_projection(&mut app, old_identity.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            app.switch_account(&second);
+            wait_for_local_account_switch_completion().await;
+        });
+
+        let target = crate::auth::claude::active_account_identity().unwrap();
+        assert_eq!(target.0, second);
+        let rebound = app
             .session
-            .messages
-            .last()
-            .expect("missing improve resume prompt");
-        assert!(matches!(
-            &msg.content[0],
-            ContentBlock::Text { text, .. }
-                if text.contains("Resume improvement mode")
-                    && text.contains("Refactor command parsing")
-        ));
+            .exact_runtime_identity
+            .as_ref()
+            .expect("destination exact identity");
+        assert_eq!(rebound.route, old_identity.route);
+        assert_eq!(rebound.account_label.as_deref(), Some(target.0.as_str()));
+        assert_eq!(rebound.account_id.as_deref(), Some(target.1.as_str()));
+        assert_eq!(rebound.account_generation, Some(target.2));
+        assert!(app.provider_session_id.is_none());
+        assert!(
+            app.provider_session_id_for_next_request().is_none(),
+            "the next provider request must not reuse the old account's resume ID"
+        );
+        assert!(app.session.provider_session_id.is_none());
+        assert!(app.session.provider_session_identity.is_none());
+        assert!(app.session.compaction.is_none());
+        assert!(app.session.context_frontier.as_ref().is_some_and(|frontier| {
+            frontier.active_node_ids.is_empty() && frontier.covered_message_count == 0
+        }));
+        assert!(
+            runtime
+                .block_on(async { app.registry.compaction().read().await.persisted_state() })
+                .is_none()
+        );
+        assert_eq!(serde_json::to_vec(&app.session.context_nodes).unwrap(), immutable_nodes);
+        assert_eq!(
+            serde_json::to_vec(
+                &crate::session::Session::load(&parent_id)
+                    .unwrap()
+                    .messages
+            )
+            .unwrap(),
+            canonical_raw
+        );
+        assert_eq!(serde_json::to_vec(&app.session.messages).unwrap(), current_raw);
+        assert_eq!(
+            serde_json::to_vec(&app.messages).unwrap(),
+            serde_json::to_vec(&app.session.messages_for_provider_uncached()).unwrap()
+        );
+    });
+}
+
+#[test]
+fn test_external_account_reconciliation_clears_old_resume_before_next_local_request() {
+    with_temp_jcode_home(|| {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let account = |label: &str| crate::auth::codex::OpenAiAccount {
+            label: label.to_string(),
+            access_token: format!("access-{label}"),
+            refresh_token: format!("refresh-{label}"),
+            id_token: None,
+            account_id: Some(format!("acct-{label}")),
+            expires_at: Some(now_ms + 60_000),
+            email: None,
+        };
+        let first = crate::auth::codex::upsert_account(account("first")).unwrap();
+        let second = crate::auth::codex::upsert_account(account("second")).unwrap();
+        crate::auth::codex::set_active_account(&first).unwrap();
+        let old_identity = local_oauth_identity(
+            jcode_provider_core::RuntimeKey::OpenAIOAuth,
+            "openai",
+            crate::auth::codex::active_account_identity().unwrap(),
+        );
+        let mut app = create_test_app();
+        app.provider = std::sync::Arc::new(RefreshingLocalAccountProvider {
+            identity: std::sync::Arc::new(std::sync::Mutex::new(old_identity.clone())),
+        });
+        install_local_account_projection(&mut app, old_identity);
+        let old_revision = app.session.persistence_revision;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (_, current_is_target, completion) = crate::server::prepare_local_account_switch(
+                app.provider.clone(),
+                jcode_provider_core::RuntimeKey::OpenAIOAuth,
+                &second,
+                &app.session.id,
+            )
+            .unwrap();
+            assert!(current_is_target);
+            completion.finish().await.unwrap();
+        });
+
+        assert_eq!(
+            app.provider_session_id.as_deref(),
+            Some("old-runtime-resume"),
+            "fixture must retain the other process's stale in-memory resume before admission"
+        );
+        let admission = runtime
+            .block_on(app.acquire_local_model_turn_admission())
+            .expect("peer TUI admission must refresh credentials and adopt durable identity");
+        assert!(app.session.persistence_revision > old_revision);
+        assert!(app.provider_session_id_for_next_request().is_none());
+        assert!(app.session.provider_session_id.is_none());
+        assert!(app.session.provider_session_identity.is_none());
+        assert!(app.session.compaction.is_none());
+        let target = crate::auth::codex::active_account_identity().unwrap();
+        assert_eq!(
+            app.session
+                .exact_runtime_identity
+                .as_ref()
+                .and_then(|identity| identity.account_id.as_deref()),
+            Some(target.1.as_str())
+        );
+        assert_eq!(app.provider.exact_runtime_identity(), app.session.exact_runtime_identity);
+        drop(admission);
+    });
+}
+
+#[test]
+fn test_openai_account_switch_preflight_failure_keeps_original_account_and_resume() {
+    with_temp_jcode_home(|| {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let account = |label: &str| crate::auth::codex::OpenAiAccount {
+            label: label.to_string(),
+            access_token: format!("access-{label}"),
+            refresh_token: format!("refresh-{label}"),
+            id_token: None,
+            account_id: Some(format!("acct-{label}")),
+            expires_at: Some(now_ms + 60_000),
+            email: None,
+        };
+        let first = crate::auth::codex::upsert_account(account("first")).unwrap();
+        let second = crate::auth::codex::upsert_account(account("second")).unwrap();
+        crate::auth::codex::set_active_account(&first).unwrap();
+
+        let mut app = create_test_app();
+        app.provider_session_id = Some("runtime-resume".to_string());
+        app.session.provider_key = Some("openai".to_string());
+        app.session.provider_session_id = Some("durable-resume".to_string());
+        app.session.save().unwrap();
+        let mut concurrent = crate::session::Session::load(&app.session.id).unwrap();
+        concurrent.title = Some("advance CAS revision".to_string());
+        concurrent.save().unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            app.switch_openai_account(&second);
+        });
+
+        assert_eq!(crate::auth::codex::active_account_label().as_deref(), Some(first.as_str()));
+        assert_eq!(app.provider_session_id.as_deref(), Some("runtime-resume"));
+        assert_eq!(app.session.provider_session_id.as_deref(), Some("durable-resume"));
+        assert_eq!(
+            crate::session::Session::load(&app.session.id)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("advance CAS revision")
+        );
+        assert!(crate::server::ensure_no_pending_account_reconciliation().is_ok());
+    });
+}
+
+#[test]
+fn test_openai_account_switch_during_admitted_turn_fails_fast_without_mutation() {
+    with_temp_jcode_home(|| {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let account = |label: &str| crate::auth::codex::OpenAiAccount {
+            label: label.to_string(),
+            access_token: format!("access-{label}"),
+            refresh_token: format!("refresh-{label}"),
+            id_token: None,
+            account_id: Some(format!("acct-{label}")),
+            expires_at: Some(now_ms + 60_000),
+            email: None,
+        };
+        let first = crate::auth::codex::upsert_account(account("turn-first")).unwrap();
+        let second = crate::auth::codex::upsert_account(account("turn-second")).unwrap();
+        crate::auth::codex::set_active_account(&first).unwrap();
+        let old_identity = local_oauth_identity(
+            jcode_provider_core::RuntimeKey::OpenAIOAuth,
+            "openai",
+            crate::auth::codex::active_account_identity().unwrap(),
+        );
+        let mut app = create_test_app();
+        install_local_account_projection(&mut app, old_identity);
+        let old_session = serde_json::to_vec(&app.session).unwrap();
+        let old_runtime_resume = app.provider_session_id.clone();
+        let admission = crate::session::AccountTransitionFileLock::acquire_shared().unwrap();
+        app.is_processing = true;
+
+        let started = std::time::Instant::now();
+        let error = app
+            .prepare_local_account_switch(jcode_provider_core::RuntimeKey::OpenAIOAuth, &second)
+            .expect_err("in-turn account switch must fail fast");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.to_string().contains("retry after it finishes"));
+        assert_eq!(
+            crate::auth::codex::active_account_label().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(serde_json::to_vec(&app.session).unwrap(), old_session);
+        assert_eq!(app.provider_session_id, old_runtime_resume);
+        drop(admission);
     });
 }

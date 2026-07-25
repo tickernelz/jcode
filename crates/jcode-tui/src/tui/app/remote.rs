@@ -1,9 +1,10 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::{
-    App, DisplayMessage, PendingReloadReconnectStatus, ProcessingStatus, RemoteResumeActivity,
-    SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
-    remote_notifications::present_swarm_notification, spawn_in_new_terminal,
+    App, DisplayMessage, PendingReloadReconnectStatus, PendingRemoteAccountSwitch,
+    ProcessingStatus, RemoteResumeActivity, SendAction, ctrl_bracket_fallback_to_esc, input,
+    parse_rate_limit_error, remote_notifications::present_swarm_notification,
+    spawn_in_new_terminal,
 };
 use crate::bus::BusEvent;
 use crate::message::ToolCall;
@@ -400,49 +401,34 @@ pub(super) async fn handle_terminal_event(
                     match selection {
                         crate::tui::AccountPickerAction::Switch { provider_id, label } => {
                             match provider_id.as_str() {
-                                "claude" => {
-                                    if let Err(e) = crate::auth::claude::set_active_account(&label)
-                                    {
-                                        app.push_display_message(DisplayMessage::error(format!(
-                                            "Failed to switch account: {}",
-                                            e
-                                        )));
-                                    } else {
-                                        crate::auth::AuthStatus::invalidate_cache();
-                                        app.context_limit = app.provider.context_window() as u64;
-                                        app.context_warning_shown = false;
-                                        let _ = remote.switch_anthropic_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to Anthropic account `{}`.",
-                                            label
-                                        )));
-                                        app.set_status_notice(format!(
-                                            "Account: switched to {}",
-                                            label
-                                        ));
+                                "claude" => match remote.switch_anthropic_account(&label).await {
+                                    Ok(id) => {
+                                        app.pending_remote_account_switch =
+                                            Some(PendingRemoteAccountSwitch {
+                                                id,
+                                                provider_id: provider_id.clone(),
+                                                label: label.clone(),
+                                            });
+                                        app.set_status_notice("Waiting for server account switch");
                                     }
-                                }
-                                "openai" => {
-                                    if let Err(e) = crate::auth::codex::set_active_account(&label) {
-                                        app.push_display_message(DisplayMessage::error(format!(
-                                            "Failed to switch OpenAI account: {}",
-                                            e
-                                        )));
-                                    } else {
-                                        crate::auth::AuthStatus::invalidate_cache();
-                                        app.context_limit = app.provider.context_window() as u64;
-                                        app.context_warning_shown = false;
-                                        let _ = remote.switch_openai_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to OpenAI account `{}`.",
-                                            label
-                                        )));
-                                        app.set_status_notice(format!(
-                                            "OpenAI account: switched to {}",
-                                            label
-                                        ));
+                                    Err(e) => app.push_display_message(DisplayMessage::error(
+                                        format!("Failed to request account switch: {e}"),
+                                    )),
+                                },
+                                "openai" => match remote.switch_openai_account(&label).await {
+                                    Ok(id) => {
+                                        app.pending_remote_account_switch =
+                                            Some(PendingRemoteAccountSwitch {
+                                                id,
+                                                provider_id: provider_id.clone(),
+                                                label: label.clone(),
+                                            });
+                                        app.set_status_notice("Waiting for server account switch");
                                     }
-                                }
+                                    Err(e) => app.push_display_message(DisplayMessage::error(
+                                        format!("Failed to request OpenAI account switch: {e}"),
+                                    )),
+                                },
                                 _ => app.push_display_message(DisplayMessage::error(format!(
                                     "Provider `{}` does not support account switching.",
                                     provider_id

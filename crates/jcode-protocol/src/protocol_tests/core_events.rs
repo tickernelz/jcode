@@ -394,6 +394,20 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         images: Vec::new(),
         provider_name: Some("openai".to_string()),
         provider_model: Some("gpt-5.4".to_string()),
+        exact_runtime_identity: Some(jcode_provider_core::ExactRuntimeIdentity {
+            provider_key: "openai".to_string(),
+            route: jcode_provider_core::RouteSelection {
+                model: "gpt-5.4".to_string(),
+                runtime_key: jcode_provider_core::RuntimeKey::OpenAIOAuth,
+                api_method: "openai-oauth".to_string(),
+                provider_label: "OpenAI".to_string(),
+                detail: String::new(),
+            },
+            account_label: Some("openai-2".to_string()),
+            account_id: Some("account_stable".to_string()),
+            account_generation: Some(7),
+            reasoning_effort: Some("high".to_string()),
+        }),
         available_models: vec!["gpt-5.4".to_string()],
         available_model_routes: Vec::new(),
         mcp_servers: Vec::new(),
@@ -448,6 +462,7 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         messages,
         provider_name,
         provider_model,
+        exact_runtime_identity,
         total_tokens,
         token_usage_totals,
         ..
@@ -458,6 +473,13 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
     assert_eq!(id, 101);
     assert_eq!(provider_name.as_deref(), Some("openai"));
     assert_eq!(provider_model.as_deref(), Some("gpt-5.4"));
+    let identity = exact_runtime_identity.expect("typed runtime identity");
+    assert_eq!(identity.provider_key, "openai");
+    assert_eq!(identity.route.runtime_key, jcode_provider_core::RuntimeKey::OpenAIOAuth);
+    assert_eq!(identity.account_label.as_deref(), Some("openai-2"));
+    assert_eq!(identity.account_id.as_deref(), Some("account_stable"));
+    assert_eq!(identity.account_generation, Some(7));
+    assert_eq!(identity.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(total_tokens, Some((123, 45)));
     assert_eq!(
         token_usage_totals.map(|totals| totals.cache_read_input_tokens),

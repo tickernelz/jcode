@@ -240,7 +240,7 @@ impl Agent {
                 }
             ));
             if let Some(msg_id) = assistant_message_id {
-                self.session.remove_tool_use_blocks(msg_id);
+                self.session.suppress_tool_use_blocks_for_provider(msg_id);
                 self.persist_session_best_effort("truncated tool-call repair");
             }
         }

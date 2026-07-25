@@ -218,6 +218,10 @@ fn description_tells_models_to_check_status_before_setup() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the process-wide test environment must stay isolated for the entire async scenario"
+)]
 async fn readiness_does_not_trust_a_stale_setup_marker() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -532,6 +532,7 @@ async fn persistent_ws_does_not_reuse_response_cancelled_before_completion() {
     let persistent_ws = Arc::new(Mutex::new(Some(PersistentWsState {
         ws_stream: client_ws,
         last_response_id: "resp_previous".to_string(),
+        response_chain_generation: 0,
         connected_at: Instant::now(),
         last_activity_at: Instant::now(),
         last_response_completed_at: Instant::now(),
@@ -543,6 +544,7 @@ async fn persistent_ws_does_not_reuse_response_cancelled_before_completion() {
 
     let result = try_persistent_ws_continuation(
         &persistent_ws,
+        &AtomicU64::new(0),
         &serde_json::json!({"model": "gpt-5.6-sol"}),
         &[
             serde_json::json!({"type": "message", "role": "user", "content": "first"}),
@@ -559,4 +561,55 @@ async fn persistent_ws_does_not_reuse_response_cancelled_before_completion() {
         "an incomplete response may contain unseen tool calls and must not be reused"
     );
     server.await.expect("test websocket server");
+}
+
+#[tokio::test]
+async fn persistent_ws_rechecks_identity_generation_immediately_before_send() {
+    let (state, server) = test_persistent_ws_state().await;
+    let persistent_ws = Arc::new(Mutex::new(Some(state)));
+    let generation = Arc::new(AtomicU64::new(0));
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.send(Ok(StreamEvent::ConnectionType {
+        connection: "test-channel-blocker".to_string(),
+    }))
+    .await
+    .expect("prefill event channel");
+
+    let task = {
+        let persistent_ws = Arc::clone(&persistent_ws);
+        let generation = Arc::clone(&generation);
+        tokio::spawn(async move {
+            try_persistent_ws_continuation(
+                &persistent_ws,
+                &generation,
+                &serde_json::json!({"model": "gpt-5.6-sol"}),
+                &[
+                    serde_json::json!({"type": "message", "role": "user", "content": "first"}),
+                    serde_json::json!({"type": "message", "role": "user", "content": "next"}),
+                ],
+                2,
+                &tx,
+            )
+            .await
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !task.is_finished(),
+        "the full event channel must hold continuation immediately before websocket send"
+    );
+    generation.fetch_add(1, AtomicOrdering::AcqRel);
+    let _ = rx.recv().await.expect("drain prefilled event");
+
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("continuation should settle")
+        .expect("continuation task should not panic");
+    assert!(matches!(result, PersistentWsResult::NotAvailable));
+    assert!(
+        persistent_ws.lock().await.is_none(),
+        "identity drift immediately before send must discard previous_response_id"
+    );
+    server.abort();
 }

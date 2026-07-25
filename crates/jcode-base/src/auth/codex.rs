@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const ALLOW_LEGACY_AUTH_ENV: &str = "JCODE_ALLOW_CODEX_LEGACY_AUTH";
 pub const LEGACY_CODEX_AUTH_SOURCE_ID: &str = "openai_codex_auth_json";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexCredentials {
     pub access_token: String,
     pub refresh_token: String,
@@ -37,6 +38,8 @@ pub struct JcodeOpenAiAuthFile {
     pub openai_accounts: Vec<OpenAiAccount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_openai_account: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub account_identities: HashMap<String, crate::auth::account_store::StoredAccountIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +161,21 @@ pub fn has_unconsented_legacy_credentials() -> bool {
 }
 
 pub fn load_auth_file() -> Result<JcodeOpenAiAuthFile> {
+    let (auth, changed) = load_auth_file_unpersisted()?;
+    if !changed {
+        return Ok(auth);
+    }
+    let _lock = crate::auth::account_store::CrossProcessFileLock::acquire(
+        &jcode_auth_path()?.with_extension("mutation.lock"),
+    )?;
+    let (auth, changed) = load_auth_file_unpersisted()?;
+    if changed {
+        save_auth_file(&auth)?;
+    }
+    Ok(auth)
+}
+
+fn load_auth_file_unpersisted() -> Result<(JcodeOpenAiAuthFile, bool)> {
     let path = jcode_auth_path()?;
     let mut auth = if path.exists() {
         crate::storage::harden_secret_file_permissions(&path);
@@ -167,14 +185,20 @@ pub fn load_auth_file() -> Result<JcodeOpenAiAuthFile> {
         JcodeOpenAiAuthFile::default()
     };
 
+    let mut changed = false;
     if relabel_accounts(&mut auth) {
         crate::logging::info(
             "Renaming OpenAI accounts to numbered labels (openai-1, openai-2, ...)",
         );
-        save_auth_file(&auth)?;
+        changed = true;
     }
-
-    Ok(auth)
+    changed |= crate::auth::account_store::ensure_account_identities(
+        auth.openai_accounts
+            .iter()
+            .map(|account| account.label.as_str()),
+        &mut auth.account_identities,
+    );
+    Ok((auth, changed))
 }
 
 pub fn save_auth_file(auth: &JcodeOpenAiAuthFile) -> Result<()> {
@@ -182,10 +206,21 @@ pub fn save_auth_file(auth: &JcodeOpenAiAuthFile) -> Result<()> {
     let clean = JcodeOpenAiAuthFile {
         openai_accounts: auth.openai_accounts.clone(),
         active_openai_account: auth.active_openai_account.clone(),
+        account_identities: auth.account_identities.clone(),
     };
 
     crate::storage::write_json_secret(&auth_path, &clean)?;
     Ok(())
+}
+
+fn mutate_auth_file<T>(mutate: impl FnOnce(&mut JcodeOpenAiAuthFile) -> Result<T>) -> Result<T> {
+    let _lock = crate::auth::account_store::CrossProcessFileLock::acquire(
+        &jcode_auth_path()?.with_extension("mutation.lock"),
+    )?;
+    let (mut auth, _) = load_auth_file_unpersisted()?;
+    let output = mutate(&mut auth)?;
+    save_auth_file(&auth)?;
+    Ok(output)
 }
 
 pub fn list_accounts() -> Result<Vec<OpenAiAccount>> {
@@ -194,7 +229,13 @@ pub fn list_accounts() -> Result<Vec<OpenAiAccount>> {
 }
 
 pub fn active_account_label() -> Option<String> {
-    let auth = load_auth_file().ok()?;
+    let auth = match load_auth_file() {
+        Ok(auth) => auth,
+        Err(error) => {
+            crate::logging::warn(&format!("Failed to load OpenAI account labels: {error}"));
+            return None;
+        }
+    };
     crate::auth::account_store::active_account_label(
         get_active_account_override(),
         auth.active_openai_account,
@@ -203,62 +244,96 @@ pub fn active_account_label() -> Option<String> {
     )
 }
 
-pub fn set_active_account(label: &str) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    crate::auth::account_store::set_active_account(
-        label,
+/// Stable non-secret identity of the currently selected OAuth account.
+pub fn active_account_identity() -> Option<(String, String, u64)> {
+    let auth = match load_auth_file() {
+        Ok(auth) => auth,
+        Err(error) => {
+            crate::logging::warn(&format!("Failed to load OpenAI account identity: {error}"));
+            return None;
+        }
+    };
+    let label = crate::auth::account_store::active_account_label(
+        get_active_account_override(),
+        auth.active_openai_account.clone(),
         &auth.openai_accounts,
-        &mut auth.active_openai_account,
-        "No OpenAI account with label '{}' found",
         |account| account.label.as_str(),
     )?;
-    save_auth_file(&auth)?;
+    let identity = auth.account_identities.get(&label)?;
+    Some((label, identity.id.clone(), identity.generation))
+}
+
+pub fn set_active_account(label: &str) -> Result<()> {
+    mutate_auth_file(|auth| {
+        crate::auth::account_store::set_active_account(
+            label,
+            &auth.openai_accounts,
+            &mut auth.active_openai_account,
+            "No OpenAI account with label '{}' found",
+            |account| account.label.as_str(),
+        )
+    })?;
     set_active_account_override(Some(label.to_string()));
     Ok(())
 }
 
 pub fn upsert_account(account: OpenAiAccount) -> Result<String> {
-    let mut auth = load_auth_file()?;
-    let label = crate::auth::account_store::upsert_account(
-        ACCOUNT_LABEL_PREFIX,
-        &mut auth.openai_accounts,
-        &mut auth.active_openai_account,
-        account,
-        |account| account.label.as_str(),
-        |account, label| account.label = label,
-    );
-    save_auth_file(&auth)?;
-    Ok(label)
+    mutate_auth_file(|auth| {
+        let replacing = auth
+            .openai_accounts
+            .iter()
+            .any(|existing| existing.label == account.label);
+        let label = crate::auth::account_store::upsert_account(
+            ACCOUNT_LABEL_PREFIX,
+            &mut auth.openai_accounts,
+            &mut auth.active_openai_account,
+            account,
+            |account| account.label.as_str(),
+            |account, label| account.label = label,
+        );
+        crate::auth::account_store::ensure_account_identities(
+            auth.openai_accounts
+                .iter()
+                .map(|account| account.label.as_str()),
+            &mut auth.account_identities,
+        );
+        if replacing && let Some(identity) = auth.account_identities.get_mut(&label) {
+            identity.generation = identity.generation.saturating_add(1);
+        }
+        Ok(label)
+    })
 }
 
 pub fn remove_account(label: &str) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    let before = auth.openai_accounts.len();
-    auth.openai_accounts
-        .retain(|account| account.label != label);
-    if auth.openai_accounts.len() == before {
-        anyhow::bail!("No OpenAI account with label '{}' found", label);
-    }
-
-    if auth.active_openai_account.as_deref() == Some(label) {
-        auth.active_openai_account = auth.openai_accounts.first().map(|a| a.label.clone());
-    }
-
-    save_auth_file(&auth)?;
+    let active = mutate_auth_file(|auth| {
+        let before = auth.openai_accounts.len();
+        auth.openai_accounts
+            .retain(|account| account.label != label);
+        if auth.openai_accounts.len() == before {
+            anyhow::bail!("No OpenAI account with label '{}' found", label);
+        }
+        auth.account_identities.remove(label);
+        if auth.active_openai_account.as_deref() == Some(label) {
+            auth.active_openai_account = auth.openai_accounts.first().map(|a| a.label.clone());
+        }
+        Ok(auth.active_openai_account.clone())
+    })?;
 
     if get_active_account_override().as_deref() == Some(label) {
-        set_active_account_override(auth.active_openai_account.clone());
+        set_active_account_override(active);
     }
 
     Ok(())
 }
 
 pub fn clear_accounts() -> Result<usize> {
-    let mut auth = load_auth_file()?;
-    let removed = auth.openai_accounts.len();
-    auth.openai_accounts.clear();
-    auth.active_openai_account = None;
-    save_auth_file(&auth)?;
+    let removed = mutate_auth_file(|auth| {
+        let removed = auth.openai_accounts.len();
+        auth.openai_accounts.clear();
+        auth.active_openai_account = None;
+        auth.account_identities.clear();
+        Ok(removed)
+    })?;
     set_active_account_override(None);
     Ok(removed)
 }
@@ -271,45 +346,55 @@ pub fn update_account_tokens(
     account_id: Option<String>,
     expires_at: Option<i64>,
 ) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    if let Some(account) = auth
-        .openai_accounts
-        .iter_mut()
-        .find(|account| account.label == label)
-    {
-        account.access_token = access_token.to_string();
-        account.refresh_token = refresh_token.to_string();
-        account.id_token = id_token.clone();
-        account.account_id =
-            account_id.or_else(|| id_token.as_deref().and_then(extract_account_id));
-        account.expires_at = expires_at;
-        account.email = id_token.as_deref().and_then(extract_email);
-        save_auth_file(&auth)?;
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "No OpenAI account with label '{}' found for token update",
-            label
-        );
-    }
+    mutate_auth_file(|auth| {
+        if let Some(account) = auth
+            .openai_accounts
+            .iter_mut()
+            .find(|account| account.label == label)
+        {
+            account.access_token = access_token.to_string();
+            account.refresh_token = refresh_token.to_string();
+            if id_token.is_some() {
+                account.id_token = id_token.clone();
+            }
+            let refreshed_account_id =
+                account_id.or_else(|| id_token.as_deref().and_then(extract_account_id));
+            if refreshed_account_id.is_some() {
+                account.account_id = refreshed_account_id;
+            }
+            account.expires_at = expires_at;
+            if account.email.is_none() {
+                account.email = id_token.as_deref().and_then(extract_email);
+            }
+            if let Some(identity) = auth.account_identities.get_mut(label) {
+                identity.generation = identity.generation.saturating_add(1);
+            }
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "No OpenAI account with label '{}' found for token update",
+                label
+            );
+        }
+    })
 }
 
 pub fn update_account_profile(label: &str, email: Option<String>) -> Result<()> {
-    let mut auth = load_auth_file()?;
-    if let Some(account) = auth
-        .openai_accounts
-        .iter_mut()
-        .find(|account| account.label == label)
-    {
-        account.email = email;
-        save_auth_file(&auth)?;
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "No OpenAI account with label '{}' found for profile update",
-            label
-        );
-    }
+    mutate_auth_file(|auth| {
+        if let Some(account) = auth
+            .openai_accounts
+            .iter_mut()
+            .find(|account| account.label == label)
+        {
+            account.email = email;
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "No OpenAI account with label '{}' found for profile update",
+                label
+            );
+        }
+    })
 }
 
 pub fn load_credentials() -> Result<CodexCredentials> {
@@ -421,15 +506,112 @@ pub fn upsert_account_from_tokens(
     id_token: Option<String>,
     expires_at: Option<i64>,
 ) -> Result<String> {
-    let creds = CodexCredentials {
-        access_token: access_token.to_string(),
-        refresh_token: refresh_token.to_string(),
-        account_id: id_token.as_deref().and_then(extract_account_id),
+    upsert_account_from_tokens_with_mode(
+        label,
+        access_token,
+        refresh_token,
         id_token,
         expires_at,
-    };
-    let email = creds.id_token.as_deref().and_then(extract_email);
-    upsert_account(account_from_credentials(label, &creds, email))
+        false,
+    )
+}
+
+pub fn replace_account_from_tokens(
+    label: &str,
+    access_token: &str,
+    refresh_token: &str,
+    id_token: Option<String>,
+    expires_at: Option<i64>,
+) -> Result<String> {
+    upsert_account_from_tokens_with_mode(
+        label,
+        access_token,
+        refresh_token,
+        id_token,
+        expires_at,
+        true,
+    )
+}
+
+fn upsert_account_from_tokens_with_mode(
+    label: &str,
+    access_token: &str,
+    refresh_token: &str,
+    id_token: Option<String>,
+    expires_at: Option<i64>,
+    replacement_login: bool,
+) -> Result<String> {
+    mutate_auth_file(|auth| {
+        let account_id = id_token.as_deref().and_then(extract_account_id);
+        let email = id_token.as_deref().and_then(extract_email);
+        if let Some(account) = auth
+            .openai_accounts
+            .iter_mut()
+            .find(|account| account.label == label)
+        {
+            account.access_token = access_token.to_string();
+            account.refresh_token = refresh_token.to_string();
+            account.expires_at = expires_at;
+            let existing_has_identity = account.account_id.is_some() || account.email.is_some();
+            let replacement_has_identity = account_id.is_some() || email.is_some();
+            let identity_is_proven_same = account
+                .account_id
+                .as_ref()
+                .zip(account_id.as_ref())
+                .is_some_and(|(existing, replacement)| existing == replacement)
+                || account.email.as_ref().zip(email.as_ref()).is_some_and(
+                    |(existing, replacement)| existing.eq_ignore_ascii_case(replacement),
+                );
+            let must_replace_identity_metadata = replacement_login
+                && (!replacement_has_identity
+                    || (existing_has_identity && !identity_is_proven_same));
+            if must_replace_identity_metadata {
+                account.id_token = id_token;
+                account.account_id = account_id;
+                account.email = email;
+            } else {
+                if id_token.is_some() {
+                    account.id_token = id_token;
+                }
+                if account_id.is_some() {
+                    account.account_id = account_id;
+                }
+                // Profile metadata is updated by the profile path. A token save must
+                // not revert a newer profile write that committed while login or
+                // refresh was in flight.
+                if account.email.is_none() {
+                    account.email = email;
+                }
+            }
+            if let Some(identity) = auth.account_identities.get_mut(label) {
+                identity.generation = identity.generation.saturating_add(1);
+            }
+            return Ok(label.to_string());
+        }
+
+        let credentials = CodexCredentials {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            account_id,
+            id_token,
+            expires_at,
+        };
+        let stored_label = crate::auth::account_store::upsert_account(
+            ACCOUNT_LABEL_PREFIX,
+            &mut auth.openai_accounts,
+            &mut auth.active_openai_account,
+            account_from_credentials(label, &credentials, email),
+            |account| account.label.as_str(),
+            |account, label| account.label = label,
+        );
+        crate::auth::account_store::ensure_account_identities(
+            auth.openai_accounts
+                .iter()
+                .map(|account| account.label.as_str()),
+            &mut auth.account_identities,
+        );
+        Ok(stored_label)
+    })
 }
 
 fn load_jcode_credentials() -> Result<CodexCredentials> {

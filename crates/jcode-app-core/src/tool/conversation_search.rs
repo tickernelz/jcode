@@ -167,12 +167,31 @@ impl Tool for ConversationSearchTool {
                 "conversation_search source session is not in the current session's recorded parent chain"
             );
         }
+        let current_session = Session::load(&ctx.session_id).map_err(|error| {
+            anyhow::anyhow!("conversation_search cannot verify current session identity: {error}")
+        })?;
+        let current_identity = current_session.exact_runtime_identity.as_ref();
+        if !current_identity.is_some_and(|identity| identity.has_verifiable_account_binding()) {
+            anyhow::bail!(
+                "conversation_search is disabled because the current credential identity is opaque or incomplete"
+            );
+        }
         let loaded_session = Session::load(&source_session_id).ok();
         if loaded_session.is_none() {
             crate::logging::warn(&format!(
                 "[tool:conversation_search] failed to load session history for session {}",
                 source_session_id
             ));
+        }
+        let source_identity = loaded_session
+            .as_ref()
+            .and_then(|session| session.exact_runtime_identity.as_ref());
+        if !source_identity.is_some_and(|identity| identity.has_verifiable_account_binding())
+            || source_identity != current_identity
+        {
+            anyhow::bail!(
+                "conversation_search is disabled because the source session credential identity is opaque, incomplete, or does not exactly match the current session"
+            );
         }
 
         let mut output = String::new();
@@ -263,6 +282,7 @@ impl Tool for ConversationSearchTool {
 
         // Handle keyword search
         if let Some(query) = params.query {
+            let safe_query = crate::message::redact_uncertain_secrets(&query);
             let results = loaded_session
                 .as_ref()
                 .map(|session| search_messages(&session.messages, &query))
@@ -271,12 +291,12 @@ impl Tool for ConversationSearchTool {
             if results.is_empty() {
                 output.push_str(&format!(
                     "## Search Results\n\nNo results found for '{}'\n",
-                    query
+                    safe_query
                 ));
             } else {
                 output.push_str(&format!(
                     "## Search Results for '{}'\n\nFound {} matches:\n\n",
-                    query,
+                    safe_query,
                     results.len()
                 ));
 
@@ -295,7 +315,7 @@ impl Tool for ConversationSearchTool {
                     crate::logging::warn(&format!(
                         "[tool:conversation_search] truncating displayed search results for session {} query={} total_results={}",
                         ctx.session_id,
-                        query,
+                        safe_query,
                         results.len()
                     ));
                     output.push_str(&format!(
@@ -384,7 +404,7 @@ impl Tool for ConversationSearchTool {
                     for block in &msg.content {
                         match block {
                             crate::message::ContentBlock::Text { text, .. } => {
-                                let text = crate::message::redact_secrets(text);
+                                let text = crate::message::redact_uncertain_secrets(text);
                                 if exact_message_range {
                                     output.push_str(&text);
                                     output.push('\n');
@@ -399,14 +419,16 @@ impl Tool for ConversationSearchTool {
                             crate::message::ContentBlock::ToolUse {
                                 id, name, input, ..
                             } => {
+                                let redacted_input =
+                                    crate::message::redact_uncertain_json(input).to_string();
                                 let input = if exact_message_range
                                     && params.payload_offset.is_none()
                                     && params.payload_limit.is_none()
                                 {
-                                    crate::message::redact_secrets(&input.to_string())
+                                    redacted_input
                                 } else {
                                     render_redacted_tool_payload(
-                                        &input.to_string(),
+                                        &redacted_input,
                                         1_000,
                                         params.payload_offset,
                                         params.payload_limit,
@@ -430,7 +452,7 @@ impl Tool for ConversationSearchTool {
                                     && params.payload_offset.is_none()
                                     && params.payload_limit.is_none()
                                 {
-                                    crate::message::redact_secrets(content)
+                                    crate::message::redact_uncertain_secrets(content)
                                 } else {
                                     render_redacted_tool_payload(
                                         content,
@@ -556,11 +578,18 @@ fn message_to_text(msg: &Message) -> String {
     msg.content
         .iter()
         .filter_map(|block| match block {
-            crate::message::ContentBlock::Text { text, .. } => Some(text.clone()),
-            crate::message::ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+            crate::message::ContentBlock::Text { text, .. } => {
+                Some(crate::message::redact_uncertain_secrets(text))
+            }
+            crate::message::ContentBlock::ToolResult { content, .. } => {
+                Some(crate::message::redact_uncertain_secrets(content))
+            }
             crate::message::ContentBlock::ToolUse {
                 id, name, input, ..
-            } => Some(format!("tool_call_id={id} name={name} input={input}")),
+            } => Some(format!(
+                "tool_call_id={id} name={name} input={}",
+                crate::message::redact_uncertain_json(input)
+            )),
             crate::message::ContentBlock::OpenAICompaction { .. } => {
                 Some("[OpenAI native compaction]".to_string())
             }
@@ -602,7 +631,7 @@ fn extract_snippet(text: &str, query: &str) -> String {
 }
 
 fn bounded_redacted_tool_payload(text: &str, max_chars: usize) -> String {
-    let redacted = crate::message::redact_secrets(text);
+    let redacted = crate::message::redact_uncertain_secrets(text);
     let char_count = redacted.chars().count();
     if char_count <= max_chars {
         return redacted;
@@ -630,7 +659,7 @@ fn render_redacted_tool_payload(
     if offset.is_none() && limit.is_none() {
         return bounded_redacted_tool_payload(text, preview_chars);
     }
-    let redacted = crate::message::redact_secrets(text);
+    let redacted = crate::message::redact_uncertain_secrets(text);
     let total = redacted.chars().count();
     let start = offset.unwrap_or(0).min(total);
     let requested = limit.unwrap_or(4_000).clamp(1, 8_000);
@@ -680,6 +709,23 @@ mod tests {
         crate::storage::lock_test_env()
     }
 
+    fn verified_identity() -> jcode_provider_core::ExactRuntimeIdentity {
+        jcode_provider_core::ExactRuntimeIdentity {
+            provider_key: "test-provider".to_string(),
+            route: jcode_provider_core::RouteSelection {
+                model: "test-model".to_string(),
+                runtime_key: jcode_provider_core::RuntimeKey::OpenAIOAuth,
+                api_method: "test-api".to_string(),
+                provider_label: "Test Provider".to_string(),
+                detail: String::new(),
+            },
+            account_label: Some("test-account".to_string()),
+            account_id: Some("stable-test-account".to_string()),
+            account_generation: Some(1),
+            reasoning_effort: None,
+        }
+    }
+
     fn setup_session(messages: Vec<Message>) -> (ToolContext, std::path::PathBuf, Option<String>) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -693,6 +739,7 @@ mod tests {
 
         let session_id = format!("test-session-{}", nonce);
         let mut session = Session::create_with_id(session_id.clone(), None, None);
+        session.exact_runtime_identity = Some(verified_identity());
         for msg in messages {
             session.add_message(msg.role.clone(), msg.content.clone());
         }
@@ -752,12 +799,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opaque_current_identity_cannot_search_canonical_history() {
+        let _guard = env_lock();
+        let tool = create_test_tool();
+        let (ctx, base, previous_home) = setup_session(vec![Message::user("private history")]);
+        let mut session = Session::load(&ctx.session_id).unwrap();
+        session.exact_runtime_identity = None;
+        session.save().unwrap();
+
+        let error = tool
+            .execute(json!({"query": "private"}), ctx)
+            .await
+            .expect_err("opaque identity must fail closed");
+        assert!(error.to_string().contains("credential identity is opaque"));
+        restore_env(base, previous_home);
+    }
+
+    #[tokio::test]
+    async fn archived_rewind_history_remains_exactly_searchable() {
+        let _guard = env_lock();
+        let tool = create_test_tool();
+        let (ctx, base, previous_home) = setup_session(vec![
+            Message::user("active branch"),
+            Message::assistant_text("ARCHIVED_REWIND_FACT"),
+        ]);
+        let mut session = Session::load(&ctx.session_id).unwrap();
+        let archived_id = session.messages[1].id.clone();
+        session.rewind_active_branch_through(0).unwrap();
+        session.save().unwrap();
+
+        let result = tool
+            .execute(json!({"query": "ARCHIVED_REWIND_FACT"}), ctx)
+            .await
+            .unwrap();
+        assert!(result.output.contains("ARCHIVED_REWIND_FACT"));
+        assert!(result.output.contains(&archived_id));
+        restore_env(base, previous_home);
+    }
+
+    #[tokio::test]
     async fn ancestor_search_requires_recorded_parent_lineage_and_returns_message_ids() {
         let _guard = env_lock();
         let base = tempfile::tempdir().unwrap();
         let previous_home = std::env::var_os("JCODE_HOME");
         crate::env::set_var("JCODE_HOME", base.path());
         let mut parent = Session::create_with_id("search-parent".to_string(), None, None);
+        parent.exact_runtime_identity = Some(verified_identity());
         parent.add_message(
             Role::User,
             vec![crate::message::ContentBlock::Text {
@@ -769,8 +856,10 @@ mod tests {
         parent.save().unwrap();
         let mut child =
             Session::create_with_id("search-child".to_string(), Some(parent.id.clone()), None);
+        child.exact_runtime_identity = Some(verified_identity());
         child.save().unwrap();
         let mut unrelated = Session::create_with_id("search-unrelated".to_string(), None, None);
+        unrelated.exact_runtime_identity = Some(verified_identity());
         unrelated.save().unwrap();
         let ctx = ToolContext {
             session_id: child.id.clone(),
@@ -792,6 +881,21 @@ mod tests {
             .unwrap();
         assert!(result.output.contains("search-parent"));
         assert!(result.output.contains(&parent_message_id));
+        let mut mismatched_parent = Session::load("search-parent").unwrap();
+        mismatched_parent
+            .exact_runtime_identity
+            .as_mut()
+            .unwrap()
+            .account_id = Some("different-account".to_string());
+        mismatched_parent.save().unwrap();
+        let mismatch = tool
+            .execute(
+                json!({"query": "PLANTED_ANCESTOR", "source_session": "search-parent"}),
+                ctx.clone(),
+            )
+            .await
+            .expect_err("ancestor account mismatch must fail closed");
+        assert!(mismatch.to_string().contains("does not exactly match"));
         assert!(
             tool.execute(
                 json!({"query": "anything", "source_session": unrelated.id}),
@@ -833,8 +937,8 @@ mod tests {
                     tool_use_id: "call-exact-17".to_string(),
                     content: format!(
                         "{}line 17: exact durable middle output{}",
-                        "a".repeat(600),
-                        "z".repeat(600)
+                        "pad ".repeat(150),
+                        " end".repeat(150)
                     ),
                     is_error: Some(false),
                 }],
@@ -861,7 +965,11 @@ mod tests {
             .unwrap();
         assert!(range.output.contains("id=call-exact-17"));
         assert!(range.output.contains("tool_use_id=call-exact-17"));
-        assert!(range.output.contains("src/lib.rs"));
+        assert!(
+            range.output.contains("src/lib.rs"),
+            "redacted range output: {}",
+            range.output
+        );
         assert!(range.output.contains("status=success"));
         assert!(!range.output.contains("exact durable middle output"));
         assert!(!range.output.contains("sk-secret-that-must-not-return"));
@@ -884,10 +992,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opaque_secrets_are_omitted_from_search_ranges_and_payload_pages() {
+        let _guard = env_lock();
+        let tool = create_test_tool();
+        let opaque = "vault/q7Vn4Zp9Lx2Kc8Mw5Rt1Hs6Bd3Yf.rs";
+        let hexadecimal_opaque = "0123456789abcdef0123456789abcdef";
+        let messages = vec![
+            Message::user(&format!(
+                "ordinary text before\n{opaque}\n{hexadecimal_opaque}\nordinary text after"
+            )),
+            Message {
+                role: Role::Assistant,
+                content: vec![crate::message::ContentBlock::ToolUse {
+                    id: "call-opaque".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"opaque": opaque, "hex": hexadecimal_opaque}),
+                    thought_signature: None,
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+            Message {
+                role: Role::User,
+                content: vec![crate::message::ContentBlock::ToolResult {
+                    tool_use_id: "call-opaque".to_string(),
+                    content: format!(
+                        "ordinary result before\n{opaque}\n{hexadecimal_opaque}\nordinary result after"
+                    ),
+                    is_error: Some(false),
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+        ];
+        let (ctx, base, previous_home) = setup_session(messages);
+        let stored = Session::load(&ctx.session_id).unwrap();
+
+        let search = tool
+            .execute(json!({"query": opaque}), ctx.clone())
+            .await
+            .unwrap();
+        assert!(!search.output.contains(opaque));
+        assert!(search.output.contains("[LCM sensitive source omitted]"));
+        let hexadecimal_search = tool
+            .execute(json!({"query": hexadecimal_opaque}), ctx.clone())
+            .await
+            .unwrap();
+        assert!(!hexadecimal_search.output.contains(hexadecimal_opaque));
+        assert!(
+            hexadecimal_search
+                .output
+                .contains("[LCM sensitive source omitted]")
+        );
+
+        let range = tool
+            .execute(
+                json!({
+                    "message_range": {
+                        "start": stored.messages[0].id,
+                        "end": stored.messages[2].id
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(range.output.contains("ordinary text before"));
+        assert!(range.output.contains("ordinary result after"));
+        assert!(range.output.contains("[LCM sensitive source omitted]"));
+        assert!(!range.output.contains(opaque));
+        assert!(!range.output.contains(hexadecimal_opaque));
+
+        let payload = tool
+            .execute(
+                json!({
+                    "message_range": {
+                        "start": stored.messages[2].id,
+                        "end": stored.messages[2].id
+                    },
+                    "payload_offset": 0,
+                    "payload_limit": 8000
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(payload.output.contains("ordinary result before"));
+        assert!(payload.output.contains("ordinary result after"));
+        assert!(payload.output.contains("[LCM sensitive source omitted]"));
+        assert!(!payload.output.contains(opaque));
+        assert!(!payload.output.contains(hexadecimal_opaque));
+
+        restore_env(base, previous_home);
+    }
+
+    #[tokio::test]
     async fn exact_message_ranges_continue_ordinary_content_and_message_caps() {
         let _guard = env_lock();
         let tool = create_test_tool();
-        let long_text = format!("ordinary-start-{}-ordinary-tail", "x".repeat(30_000));
+        let long_text = format!(
+            "ordinary-start-{}-ordinary-tail",
+            "bounded ordinary chunk ".repeat(700)
+        );
         let mut messages = vec![Message::user(&long_text)];
         messages.extend((1..=50).map(|index| Message::user(&format!("message-{index}"))));
         let (ctx, base, previous_home) = setup_session(messages);
@@ -919,7 +1125,7 @@ mod tests {
                         "start": stored.messages[0].id,
                         "end": stored.messages[50].id
                     },
-                    "response_offset": 24000,
+                    "response_offset": 12000,
                     "response_limit": 12000
                 }),
                 ctx.clone(),

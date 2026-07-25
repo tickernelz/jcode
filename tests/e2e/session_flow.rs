@@ -159,7 +159,7 @@ async fn test_agent_clear_preserves_debug_flag() -> Result<()> {
     agent.set_debug(true);
     let old_session_id = agent.session_id().to_string();
 
-    agent.clear();
+    agent.clear().expect("clear session");
 
     assert_ne!(agent.session_id(), old_session_id);
     assert!(agent.is_debug());

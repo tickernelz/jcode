@@ -776,9 +776,9 @@ impl AuthStatus {
         }
     }
 
-    /// Invalidate all auth-derived state after credentials actually change.
     pub fn invalidate_cache() {
         Self::invalidate_cached_status();
+        crate::auth::account_store::invalidate_runtime_credential_identities();
         crate::auth::copilot::invalidate_github_token_cache();
         crate::provider::pricing::invalidate_auth_pricing_memos();
         crate::memory_rerank::clear_failure_backoff();

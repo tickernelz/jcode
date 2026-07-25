@@ -100,6 +100,7 @@ impl Agent {
                 .then(|| Message::with_timestamps(&messages_with_memory));
             let send_messages = stamped.as_deref().unwrap_or(&messages_with_memory);
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
+            let identity_at_request_start = self.provider.exact_runtime_identity();
             self.last_status_detail = None;
             let mut stream = match self
                 .provider
@@ -133,6 +134,10 @@ impl Agent {
                     return Err(e);
                 }
             };
+            self.reconcile_exact_runtime_identity_after_request_open(
+                identity_at_request_start.as_ref(),
+            )?;
+            let identity_at_stream_open = self.provider.exact_runtime_identity();
 
             // The provider returned an owned stream, so the request transcript
             // copies are no longer needed while the response is consumed.
@@ -491,8 +496,10 @@ impl Agent {
                         if trace {
                             eprintln!("[trace] session_id {}", sid);
                         }
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid);
+                        self.bind_provider_session_id_for_identity(
+                            sid,
+                            identity_at_stream_open.as_ref(),
+                        );
                         // We've received session_id, can exit the loop now
                         if saw_message_end {
                             break;
@@ -640,6 +647,13 @@ impl Agent {
                     }
                 }
             }
+
+            // An owned response stream may observe a cross-process credential
+            // refresh after it opened. Reconcile before accepting output,
+            // persisting provider-owned state, executing tools, or continuing.
+            self.reconcile_exact_runtime_identity_after_request_open(
+                identity_at_stream_open.as_ref(),
+            )?;
 
             if retry_after_compaction {
                 log_agent_provider_stream_lifecycle(
@@ -1008,7 +1022,10 @@ impl Agent {
                     model: Some(self.provider.model()),
                 }));
 
-                let result = self.registry.execute(&tc.name, tc.input.clone(), ctx).await;
+                let result = match self.ensure_tool_identity_ready() {
+                    Ok(()) => self.registry.execute(&tc.name, tc.input.clone(), ctx).await,
+                    Err(error) => Err(error),
+                };
                 crate::telemetry::record_tool_call();
                 self.unlock_tools_if_needed(&tc.name);
                 let tool_elapsed = tool_start.elapsed();
@@ -1140,61 +1157,4 @@ impl Agent {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn user_text(text: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-                cache_control: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }
-    }
-
-    fn tool_result(id: &str, content: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                content: content.to_string(),
-                is_error: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: Some(1),
-        }
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_detects_tool_continuation_context() {
-        let messages = vec![
-            user_text("tell me about the desktop application"),
-            tool_result("functions.read:0", "desktop architecture docs"),
-            tool_result("functions.agentgrep:4", "desktop source summary"),
-        ];
-
-        assert!(Agent::messages_end_with_tool_result(&messages));
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_allows_memory_after_tool_results() {
-        let messages = vec![
-            user_text("tell me about the desktop application"),
-            tool_result("functions.read:0", "desktop architecture docs"),
-            user_text("<system-reminder>Relevant memory</system-reminder>"),
-        ];
-
-        assert!(Agent::messages_end_with_tool_result(&messages));
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_ignores_plain_user_prompt() {
-        let messages = vec![user_text("hello")];
-
-        assert!(!Agent::messages_end_with_tool_result(&messages));
-    }
-}
+include!("turn_loops/tests.rs");

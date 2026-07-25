@@ -1,4 +1,5 @@
 #![allow(clippy::collapsible_match)]
+#![allow(clippy::await_holding_lock)]
 
 use super::*;
 use anyhow::Result;
@@ -78,6 +79,7 @@ async fn test_persistent_ws_state() -> (PersistentWsState, tokio::task::JoinHand
         PersistentWsState {
             ws_stream: client_ws,
             last_response_id: "resp_test".to_string(),
+            response_chain_generation: 0,
             connected_at: Instant::now(),
             last_activity_at: Instant::now(),
             last_response_completed_at: Instant::now(),
@@ -111,12 +113,8 @@ async fn test_persistent_ws_state_with_ping_notify() -> (
             match message {
                 Ok(WsMessage::Ping(payload)) => {
                     server_ping_notify.notify_one();
-                    let _ = ws
-                        .send(WsMessage::Pong(b"stale-pong".to_vec().into()))
-                        .await;
-                    let _ = ws
-                        .send(WsMessage::Ping(b"server-keepalive".to_vec().into()))
-                        .await;
+                    let _ = ws.send(WsMessage::Pong(b"stale-pong".to_vec())).await;
+                    let _ = ws.send(WsMessage::Ping(b"server-keepalive".to_vec())).await;
                     let _ = ws.send(WsMessage::Pong(payload)).await;
                 }
                 Ok(WsMessage::Pong(payload)) if payload.as_slice() == b"server-keepalive" => {
@@ -135,6 +133,7 @@ async fn test_persistent_ws_state_with_ping_notify() -> (
         PersistentWsState {
             ws_stream: client_ws,
             last_response_id: "resp_test".to_string(),
+            response_chain_generation: 0,
             connected_at: Instant::now(),
             last_activity_at: Instant::now(),
             last_response_completed_at: Instant::now(),

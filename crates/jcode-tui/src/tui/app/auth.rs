@@ -2,6 +2,8 @@
 mod auth_account_commands;
 #[path = "auth_account_picker.rs"]
 mod auth_account_picker;
+#[path = "auth_account_transition.rs"]
+mod auth_account_transition;
 #[path = "auth_types.rs"]
 mod auth_types;
 pub(crate) use self::auth_account_commands::{
@@ -10,11 +12,9 @@ pub(crate) use self::auth_account_commands::{
     save_openai_fast_setting_local,
 };
 pub(super) use self::auth_types::{AccountCommand, PendingAccountInput, PendingLogin};
-
 use super::*;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::sync::Arc;
-
 impl App {
     fn open_auth_browser(url: &str) -> bool {
         // Honors --no-browser/NO_BROWSER/JCODE_NO_BROWSER and never opens real
@@ -23,7 +23,6 @@ impl App {
         // developer's desktop).
         super::helpers::open_path_or_url_detached(url).is_ok()
     }
-
     fn record_oauth_preflight(
         provider_id: &str,
         browser_opened: bool,
@@ -65,14 +64,12 @@ impl App {
         }
         notices.join("\n")
     }
-
     pub(super) fn show_jcode_subscription_status(&mut self) {
         let configured_key = crate::subscription_catalog::configured_api_key().is_some();
         let configured_base = crate::subscription_catalog::configured_api_base()
             .unwrap_or_else(|| crate::subscription_catalog::DEFAULT_JCODE_API_BASE.to_string());
         let runtime_mode = crate::subscription_catalog::is_runtime_mode_enabled();
         let cached_tier = crate::subscription_catalog::cached_tier();
-
         let mut message = String::from("Jcode Subscription Status\n\n");
         message.push_str(&format!(
             "  - Credentials: {}\n",
@@ -105,7 +102,6 @@ impl App {
                 "inactive for this session"
             }
         ));
-
         message.push_str("Catalog\n\n");
         for model in crate::subscription_catalog::curated_models() {
             let default_suffix = if model.default_enabled {
@@ -128,7 +124,6 @@ impl App {
                 model.note
             ));
         }
-
         message.push_str("\nTiers\n\n");
         for tier in crate::subscription_catalog::JcodeTier::ALL.iter().copied() {
             message.push_str(&format!(
@@ -138,15 +133,12 @@ impl App {
                 tier.usable_budget_usd()
             ));
         }
-
         if configured_key {
             message.push_str("\nFetching account status...");
         } else {
             message.push_str("\nLog in with /login jcode to see account usage and tier.");
         }
-
         self.push_display_message(DisplayMessage::system(message));
-
         // With credentials present, fetch live account status (/v1/me) in the
         // background and surface it via a UiActivity card. Short timeout keeps
         // this responsive; offline failures degrade to a quiet log line.
@@ -209,7 +201,6 @@ impl App {
             }
         }
     }
-
     pub(super) fn show_auth_status(&mut self) {
         let status = crate::auth::AuthStatus::check();
         let validation = crate::auth::validation::load_all();
@@ -261,29 +252,24 @@ impl App {
         );
         self.push_display_message(DisplayMessage::system(message));
     }
-
     pub(super) fn show_interactive_login(&mut self) {
         crate::telemetry::record_setup_step_once("login_picker_opened");
         self.open_login_picker_inline();
         self.set_status_notice("Login: choose a provider");
     }
-
     pub(super) fn show_interactive_logout(&mut self) {
         self.open_logout_picker_inline();
         self.set_status_notice("Logout: choose a provider");
     }
-
     pub(super) fn start_logout_provider(
         &mut self,
         provider: crate::provider_catalog::LoginProviderDescriptor,
     ) {
         use crate::provider_catalog::LoginProviderTarget;
-
         if matches!(provider.target, LoginProviderTarget::Jcode) {
             self.start_jcode_account_logout();
             return;
         }
-
         let result: anyhow::Result<String> = (|| match provider.target {
             LoginProviderTarget::Jcode => unreachable!("handled above"),
             LoginProviderTarget::Claude => {
@@ -348,7 +334,6 @@ impl App {
                 provider.display_name, provider.id
             )),
         })();
-
         match result {
             Ok(message) => {
                 crate::auth::AuthStatus::invalidate_cache();
@@ -364,11 +349,9 @@ impl App {
             }
         }
     }
-
     pub(super) fn start_logout_all(&mut self) {
         let mut summary: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
-
         match crate::auth::claude::clear_accounts() {
             Ok(removed) if removed > 0 => summary.push(format!("{} Anthropic account(s)", removed)),
             Ok(_) => {}
@@ -379,7 +362,6 @@ impl App {
             Ok(_) => {}
             Err(err) => errors.push(format!("OpenAI: {}", err)),
         }
-
         Self::clear_api_key_logout_summary(
             &mut summary,
             &mut errors,
@@ -401,7 +383,6 @@ impl App {
                 errors.push(format!("jcode subscription {}: {}", env_key, err));
             }
         }
-
         Self::clear_api_key_logout_summary(
             &mut summary,
             &mut errors,
@@ -474,16 +455,13 @@ impl App {
             Ok(()) => summary.push("Gemini".to_string()),
             Err(err) => errors.push(format!("Gemini: {}", err)),
         }
-
         crate::auth::AuthStatus::invalidate_cache();
-
         let message = if summary.is_empty() {
             "No automated logins to clear.".to_string()
         } else {
             format!("Logged out of: {}.", summary.join(", "))
         };
         self.push_display_message(DisplayMessage::system(message));
-
         if errors.is_empty() {
             self.set_status_notice("Logout: all providers");
         } else {
@@ -494,11 +472,9 @@ impl App {
             self.set_status_notice("Logout: completed with errors");
         }
     }
-
     fn clear_api_key_login(env_key: &str, env_file: &str) -> anyhow::Result<()> {
         crate::provider_catalog::save_env_value_to_env_file(env_key, env_file, None)
     }
-
     fn clear_api_key_logout_summary(
         summary: &mut Vec<String>,
         errors: &mut Vec<String>,
@@ -514,7 +490,6 @@ impl App {
             Err(err) => errors.push(format!("{}: {}", label, err)),
         }
     }
-
     pub(super) fn start_login_provider(
         &mut self,
         provider: crate::provider_catalog::LoginProviderDescriptor,
@@ -589,20 +564,17 @@ impl App {
             }
         }
     }
-
     fn begin_pending_login(&mut self, pending: PendingLogin) {
         if let Some((provider, method)) = pending.telemetry_context() {
             crate::telemetry::record_auth_started(&provider, &method);
         }
         self.pending_login = Some(pending);
     }
-
     fn start_claude_login(&mut self) {
         let label = crate::auth::claude::login_target_label(None)
             .unwrap_or_else(|_| crate::auth::claude::primary_account_label());
         self.start_claude_login_for_account(&label);
     }
-
     fn start_jcode_login(&mut self) {
         self.push_display_message(DisplayMessage::system(
             "Jcode Account Login\n\nRequesting a secure browser approval flow. No email or API key will be requested in the terminal."
@@ -621,7 +593,6 @@ impl App {
                 ActivationOutcome, PollingBackoff, TokenPollOutcome,
             };
             use std::time::Duration;
-
             let publish = |message: String, status: &'static str| {
                 crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
                     crate::bus::UiActivity::background(
@@ -652,7 +623,6 @@ impl App {
                     return;
                 }
             };
-
             let opened = App::open_auth_browser(&device.verification_uri_complete);
             publish(
                 format!(
@@ -666,7 +636,6 @@ impl App {
                 ),
                 "Jcode account: waiting for browser approval",
             );
-
             let approved = {
                 let deadline = tokio::time::Instant::now()
                     + Duration::from_secs(device.expires_in.max(device.interval));
@@ -712,7 +681,6 @@ impl App {
                     return;
                 }
             };
-
             if let Err(error) = crate::subscription_catalog::persist_account_credentials(
                 &approved.api_key,
                 Some(&approved.account_id),
@@ -733,7 +701,6 @@ impl App {
                 ),
                 "Jcode account: waiting for plan activation",
             );
-
             match crate::subscription_api::poll_for_paid_activation(
                 &client,
                 &api_base,
@@ -774,7 +741,6 @@ impl App {
             }
         });
     }
-
     pub(super) fn open_jcode_account_management(&mut self) {
         let url = crate::subscription_catalog::JCODE_ACCOUNT_URL;
         let opened = Self::open_auth_browser(url);
@@ -789,7 +755,6 @@ impl App {
         )));
         self.set_status_notice("Jcode account management");
     }
-
     pub(super) fn start_jcode_account_logout(&mut self) {
         self.set_status_notice("Jcode account: logging out");
         let session_id = self.session.id.clone();
@@ -841,11 +806,9 @@ impl App {
             ));
         });
     }
-
     pub(super) fn start_claude_login_for_account(&mut self, label: &str) {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use sha2::{Digest, Sha256};
-
         let verifier: String = {
             use rand::Rng;
             const CHARSET: &[u8] =
@@ -858,12 +821,10 @@ impl App {
                 })
                 .collect()
         };
-
         let mut hasher = Sha256::new();
         hasher.update(verifier.as_bytes());
         let hash = hasher.finalize();
         let challenge = URL_SAFE_NO_PAD.encode(hash);
-
         // Try a loopback callback first so the user never has to copy/paste the
         // authorization code (mirrors the OpenAI/Gemini flows). Claude uses the
         // PKCE verifier as the OAuth `state`, so we wait for that on the
@@ -875,7 +836,6 @@ impl App {
             .and_then(|l| l.local_addr().ok())
             .map(|addr| addr.port());
         let callback_available = callback_listener.is_some() && callback_port.is_some();
-
         let (auth_url, redirect_uri) = match callback_port {
             Some(port) if callback_available => {
                 let redirect_uri = format!("http://localhost:{}/callback", port);
@@ -896,7 +856,6 @@ impl App {
         )
         .map(|section| format!("\n\n{section}"))
         .unwrap_or_default();
-
         let browser_opened = Self::open_auth_browser(&auth_url);
         let preflight = Self::record_oauth_preflight(
             "claude",
@@ -904,7 +863,6 @@ impl App {
             callback_port.map(|p| format!("localhost:{}", p)).as_deref(),
             Some(callback_available),
         );
-
         // Spawn the loopback waiter. On success it publishes LoginCompleted just
         // like the manual paste path, so onboarding and account UI react
         // identically.
@@ -938,7 +896,6 @@ impl App {
                 }
             });
         }
-
         let callback_line = if callback_available {
             "Waiting for the browser callback... (this completes automatically)\n".to_string()
         } else {
@@ -1002,35 +959,23 @@ impl App {
     }
 
     pub(super) fn switch_account(&mut self, label: &str) {
-        match crate::auth::claude::set_active_account(label) {
-            Ok(()) => {
-                {
-                    let provider = self.provider.clone();
-                    let label_owned = label.to_string();
-                    tokio::spawn(async move {
-                        provider.invalidate_credentials().await;
-                        crate::logging::info(&format!(
-                            "Switched to Anthropic account '{}'",
-                            label_owned
-                        ));
-                    });
-                }
-                self.push_display_message(DisplayMessage::system(format!(
-                    "Switched to Anthropic account {}.",
-                    label
-                )));
-                // Keep account-sensitive UI state in sync immediately.
-                crate::auth::AuthStatus::invalidate_cache();
-                self.context_limit = self.provider.context_window() as u64;
-                self.context_warning_shown = false;
-            }
-            Err(e) => {
-                self.push_display_message(DisplayMessage::error(format!(
-                    "Failed to switch account: {}",
-                    e
-                )));
-            }
+        if let Err(error) =
+            self.prepare_local_account_switch(jcode_provider_core::RuntimeKey::ClaudeOAuth, label)
+        {
+            self.push_display_message(DisplayMessage::error(format!(
+                "Failed to switch Anthropic account safely: {error}"
+            )));
+            return;
         }
+        crate::logging::info(&format!("Switched to Anthropic account '{label}'"));
+        self.push_display_message(DisplayMessage::system(format!(
+            "Switched to Anthropic account {}.",
+            label
+        )));
+        // Keep account-sensitive UI state in sync immediately.
+        crate::auth::AuthStatus::invalidate_cache();
+        self.context_limit = self.provider.context_window() as u64;
+        self.context_warning_shown = false;
     }
 
     pub(super) fn switch_account_by_label(&mut self, label: &str) {
@@ -1075,34 +1020,22 @@ impl App {
     }
 
     pub(super) fn switch_openai_account(&mut self, label: &str) {
-        match crate::auth::codex::set_active_account(label) {
-            Ok(()) => {
-                {
-                    let provider = self.provider.clone();
-                    let label_owned = label.to_string();
-                    tokio::spawn(async move {
-                        provider.invalidate_credentials().await;
-                        crate::logging::info(&format!(
-                            "Switched to OpenAI account '{}'",
-                            label_owned
-                        ));
-                    });
-                }
-                self.push_display_message(DisplayMessage::system(format!(
-                    "Switched to OpenAI account {}.",
-                    label
-                )));
-                crate::auth::AuthStatus::invalidate_cache();
-                self.context_limit = self.provider.context_window() as u64;
-                self.context_warning_shown = false;
-            }
-            Err(e) => {
-                self.push_display_message(DisplayMessage::error(format!(
-                    "Failed to switch OpenAI account: {}",
-                    e
-                )));
-            }
+        if let Err(error) =
+            self.prepare_local_account_switch(jcode_provider_core::RuntimeKey::OpenAIOAuth, label)
+        {
+            self.push_display_message(DisplayMessage::error(format!(
+                "Failed to switch OpenAI account safely: {error}"
+            )));
+            return;
         }
+        crate::logging::info(&format!("Switched to OpenAI account '{label}'"));
+        self.push_display_message(DisplayMessage::system(format!(
+            "Switched to OpenAI account {}.",
+            label
+        )));
+        crate::auth::AuthStatus::invalidate_cache();
+        self.context_limit = self.provider.context_window() as u64;
+        self.context_warning_shown = false;
     }
 
     pub(super) fn remove_openai_account(&mut self, label: &str) {
@@ -1298,7 +1231,8 @@ impl App {
         };
 
         let label = label.unwrap_or_else(crate::auth::codex::primary_account_label);
-        crate::auth::oauth::save_openai_tokens_for_account(&oauth_tokens, &label)
+        crate::auth::oauth::replace_openai_tokens_for_account(oauth_tokens, label.clone())
+            .await
             .map_err(|e| format!("Failed to save tokens: {}", e))?;
 
         Ok(format!(
@@ -2771,6 +2705,7 @@ impl App {
                                 crate::bus::BusEvent::ProviderModelActivated {
                                     session_id: session_id.clone(),
                                     model: model.clone(),
+                                    model_request: model_request.clone(),
                                     provider_key,
                                     message: format!(
                                         "Login ready. Switched to the strongest available default model: {model}."
@@ -2800,8 +2735,13 @@ impl App {
                     {
                         let selection = crate::provider::RouteSelection::from_model_route(&route);
                         let model_request = selection.routed_model_spec();
-                        if provider.set_route_selection(&selection).is_ok() {
-                            self.finalize_model_switch(&model_request);
+                        if provider.set_route_selection(&selection).is_ok()
+                            && let Err(error) =
+                                self.finalize_route_selection(&model_request, &selection)
+                        {
+                            crate::logging::error(&format!(
+                                "Failed to persist post-login model route: {error}"
+                            ));
                         }
                     }
                 } else {
@@ -2813,8 +2753,12 @@ impl App {
                     ) {
                         let model_request =
                             activation.model_switch_request(provider.name(), &model);
-                        if provider.set_model(&model_request).is_ok() {
-                            self.finalize_model_switch(&model_request);
+                        if provider.set_model(&model_request).is_ok()
+                            && let Err(error) = self.finalize_model_switch(&model_request)
+                        {
+                            crate::logging::error(&format!(
+                                "Failed to persist post-login model route: {error}"
+                            ));
                         }
                     }
                 }
@@ -2867,7 +2811,16 @@ impl App {
 
         match self.provider.set_model(&model_request) {
             Ok(()) => {
-                let active_model = self.finalize_model_switch(&model_request);
+                let active_model = match self.finalize_model_switch(&model_request) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        crate::logging::error(&format!(
+                            "Failed to persist Azure runtime model: {error}"
+                        ));
+                        crate::bus::Bus::global().publish_models_updated();
+                        return;
+                    }
+                };
                 crate::bus::Bus::global().publish_models_updated();
                 crate::logging::auth_event(
                     "auth_changed_runtime_model_applied",
@@ -3009,6 +2962,7 @@ impl App {
                                         crate::bus::BusEvent::ProviderModelActivated {
                                             session_id,
                                             model: model.clone(),
+                                            model_request,
                                             provider_key,
                                             message: format!(
                                                 "{} is ready.\n\nFetched model catalog: +{} models, +{} routes, ~{} changed.{}\n\nSwitched to {}. Use /model if you want to choose a different accessible model.\n\nIf the model list ever looks stale, run /refresh-model-list.",
@@ -3210,25 +3164,19 @@ impl App {
                 .await
                 .map_err(|e| e.to_string())?;
 
-        crate::auth::oauth::save_claude_tokens_for_account(&oauth_tokens, label)
-            .map_err(|e| format!("Failed to save tokens: {}", e))?;
-
-        let profile_suffix = match crate::auth::oauth::update_claude_account_profile(
-            label,
-            &oauth_tokens.access_token,
-        )
-        .await
-        {
-            Ok(Some(email)) => format!(" (email: {})", mask_email(&email)),
-            Ok(None) => String::new(),
-            Err(e) => {
-                crate::logging::warn(&format!(
-                    "Claude login [{}] profile fetch failed: {}",
-                    label, e
-                ));
-                String::new()
-            }
-        };
+        let (profile_email, profile_error) =
+            crate::auth::oauth::replace_claude_tokens_and_profile(oauth_tokens, label.to_string())
+                .await
+                .map_err(|e| format!("Failed to save tokens: {}", e))?;
+        if let Some(error) = profile_error {
+            crate::logging::warn(&format!(
+                "Claude login [{}] profile fetch failed: {}",
+                label, error
+            ));
+        }
+        let profile_suffix = profile_email
+            .map(|email| format!(" (email: {})", mask_email(&email)))
+            .unwrap_or_default();
 
         Ok(format!(
             "Successfully logged in to Claude! (account: {}){}",

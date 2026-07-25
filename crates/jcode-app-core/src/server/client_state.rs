@@ -191,6 +191,7 @@ pub(super) async fn handle_get_model_catalog(
         available_models,
         available_model_routes,
         resolved_credential,
+        exact_runtime_identity,
         source,
     ) = {
         match agent.try_lock() {
@@ -200,6 +201,7 @@ pub(super) async fn handle_get_model_catalog(
                 agent_guard.available_models_display(),
                 agent_guard.model_routes(),
                 agent_guard.active_resolved_credential(),
+                agent_guard.exact_runtime_identity(),
                 "live",
             ),
             Err(_) => {
@@ -217,6 +219,10 @@ pub(super) async fn handle_get_model_catalog(
                     provider.available_models_display(),
                     provider.model_routes(),
                     provider.active_resolved_credential(),
+                    persisted
+                        .as_ref()
+                        .and_then(|session| session.exact_runtime_identity.clone())
+                        .or_else(|| provider.exact_runtime_identity()),
                     "fallback",
                 )
             }
@@ -232,6 +238,7 @@ pub(super) async fn handle_get_model_catalog(
         images: Vec::new(),
         provider_name,
         provider_model,
+        exact_runtime_identity,
         available_models,
         available_model_routes,
         mcp_servers: Vec::new(),
@@ -299,8 +306,7 @@ pub(super) async fn handle_get_compacted_history(
             (messages, images, info, "live")
         }
         Err(_) => {
-            let session = crate::session::Session::load_for_remote_startup(session_id)
-                .or_else(|_| crate::session::Session::load_startup_stub(session_id))?;
+            let session = crate::session::Session::load_for_remote_startup(session_id)?;
             let (rendered_messages, images, info) =
                 crate::session::render_messages_and_images_with_compacted_history(
                     &session,
@@ -479,8 +485,7 @@ async fn send_history_from_persisted_session(
     was_interrupted: Option<bool>,
     activity: Option<SessionActivitySnapshot>,
 ) -> Result<()> {
-    let session = crate::session::Session::load_for_remote_startup(session_id)
-        .or_else(|_| crate::session::Session::load_startup_stub(session_id))?;
+    let session = crate::session::Session::load_for_remote_startup(session_id)?;
     let token_usage_totals = session.token_usage_totals();
     let (rendered_messages, images) = crate::session::render_messages_and_images(&session);
     // Extract the small metadata fields we need, then drop the full Session
@@ -490,6 +495,10 @@ async fn send_history_from_persisted_session(
     let provider_name =
         history_provider_name_from_session(&session).or_else(|| Some(provider.name().to_string()));
     let provider_model = session.model.clone().or_else(|| Some(provider.model()));
+    let exact_runtime_identity = session
+        .exact_runtime_identity
+        .clone()
+        .or_else(|| provider.exact_runtime_identity());
     let subagent_model = session.subagent_model.clone();
     let autoreview_enabled = session.autoreview_enabled;
     let autojudge_enabled = session.autojudge_enabled;
@@ -521,6 +530,7 @@ async fn send_history_from_persisted_session(
         images,
         provider_name,
         provider_model,
+        exact_runtime_identity,
         subagent_model,
         autoreview_enabled,
         autojudge_enabled,
@@ -579,6 +589,7 @@ pub(super) async fn send_history(
         is_canary,
         provider_name,
         provider_model,
+        exact_runtime_identity,
         subagent_model,
         autoreview_enabled,
         autojudge_enabled,
@@ -654,6 +665,7 @@ pub(super) async fn send_history(
             agent_guard.is_canary(),
             agent_guard.provider_name(),
             agent_guard.provider_model(),
+            agent_guard.exact_runtime_identity(),
             agent_guard.subagent_model(),
             agent_guard.autoreview_enabled(),
             agent_guard.autojudge_enabled(),
@@ -734,6 +746,7 @@ pub(super) async fn send_history(
         images,
         provider_name: Some(provider_name),
         provider_model: Some(provider_model),
+        exact_runtime_identity,
         subagent_model,
         autoreview_enabled,
         autojudge_enabled,

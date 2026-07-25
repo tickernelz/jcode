@@ -440,7 +440,7 @@ pub fn ensure_dir(path: &Path) -> Result<()> {
 }
 
 pub fn write_text_secret(path: &Path, content: &str) -> Result<()> {
-    write_bytes_inner(path, content.as_bytes(), true, true)
+    write_bytes_inner(path, content.as_bytes(), true, true, true)
 }
 
 pub fn upsert_env_file_value(path: &Path, env_key: &str, value: Option<&str>) -> Result<()> {
@@ -502,7 +502,46 @@ pub fn write_json_fast<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<
 /// durability. Used for editing user config files where a torn write would be
 /// catastrophic.
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_bytes_inner(path, bytes, true, false)
+    write_bytes_inner(path, bytes, true, false, true)
+}
+
+/// Atomically and durably write raw bytes without rotating the destination to
+/// `<path>.bak`. Use this only when `path` is itself an explicitly managed
+/// recovery copy. In particular, rotating a path already ending in `.bak`
+/// aliases the destination on Windows and can restore the old bytes over the
+/// newly published recovery copy.
+pub fn write_bytes_without_backup(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_bytes_inner(path, bytes, true, false, false)
+}
+
+/// Confirm already-published bytes and their directory entry after an atomic
+/// writer reported an ambiguous post-publication error. This never republishes
+/// bytes and is safe to retry.
+pub fn confirm_publication_durable(path: &Path) -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    inject_test_confirmation_failure(path)?;
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Published file {} could not be synchronized: {}",
+                path.display(),
+                error
+            )
+        })?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Published directory entry for {} could not be synchronized: {}",
+                    path.display(),
+                    error
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn write_json_inner<T: Serialize + ?Sized>(
@@ -512,10 +551,307 @@ fn write_json_inner<T: Serialize + ?Sized>(
     secret: bool,
 ) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    write_bytes_inner(path, &bytes, durable, secret)
+    write_bytes_inner(path, &bytes, durable, secret, true)
 }
 
-fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool, secret: bool) -> Result<()> {
+#[cfg(feature = "test-support")]
+static TEST_WRITE_FAILURE: std::sync::Mutex<Option<(Option<std::path::PathBuf>, usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(feature = "test-support")]
+static TEST_POST_PUBLICATION_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_POST_APPEND_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_CONFIRMATION_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Fail the next atomic write, optionally only when it targets `path`.
+/// Compiled only for test-support builds.
+#[cfg(feature = "test-support")]
+pub fn inject_write_failure(path: Option<std::path::PathBuf>) -> TestWriteFailureGuard {
+    inject_nth_write_failure(path, 1)
+}
+
+/// Fail the `nth` matching atomic write. Compiled only for test-support builds.
+#[cfg(feature = "test-support")]
+pub fn inject_nth_write_failure(
+    path: Option<std::path::PathBuf>,
+    nth: usize,
+) -> TestWriteFailureGuard {
+    inject_nth_write_failures(path, nth, 1)
+}
+
+/// Starting at the `nth` matching write, fail `count` consecutive matching
+/// writes. Compiled only for test-support builds.
+#[cfg(feature = "test-support")]
+pub fn inject_nth_write_failures(
+    path: Option<std::path::PathBuf>,
+    nth: usize,
+    count: usize,
+) -> TestWriteFailureGuard {
+    assert!(nth > 0, "write failure index is one-based");
+    assert!(count > 0, "write failure count must be nonzero");
+    *TEST_WRITE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((path, nth, count));
+    TestWriteFailureGuard
+}
+
+#[cfg(feature = "test-support")]
+pub struct TestWriteFailureGuard;
+
+#[cfg(feature = "test-support")]
+impl Drop for TestWriteFailureGuard {
+    fn drop(&mut self) {
+        *TEST_WRITE_FAILURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// Fail one durable atomic write after its replacement bytes have become the
+/// visible destination. This models errors such as a parent-directory fsync
+/// failure whose Result alone cannot tell a caller whether publication occurred.
+#[cfg(feature = "test-support")]
+pub fn inject_post_publication_failure(
+    path: std::path::PathBuf,
+) -> TestPostPublicationFailureGuard {
+    *TEST_POST_PUBLICATION_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+    TestPostPublicationFailureGuard
+}
+
+#[cfg(feature = "test-support")]
+pub struct TestPostPublicationFailureGuard;
+
+#[cfg(feature = "test-support")]
+impl Drop for TestPostPublicationFailureGuard {
+    fn drop(&mut self) {
+        *TEST_POST_PUBLICATION_FAILURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// Fail one durable journal append after the complete line is visible but
+/// before its first synchronization attempt.
+#[cfg(any(test, feature = "test-support"))]
+pub fn inject_post_append_failure(path: std::path::PathBuf) -> TestPostAppendFailureGuard {
+    *TEST_POST_APPEND_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+    TestPostAppendFailureGuard
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestPostAppendFailureGuard;
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestPostAppendFailureGuard {
+    fn drop(&mut self) {
+        *TEST_POST_APPEND_FAILURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// Fail one explicit durability confirmation for an already-visible path.
+/// Compiled only for test-support builds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn inject_confirmation_failure(path: std::path::PathBuf) -> TestConfirmationFailureGuard {
+    *TEST_CONFIRMATION_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+    TestConfirmationFailureGuard
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestConfirmationFailureGuard;
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestConfirmationFailureGuard {
+    fn drop(&mut self) {
+        *TEST_CONFIRMATION_FAILURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn inject_test_post_append_failure(path: &Path) -> Result<()> {
+    let mut failure = TEST_POST_APPEND_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failure.as_deref() == Some(path) {
+        *failure = None;
+        anyhow::bail!(
+            "injected post-append durability failure for {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn inject_test_confirmation_failure(path: &Path) -> Result<()> {
+    let mut failure = TEST_CONFIRMATION_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failure.as_deref() == Some(path) {
+        *failure = None;
+        anyhow::bail!(
+            "injected publication confirmation failure for {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn inject_test_post_publication_failure(path: &Path) -> Result<()> {
+    let mut failure = TEST_POST_PUBLICATION_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failure.as_deref() == Some(path) {
+        *failure = None;
+        anyhow::bail!(
+            "injected post-publication durability failure for {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn inject_test_write_failure(path: &Path) -> Result<()> {
+    let mut failure = TEST_WRITE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((target, remaining, failures)) = failure.as_mut()
+        && target.as_deref().is_none_or(|target| target == path)
+    {
+        if *remaining > 1 {
+            *remaining -= 1;
+        } else {
+            *failures -= 1;
+            if *failures == 0 {
+                *failure = None;
+            }
+            anyhow::bail!("injected atomic write failure for {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(path: &Path, replacement: &Path, backup: Option<&Path>) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    fn wide(path: &Path) -> std::io::Result<Vec<u16>> {
+        let absolute = std::path::absolute(path)?;
+        let path: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        let mut extended =
+            if path.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+                path
+            } else if path.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+                "\\\\?\\UNC\\"
+                    .encode_utf16()
+                    .chain(path.into_iter().skip(2))
+                    .collect()
+            } else {
+                "\\\\?\\".encode_utf16().chain(path).collect()
+            };
+        extended.push(0);
+        Ok(extended)
+    }
+
+    let path_wide = wide(path)?;
+    let replacement_wide = wide(replacement)?;
+    let backup_wide = backup.map(wide).transpose()?;
+    let replaced = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            backup_wide
+                .as_ref()
+                .map_or(std::ptr::null(), |path| path.as_ptr()),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        let error = std::io::Error::last_os_error();
+        let partial_move = matches!(error.raw_os_error(), Some(1176 | 1177));
+        if partial_move
+            && !path.exists()
+            && let Some(backup) = backup
+            && backup.exists()
+            && let Err(restore_error) = std::fs::rename(backup, path)
+        {
+            return Err(std::io::Error::other(format!(
+                "{error}; failed to restore replaced file from {}: {restore_error}",
+                backup.display()
+            )));
+        }
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+struct AtomicPathLock(std::fs::File);
+
+impl AtomicPathLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = path.with_extension("atomic.lock");
+        if let Some(parent) = lock_path.parent() {
+            ensure_dir(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        file.lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for AtomicPathLock {
+    fn drop(&mut self) {
+        drop(self.0.unlock());
+    }
+}
+
+fn write_bytes_inner(
+    path: &Path,
+    bytes: &[u8],
+    durable: bool,
+    secret: bool,
+    preserve_backup: bool,
+) -> Result<()> {
+    let _path_lock = AtomicPathLock::acquire(path)?;
+    write_bytes_inner_locked(path, bytes, durable, secret, preserve_backup)
+}
+
+fn write_bytes_inner_locked(
+    path: &Path,
+    bytes: &[u8],
+    durable: bool,
+    secret: bool,
+    preserve_backup: bool,
+) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    inject_test_write_failure(path)?;
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
         if secret {
@@ -530,6 +866,10 @@ fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool, secret: bool) -> 
     let pid = std::process::id();
     let nonce: u64 = rand::random();
     let tmp_path = path.with_extension(format!("tmp.{}.{}", pid, nonce));
+    let backup_tmp_path = path.with_extension(format!("bak.tmp.{}.{}", pid, nonce));
+    let rotated_backup_tmp_path =
+        path.with_extension(format!("bak.previous.tmp.{}.{}", pid, nonce));
+    let destination_existed = path.exists();
 
     let result = (|| -> Result<()> {
         let file = std::fs::File::create(&tmp_path)?;
@@ -545,8 +885,11 @@ fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool, secret: bool) -> 
         if durable {
             file.sync_all()?;
         }
+        drop(file);
 
-        if path.exists() {
+        #[cfg(windows)]
+        let mut destination_published = false;
+        if destination_existed {
             let bak_path = path.with_extension("bak");
             if secret {
                 jcode_core::fs::set_permissions_owner_only(path)?;
@@ -560,211 +903,117 @@ fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool, secret: bool) -> 
             // concurrent load-all style readers silently drop entries, e.g.
             // self-dev build requests "disappearing" from the queue.)
             #[cfg(unix)]
-            {
-                let _ = std::fs::remove_file(&bak_path);
-                let _ = std::fs::hard_link(path, &bak_path);
+            if preserve_backup {
+                std::fs::hard_link(path, &backup_tmp_path)?;
+                std::fs::rename(&backup_tmp_path, &bak_path)?;
             }
-            // On Windows, rename fails when the destination exists, so the
-            // primary must be moved away first; the brief missing window is
-            // unavoidable without platform-specific replace APIs.
-            #[cfg(not(unix))]
+            // ReplaceFileW swaps the files and writes the backup in one
+            // filesystem operation, so concurrent readers never see a missing
+            // primary path. The documented WRITE_THROUGH flag is unsupported,
+            // so durability still comes from syncing the replacement before
+            // publication rather than making a stronger Windows claim.
+            #[cfg(windows)]
             {
-                let _ = std::fs::remove_file(&bak_path);
-                let _ = std::fs::rename(path, &bak_path);
+                replace_file(path, &tmp_path, Some(&backup_tmp_path))?;
+                destination_published = true;
+                if preserve_backup && bak_path.exists() {
+                    if let Err(error) =
+                        replace_file(&bak_path, &backup_tmp_path, Some(&rotated_backup_tmp_path))
+                    {
+                        eprintln!(
+                            "Atomic write to {} was published, but backup rotation at {} failed: {}",
+                            path.display(),
+                            bak_path.display(),
+                            error
+                        );
+                    }
+                    if bak_path.exists() {
+                        drop(std::fs::remove_file(&backup_tmp_path));
+                        drop(std::fs::remove_file(&rotated_backup_tmp_path));
+                    }
+                } else if preserve_backup {
+                    if let Err(error) = std::fs::rename(&backup_tmp_path, &bak_path) {
+                        eprintln!(
+                            "Atomic write to {} was published, but backup promotion to {} failed: {}",
+                            path.display(),
+                            bak_path.display(),
+                            error
+                        );
+                    }
+                } else {
+                    drop(std::fs::remove_file(&backup_tmp_path));
+                }
             }
-            if secret && bak_path.exists() {
-                jcode_core::fs::set_permissions_owner_only(&bak_path)?;
+            #[cfg(not(any(unix, windows)))]
+            if preserve_backup {
+                drop(std::fs::remove_file(&bak_path));
+                drop(std::fs::rename(path, &bak_path));
+            }
+            if preserve_backup
+                && secret
+                && bak_path.exists()
+                && let Err(error) = jcode_core::fs::set_permissions_owner_only(&bak_path)
+            {
+                eprintln!(
+                    "Atomic write backup {} was published after owner-only source hardening, but permission recheck failed: {}",
+                    bak_path.display(),
+                    error
+                );
             }
         }
 
-        std::fs::rename(&tmp_path, path)?;
-        if secret {
-            jcode_core::fs::set_permissions_owner_only(path)?;
+        #[cfg(windows)]
+        if !destination_published {
+            std::fs::rename(&tmp_path, path)?;
         }
+        #[cfg(not(windows))]
+        std::fs::rename(&tmp_path, path)?;
+        if secret && let Err(error) = jcode_core::fs::set_permissions_owner_only(path) {
+            eprintln!(
+                "Atomic write to {} was published after owner-only temporary-file hardening, but permission recheck failed: {}",
+                path.display(),
+                error
+            );
+        }
+
+        #[cfg(feature = "test-support")]
+        inject_test_post_publication_failure(path)?;
 
         #[cfg(unix)]
-        if durable
-            && let Some(parent) = path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
+        if durable && let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Atomic write to {} was published, but parent-directory sync failed: {}",
+                        path.display(),
+                        error
+                    )
+                })?;
         }
 
         Ok(())
     })();
 
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
+        if !destination_existed || path.exists() {
+            drop(std::fs::remove_file(&backup_tmp_path));
+            drop(std::fs::remove_file(&rotated_backup_tmp_path));
+        }
+        #[cfg(not(windows))]
+        drop(std::fs::remove_file(&tmp_path));
+        #[cfg(windows)]
+        if !destination_existed || path.exists() {
+            drop(std::fs::remove_file(&tmp_path));
+        }
     }
 
     result
 }
 
-pub enum StorageRecoveryEvent<'a> {
-    CorruptPrimary {
-        path: &'a Path,
-        error: &'a serde_json::Error,
-    },
-    RecoveredFromBackup {
-        backup_path: &'a Path,
-    },
-}
+mod recovery;
 
-pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    read_json_with_recovery_handler(path, |event| match event {
-        StorageRecoveryEvent::CorruptPrimary { path, error } => {
-            eprintln!(
-                "Corrupt JSON at {}, trying backup: {}",
-                path.display(),
-                error
-            );
-        }
-        StorageRecoveryEvent::RecoveredFromBackup { backup_path } => {
-            eprintln!("Recovered from backup: {}", backup_path.display());
-        }
-    })
-}
-
-pub fn read_json_with_recovery_handler<T, F>(path: &Path, mut on_recovery: F) -> Result<T>
-where
-    T: DeserializeOwned,
-    F: FnMut(StorageRecoveryEvent<'_>),
-{
-    let data = std::fs::read_to_string(path)?;
-    match serde_json::from_str(&data) {
-        Ok(val) => Ok(val),
-        Err(e) => {
-            let bak_path = path.with_extension("bak");
-            if bak_path.exists() {
-                on_recovery(StorageRecoveryEvent::CorruptPrimary { path, error: &e });
-                let bak_data = std::fs::read_to_string(&bak_path)?;
-                match serde_json::from_str(&bak_data) {
-                    Ok(val) => {
-                        on_recovery(StorageRecoveryEvent::RecoveredFromBackup {
-                            backup_path: &bak_path,
-                        });
-                        let _ = std::fs::copy(&bak_path, path);
-                        Ok(val)
-                    }
-                    Err(bak_err) => Err(anyhow::anyhow!(
-                        "Corrupt JSON at {} ({}), backup also corrupt ({})",
-                        path.display(),
-                        e,
-                        bak_err
-                    )),
-                }
-            } else {
-                Err(anyhow::anyhow!("Corrupt JSON at {}: {}", path.display(), e))
-            }
-        }
-    }
-}
-
-/// Fast append of a single JSON value followed by a newline.
-/// Intended for append-only journals where per-write fsync is not required.
-///
-/// The entire line (value + trailing newline) is serialized into one buffer
-/// and appended with a single `write_all`. Streaming the serializer straight
-/// into the file issued many small writes, so a concurrent reader (or a
-/// process killed mid-append) could observe a torn half-line, and two
-/// concurrent appenders could interleave fragments. A single `O_APPEND` write
-/// of the complete line keeps each journal line intact.
-pub fn append_json_line_fast<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-
-    let mut line = serde_json::to_vec(value)?;
-    line.push(b'\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    file.write_all(&line)?;
-    Ok(())
-}
-
-#[cfg(all(test, windows))]
-mod windows_hardening_tests {
-    use super::*;
-
-    #[test]
-    fn first_path_starts_one_worker_and_repeated_paths_are_coalesced() {
-        let mut state = SecretHardenState::default();
-        let now = Instant::now();
-        let directory = Path::new(r"C:\Users\test\.jcode");
-        let file = directory.join("auth.json");
-
-        assert!(state.enqueue(directory, true, now));
-        assert!(!state.enqueue(directory, true, now));
-        assert!(!state.enqueue(&file, false, now));
-        assert!(state.worker_running);
-        assert_eq!(state.pending_directories.len(), 1);
-        assert_eq!(state.pending_files.len(), 1);
-    }
-
-    #[test]
-    fn recently_attempted_paths_are_not_requeued() {
-        let mut state = SecretHardenState::default();
-        let attempted_at = Instant::now();
-        let file = PathBuf::from(r"C:\Users\test\.jcode\auth.json");
-        state
-            .files
-            .insert(file.clone(), SecretHardenAttempt::Succeeded(attempted_at));
-
-        assert!(!state.enqueue(&file, false, attempted_at));
-        assert!(!state.worker_running);
-        assert!(state.pending_files.is_empty());
-    }
-
-    #[test]
-    fn failed_paths_retry_after_shorter_backoff() {
-        let mut state = SecretHardenState::default();
-        let attempted_at = Instant::now();
-        let file = PathBuf::from(r"C:\Users\test\.jcode\auth.json");
-        state
-            .files
-            .insert(file.clone(), SecretHardenAttempt::Failed(attempted_at));
-
-        assert!(!state.enqueue(&file, false, attempted_at));
-        let retry_at = attempted_at + SECRET_HARDEN_FAILURE_BACKOFF;
-        assert!(state.enqueue(&file, false, retry_at));
-    }
-
-    #[test]
-    fn in_flight_paths_are_not_requeued() {
-        let mut state = SecretHardenState::default();
-        let now = Instant::now();
-        let file = PathBuf::from(r"C:\Users\test\.jcode\auth.json");
-        state
-            .files
-            .insert(file.clone(), SecretHardenAttempt::InFlight);
-
-        assert!(!state.enqueue(&file, false, now));
-        assert!(state.pending_files.is_empty());
-    }
-}
+pub use recovery::*;
 
 #[cfg(test)]
-mod env_file_tests {
-    use super::*;
-
-    #[test]
-    fn env_upsert_rejects_key_and_value_injection() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join("provider.env");
-
-        assert!(upsert_env_file_value(&path, "SAFE_KEY", Some("safe-value")).is_ok());
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("saved env"),
-            "SAFE_KEY=safe-value\n"
-        );
-        assert!(upsert_env_file_value(&path, "SAFE_KEY\nINJECTED", Some("x")).is_err());
-        assert!(upsert_env_file_value(&path, "SAFE_KEY", Some("x\nINJECTED=y")).is_err());
-        assert!(upsert_env_file_value(&path, "BAD=KEY", Some("x")).is_err());
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("unchanged env"),
-            "SAFE_KEY=safe-value\n"
-        );
-    }
-}
+mod tests;

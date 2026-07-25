@@ -6,13 +6,13 @@ async fn handle_clear_session_replaces_runtime_handles_and_updates_shutdown_regi
 -> Result<()> {
     let _guard = crate::storage::lock_test_env();
 
-    let old_session_id = "session_before_clear";
+    let old_session_id = format!("session_before_clear_{}", uuid::Uuid::new_v4().simple());
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
     let agent = Arc::new(Mutex::new(build_test_agent_with_id(
         provider.clone(),
         registry.clone(),
-        old_session_id,
+        &old_session_id,
         Vec::new(),
     )));
 
@@ -30,15 +30,15 @@ async fn handle_clear_session_replaces_runtime_handles_and_updates_shutdown_regi
     };
 
     let sessions = Arc::new(RwLock::new(HashMap::from([(
-        old_session_id.to_string(),
+        old_session_id.clone(),
         Arc::clone(&agent),
     )])));
     let shutdown_signals = Arc::new(RwLock::new(HashMap::from([(
-        old_session_id.to_string(),
+        old_session_id.clone(),
         old_cancel_signal.clone(),
     )])));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::from([(
-        old_session_id.to_string(),
+        old_session_id.clone(),
         old_queue.clone(),
     )])));
     let now = Instant::now();
@@ -46,7 +46,7 @@ async fn handle_clear_session_replaces_runtime_handles_and_updates_shutdown_regi
         "conn_clear".to_string(),
         ClientConnectionInfo {
             client_id: "conn_clear".to_string(),
-            session_id: old_session_id.to_string(),
+            session_id: old_session_id.clone(),
             client_instance_id: None,
             debug_client_id: Some("debug_clear".to_string()),
             connected_at: now,
@@ -74,31 +74,45 @@ async fn handle_clear_session_replaces_runtime_handles_and_updates_shutdown_regi
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel::<SwarmEvent>(8);
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
 
-    let mut client_session_id = old_session_id.to_string();
-    handle_clear_session(
-        7,
-        false,
-        &mut client_session_id,
-        "conn_clear",
-        &agent,
-        &provider,
-        &registry,
-        &sessions,
-        &shutdown_signals,
-        &soft_interrupt_queues,
-        &client_connections,
-        &swarm_members,
-        &swarms_by_id,
-        &file_touch,
-        &channel_subscriptions,
-        &channel_subscriptions_by_session,
-        &swarm_plans,
-        &event_history,
-        &event_counter,
-        &swarm_event_tx,
-        &client_event_tx,
-    )
-    .await;
+    let mut client_session_id = old_session_id.clone();
+    let old_lifecycle = crate::server::acquire_session_lifecycle_lease(&old_session_id).await;
+    {
+        let clear = handle_clear_session(
+            7,
+            false,
+            &mut client_session_id,
+            "conn_clear",
+            &agent,
+            &provider,
+            &registry,
+            &sessions,
+            &shutdown_signals,
+            &soft_interrupt_queues,
+            &client_connections,
+            &swarm_members,
+            &swarms_by_id,
+            &file_touch,
+            &channel_subscriptions,
+            &channel_subscriptions_by_session,
+            &swarm_plans,
+            &event_history,
+            &event_counter,
+            &swarm_event_tx,
+            &client_event_tx,
+        );
+        tokio::pin!(clear);
+        tokio::select! {
+            result = &mut clear => panic!("clear bypassed the old lifecycle lease: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+        assert!(sessions.read().await.contains_key(&old_session_id));
+        assert_eq!(
+            client_connections.read().await["conn_clear"].session_id,
+            old_session_id
+        );
+        drop(old_lifecycle);
+        clear.as_mut().await.expect("clear session");
+    }
 
     assert_ne!(client_session_id, old_session_id);
 
@@ -128,12 +142,12 @@ async fn handle_clear_session_replaces_runtime_handles_and_updates_shutdown_regi
     assert!(!agent.lock().await.has_soft_interrupts());
 
     let queue_map = soft_interrupt_queues.read().await;
-    assert!(!queue_map.contains_key(old_session_id));
+    assert!(!queue_map.contains_key(&old_session_id));
     assert!(queue_map.contains_key(&client_session_id));
     drop(queue_map);
 
     let signals = shutdown_signals.read().await;
-    assert!(!signals.contains_key(old_session_id));
+    assert!(!signals.contains_key(&old_session_id));
     let registered_signal = signals
         .get(&client_session_id)
         .ok_or_else(|| anyhow!("new session should have shutdown signal"))?

@@ -2,11 +2,9 @@ use super::*;
 use crate::tui::app as app_mod;
 use crate::tui::app::PendingRemoteRewindNotice;
 use crate::tui::core;
-
 pub(in crate::tui::app) fn handle_remote_char_input(app: &mut App, c: char) {
     input::handle_text_input(app, &c.to_string());
 }
-
 pub(in crate::tui::app) async fn send_interleave_now(
     app: &mut App,
     content: String,
@@ -29,13 +27,11 @@ pub(in crate::tui::app) async fn send_interleave_now(
         }
     }
 }
-
 pub(in crate::tui::app) async fn handle_remote_update_command(
     app: &mut App,
     remote: &mut RemoteConnection,
 ) -> Result<()> {
     reload_stale_remote_server_before_update(app, remote).await?;
-
     let session_id = app
         .remote_session_id
         .clone()
@@ -43,7 +39,6 @@ pub(in crate::tui::app) async fn handle_remote_update_command(
     app.start_background_client_update(session_id);
     Ok(())
 }
-
 pub(in crate::tui::app) async fn reload_stale_remote_server_before_update(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -51,12 +46,10 @@ pub(in crate::tui::app) async fn reload_stale_remote_server_before_update(
     if app.remote_server_has_update != Some(true) {
         return Ok(false);
     }
-
     app.append_reload_message("Reloading stale server before checking for client updates...");
     remote.reload().await?;
     Ok(true)
 }
-
 async fn apply_remote_effort_direction(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -109,14 +102,12 @@ async fn apply_remote_effort_direction(
     }
     Ok(())
 }
-
 fn remote_rewindable_messages(app: &App) -> Vec<&DisplayMessage> {
     app.display_messages()
         .iter()
         .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
         .collect()
 }
-
 fn show_remote_rewind_history(app: &mut App) {
     let rewindable = remote_rewindable_messages(app);
     if rewindable.is_empty() {
@@ -125,7 +116,6 @@ fn show_remote_rewind_history(app: &mut App) {
         ));
         return;
     }
-
     let mut history = String::from("Conversation history:\n\n");
     for (i, msg) in rewindable.iter().enumerate() {
         let role_str = match msg.role.as_str() {
@@ -140,7 +130,6 @@ fn show_remote_rewind_history(app: &mut App) {
     history.push_str(" After rewinding, use /rewind undo to restore the removed messages.");
     app.push_display_message(DisplayMessage::system(history));
 }
-
 async fn handle_remote_rewind_command(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -150,7 +139,6 @@ async fn handle_remote_rewind_command(
         show_remote_rewind_history(app);
         return Ok(true);
     }
-
     if trimmed == "/rewind undo" {
         remote.rewind_undo().await?;
         app.pending_remote_rewind_notice = Some(PendingRemoteRewindNotice {
@@ -161,11 +149,9 @@ async fn handle_remote_rewind_command(
         app.set_status_notice("Undoing rewind...");
         return Ok(true);
     }
-
     let Some(num_str) = trimmed.strip_prefix("/rewind ") else {
         return Ok(false);
     };
-
     let message_count = remote_rewindable_messages(app).len();
     if message_count == 0 {
         app.push_display_message(DisplayMessage::system(
@@ -173,7 +159,6 @@ async fn handle_remote_rewind_command(
         ));
         return Ok(true);
     }
-
     match num_str.trim().parse::<usize>() {
         Ok(n) if n > 0 && n <= message_count => {
             remote.rewind(n).await?;
@@ -197,10 +182,8 @@ async fn handle_remote_rewind_command(
             )));
         }
     }
-
     Ok(true)
 }
-
 impl App {
     pub(super) async fn handle_account_picker_command_remote(
         &mut self,
@@ -236,7 +219,6 @@ impl App {
         Ok(())
     }
 }
-
 pub(in crate::tui::app) async fn handle_remote_key(
     app: &mut App,
     code: KeyCode,
@@ -245,7 +227,6 @@ pub(in crate::tui::app) async fn handle_remote_key(
 ) -> Result<()> {
     handle_remote_key_internal(app, code, modifiers, remote, None).await
 }
-
 pub(in crate::tui::app) async fn handle_remote_key_event(
     app: &mut App,
     event: KeyEvent,
@@ -260,7 +241,6 @@ pub(in crate::tui::app) async fn handle_remote_key_event(
     )
     .await
 }
-
 async fn handle_remote_key_internal(
     app: &mut App,
     code: KeyCode,
@@ -271,39 +251,31 @@ async fn handle_remote_key_internal(
     let mut code = code;
     let mut modifiers = modifiers;
     ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
-
     // Alt+5 always resets the simulator before modal routing, including in the
     // remote/client mode used by self-dev sessions.
     if app.handle_onboarding_sim_reset_shortcut(code, modifiers) {
         return Ok(());
     }
-
     // The onboarding simulator owns all key handling while active (and Cmd+5
     // toggles it). Handle it first so no real onboarding action can leak through.
     if app.handle_onboarding_sim_key(code, modifiers) {
         return Ok(());
     }
-
     if app.handle_onboarding_continue_prompt_key(code) {
         return Ok(());
     }
-
     if app.changelog_scroll.is_some() {
         return app.handle_changelog_key(code);
     }
-
     if app.help_scroll.is_some() {
         return app.handle_help_key(code);
     }
-
     if app.session_picker_overlay.is_some() {
         return app.handle_session_picker_key(code, modifiers);
     }
-
     if app.login_picker_overlay.is_some() {
         return app.handle_login_picker_key(code, modifiers);
     }
-
     if app.account_picker_overlay.is_some() {
         if let Some(command) = app.next_account_picker_action(code, modifiers)? {
             app.handle_account_picker_command_remote(remote, command)
@@ -311,7 +283,6 @@ async fn handle_remote_key_internal(
         }
         return Ok(());
     }
-
     if let Some(ref picker) = app.inline_interactive_state
         && !picker.preview
     {

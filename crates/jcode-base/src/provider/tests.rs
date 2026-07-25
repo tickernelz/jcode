@@ -229,6 +229,57 @@ fn test_multi_provider_with_openai() -> MultiProvider {
 }
 
 #[test]
+fn api_key_exact_runtime_identity_has_verifiable_generation_binding() {
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        let provider = test_multi_provider_with_openai();
+        let model = known_openai_model_ids()
+            .into_iter()
+            .next()
+            .expect("OpenAI model");
+        provider
+            .set_model(&format!("openai-api:{model}"))
+            .expect("select API-key route");
+
+        let identity = provider.exact_runtime_identity().expect("runtime identity");
+        assert!(identity.has_verifiable_account_binding());
+        assert_eq!(identity.account_label.as_deref(), Some("openai-api-key"));
+        assert_eq!(identity.account_generation, Some(1));
+        assert_eq!(provider.exact_runtime_identity().as_ref(), Some(&identity));
+
+        crate::auth::AuthStatus::invalidate_cache();
+        let replacement = provider
+            .exact_runtime_identity()
+            .expect("replacement identity");
+        assert_ne!(replacement.account_generation, Some(1));
+        assert_ne!(replacement, identity);
+    });
+}
+
+#[test]
+fn named_profile_exact_runtime_identity_is_profile_scoped_and_verifiable() {
+    with_clean_provider_test_env(|| {
+        save_test_openai_compatible_login_config("test-model");
+        let provider = MultiProvider::new_fast();
+        let profile = crate::provider_catalog::OPENAI_COMPAT_PROFILE;
+        provider
+            .set_model(&format!("{}:test-model", profile.id))
+            .expect("select named compatible profile");
+
+        let identity = provider.exact_runtime_identity().expect("runtime identity");
+        assert!(identity.has_verifiable_account_binding());
+        assert_eq!(
+            identity.account_label.as_deref(),
+            Some(format!("openai-compatible:{}", profile.id).as_str())
+        );
+        let mut mismatch = identity.clone();
+        mismatch.account_generation = Some(identity.account_generation.unwrap() + 1);
+        assert_ne!(identity, mismatch);
+    });
+}
+
+#[test]
 fn openai_model_switch_prefixes_preserve_oauth_vs_api_state_space() {
     with_clean_provider_test_env(|| {
         let rt = enter_test_runtime();

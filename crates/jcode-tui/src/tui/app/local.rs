@@ -201,6 +201,7 @@ pub(super) fn handle_bus_event(
         Ok(BusEvent::ProviderModelActivated {
             session_id,
             model,
+            model_request,
             provider_key,
             message,
             open_picker,
@@ -208,20 +209,17 @@ pub(super) fn handle_bus_event(
             if session_id != app.session.id {
                 return false;
             }
-            app.provider_session_id = None;
-            app.session.provider_session_id = None;
-            app.upstream_provider = None;
-            app.invalidate_model_picker_cache();
-            app.update_context_limit_for_model(&model);
-            app.session.provider_key = provider_key.or_else(|| {
-                crate::provider::MultiProvider::session_provider_key_after_model_switch(
-                    &model,
-                    app.provider.name(),
-                    app.session.provider_key.as_deref(),
-                )
-            });
-            app.session.model = Some(model.clone());
-            let _ = app.session.save();
+            if let Err(error) = app.finalize_applied_model_switch(
+                &model_request,
+                Some(model.clone()),
+                None,
+                provider_key,
+            ) {
+                app.push_display_message(crate::tui::DisplayMessage::error(format!(
+                    "Failed to persist activated provider model: {error}"
+                )));
+                return true;
+            }
             if !app.auth_catalog_refresh_pending {
                 app.push_display_message(crate::tui::DisplayMessage::system(message));
             }

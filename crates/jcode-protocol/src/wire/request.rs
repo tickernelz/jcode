@@ -1,0 +1,690 @@
+use super::*;
+/// Client request to server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Request {
+    /// Send a message to the agent
+    #[serde(rename = "message")]
+    Message {
+        id: u64,
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_reminder: Option<String>,
+    },
+
+    /// Cancel current generation
+    #[serde(rename = "cancel")]
+    Cancel { id: u64 },
+
+    /// Move the currently executing tool to background
+    #[serde(rename = "background_tool")]
+    BackgroundTool { id: u64 },
+
+    /// Soft interrupt: inject message at next safe point without cancelling
+    #[serde(rename = "soft_interrupt")]
+    SoftInterrupt {
+        id: u64,
+        content: String,
+        /// If true, can skip remaining tools at injection point C
+        #[serde(default)]
+        urgent: bool,
+    },
+
+    /// Cancel all pending soft interrupts (remove from server queue before injection)
+    #[serde(rename = "cancel_soft_interrupts")]
+    CancelSoftInterrupts { id: u64 },
+
+    /// Clear conversation history
+    #[serde(rename = "clear")]
+    Clear { id: u64 },
+
+    /// Rewind conversation history to the given 1-based message index.
+    #[serde(rename = "rewind")]
+    Rewind { id: u64, message_index: usize },
+
+    /// Undo the most recent rewind, if one is available.
+    #[serde(rename = "rewind_undo")]
+    RewindUndo { id: u64 },
+
+    /// Health check
+    #[serde(rename = "ping")]
+    Ping { id: u64 },
+
+    /// Get current state (debug)
+    #[serde(rename = "state")]
+    GetState { id: u64 },
+
+    /// Execute a debug command (debug socket only)
+    #[serde(rename = "debug_command")]
+    DebugCommand {
+        id: u64,
+        command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+
+    /// Execute a client debug command (forwarded to TUI)
+    #[serde(rename = "client_debug_command")]
+    ClientDebugCommand { id: u64, command: String },
+
+    /// Response from TUI for client debug command
+    #[serde(rename = "client_debug_response")]
+    ClientDebugResponse { id: u64, output: String },
+
+    /// Subscribe to events (for TUI clients)
+    #[serde(rename = "subscribe")]
+    Subscribe {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selfdev: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        client_has_local_history: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_session_takeover: bool,
+        /// Terminal-identifying env vars (tmux/zellij/kitty/DISPLAY/...) captured
+        /// from the connecting client so the server can route spawn/focus hooks
+        /// to the client's terminal instead of its own stale startup env (#405).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_env: Vec<(String, String)>,
+    },
+
+    /// Get full conversation history (for TUI sync on connect)
+    #[serde(rename = "get_history")]
+    GetHistory { id: u64 },
+
+    /// Get only provider/model metadata and available models.
+    #[serde(rename = "get_model_catalog")]
+    GetModelCatalog { id: u64 },
+
+    /// Get a bounded view of compacted historical messages for lazy transcript expansion.
+    #[serde(rename = "get_compacted_history")]
+    GetCompactedHistory {
+        id: u64,
+        /// Number of leading compacted messages the client wants rendered before the live tail.
+        visible_messages: usize,
+    },
+
+    /// Trigger server hot reload (build new version, restart)
+    #[serde(rename = "reload")]
+    Reload {
+        id: u64,
+        /// When `true` (the default for backward compatibility), the server
+        /// reloads unconditionally. When `false`, the server only reloads if it
+        /// detects a strictly-newer reload candidate binary, so callers like
+        /// `jcode server reload` can request a graceful upgrade without risking
+        /// a downgrade (e.g. a newer self-dev daemon next to an older release).
+        #[serde(default = "default_true")]
+        force: bool,
+    },
+
+    /// Resume a specific session by ID
+    #[serde(rename = "resume_session")]
+    ResumeSession {
+        id: u64,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_instance_id: Option<String>,
+        #[serde(default)]
+        client_has_local_history: bool,
+        #[serde(default)]
+        allow_session_takeover: bool,
+    },
+
+    /// Resume/continue every live session that was interrupted and would
+    /// auto-continue on a reload (e.g. crashed/errored mid-turn). This is the
+    /// on-demand equivalent of the automatic post-reload recovery sweep.
+    #[serde(rename = "resume_all_sessions")]
+    ResumeAllSessions { id: u64 },
+
+    /// Deliver a scheduled task to a currently live session.
+    #[serde(rename = "notify_session")]
+    NotifySession {
+        id: u64,
+        session_id: String,
+        message: String,
+    },
+
+    /// Inject externally transcribed text into a live TUI session.
+    #[serde(rename = "transcript")]
+    Transcript {
+        id: u64,
+        text: String,
+        #[serde(default)]
+        mode: TranscriptMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+
+    /// Execute a shell command from `!cmd` in the active remote session.
+    #[serde(rename = "input_shell")]
+    InputShell { id: u64, command: String },
+
+    /// Cycle the active model (direction: 1 for next, -1 for previous)
+    #[serde(rename = "cycle_model")]
+    CycleModel {
+        id: u64,
+        #[serde(default = "default_model_direction")]
+        direction: i8,
+    },
+
+    #[serde(rename = "refresh_models")]
+    RefreshModels { id: u64 },
+
+    /// Set the active model by name.
+    ///
+    /// A legacy/desktop compatibility shape (`{"type":"set_route","model":...}`)
+    /// is also accepted, but it is normalized into this variant inside
+    /// [`crate::decode_request`] rather than via a serde `alias`. A serde alias
+    /// would make this variant *also* answer to the `set_route` tag, and serde's
+    /// internally-tagged enums pick the first matching variant by tag (not by
+    /// fields), so it would shadow the structured [`Request::SetRoute`] variant
+    /// below and make every structured route switch fail with
+    /// `missing field \`model\``.
+    #[serde(rename = "set_model")]
+    SetModel { id: u64, model: String },
+
+    /// Set the active model by structured route identity.
+    #[serde(rename = "set_route")]
+    SetRoute {
+        id: u64,
+        selection: jcode_provider_core::RouteSelection,
+    },
+
+    /// Set or clear the session-scoped subagent model preference.
+    #[serde(rename = "set_subagent_model")]
+    SetSubagentModel {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+
+    /// Launch a subagent immediately in the active session.
+    #[serde(rename = "run_subagent")]
+    RunSubagent {
+        id: u64,
+        prompt: String,
+        subagent_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+
+    /// Set reasoning effort for providers that expose it (OpenAI: none|minimal|low|medium|high|xhigh|max; Anthropic: none|low|medium|high|xhigh|max; DeepSeek: none|low|medium|high|max)
+    #[serde(rename = "set_reasoning_effort")]
+    SetReasoningEffort {
+        id: u64,
+        effort: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_session_id: Option<String>,
+    },
+
+    /// Set service tier for OpenAI models (priority|fast|flex|off)
+    #[serde(rename = "set_service_tier")]
+    SetServiceTier { id: u64, service_tier: String },
+
+    /// Set connection transport for OpenAI models (auto|https|websocket)
+    #[serde(rename = "set_transport")]
+    SetTransport { id: u64, transport: String },
+
+    /// Set Copilot premium request conservation mode (0=normal, 1=one-per-session, 2=zero)
+    #[serde(rename = "set_premium_mode")]
+    SetPremiumMode { id: u64, mode: u8 },
+
+    /// Toggle a runtime feature for this session
+    #[serde(rename = "set_feature")]
+    SetFeature {
+        id: u64,
+        feature: FeatureToggle,
+        enabled: bool,
+    },
+
+    /// Set the compaction mode for this session
+    #[serde(rename = "set_compaction_mode")]
+    SetCompactionMode {
+        id: u64,
+        mode: jcode_config_types::CompactionMode,
+    },
+
+    /// Set or clear the server-global compaction model route spec.
+    #[serde(rename = "set_compaction_model")]
+    SetCompactionModel {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+
+    /// Set or clear the active session's custom display title.
+    #[serde(rename = "rename_session")]
+    RenameSession {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+
+    /// Split the current session — clone conversation into a new session
+    #[serde(rename = "split")]
+    Split { id: u64 },
+
+    /// Transfer the current session into a compacted handoff session
+    #[serde(rename = "transfer")]
+    Transfer { id: u64 },
+
+    /// Trigger manual context compaction
+    #[serde(rename = "compact")]
+    Compact { id: u64 },
+
+    /// Trigger immediate memory extraction for the current session
+    #[serde(rename = "trigger_memory_extraction")]
+    TriggerMemoryExtraction { id: u64 },
+
+    /// Notify server that auth credentials changed (e.g., after login)
+    #[serde(rename = "notify_auth_changed")]
+    NotifyAuthChanged {
+        id: u64,
+        /// Optional runtime provider identity whose credentials changed. Older
+        /// clients omit this and get the legacy generic refresh behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Typed auth lifecycle event for new clients. The legacy `provider`
+        /// string is retained for old clients, while this payload gives the
+        /// server enough context to activate the intended runtime/catalog
+        /// profile deterministically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<AuthChanged>,
+        /// First-run onboarding may ask the server to choose the strongest
+        /// available route across all authenticated providers. Normal re-auth,
+        /// account switching, and older clients leave this false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        prefer_strongest: bool,
+    },
+
+    /// Switch active Anthropic account label on the server session.
+    /// This keeps account overrides and provider credential caches in sync.
+    #[serde(rename = "switch_anthropic_account")]
+    SwitchAnthropicAccount { id: u64, label: String },
+
+    /// Switch active OpenAI account label on the server session.
+    /// This keeps account overrides and provider credential caches in sync.
+    #[serde(rename = "switch_openai_account")]
+    SwitchOpenAiAccount { id: u64, label: String },
+
+    /// Send stdin input to a running command that requested it
+    #[serde(rename = "stdin_response")]
+    StdinResponse {
+        id: u64,
+        /// Matches the request_id from StdinRequest
+        request_id: String,
+        /// The user's input (line of text)
+        input: String,
+    },
+
+    // === Agent-to-agent communication ===
+    /// Register as an external agent
+    #[serde(rename = "agent_register")]
+    AgentRegister {
+        id: u64,
+        agent_name: String,
+        capabilities: Vec<String>,
+    },
+
+    /// Send a task to jcode agent
+    #[serde(rename = "agent_task")]
+    AgentTask {
+        id: u64,
+        from_agent: String,
+        task: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<serde_json::Value>,
+        /// Whether to wait for completion or return immediately
+        #[serde(default)]
+        async_: bool,
+    },
+
+    /// Query jcode agent's capabilities
+    #[serde(rename = "agent_capabilities")]
+    AgentCapabilities { id: u64 },
+
+    /// Get conversation context (for handoff between agents)
+    #[serde(rename = "agent_context")]
+    AgentContext { id: u64 },
+
+    // === Agent communication ===
+    /// Share context with other agents
+    #[serde(rename = "comm_share")]
+    CommShare {
+        id: u64,
+        session_id: String,
+        key: String,
+        value: String,
+        #[serde(default)]
+        append: bool,
+    },
+
+    /// Read shared context from other agents
+    #[serde(rename = "comm_read")]
+    CommRead {
+        id: u64,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+
+    /// Send a message to other agents
+    #[serde(rename = "comm_message")]
+    CommMessage {
+        id: u64,
+        from_session: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<CommDeliveryMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake: Option<bool>,
+        /// Sender-provided one-line summary. Receiving UIs render long
+        /// message bodies collapsed to this with an expand control.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tldr: Option<String>,
+    },
+
+    /// List agents and their activity
+    #[serde(rename = "comm_list")]
+    CommList { id: u64, session_id: String },
+
+    /// List swarm channels and subscriber counts
+    #[serde(rename = "comm_list_channels")]
+    CommListChannels { id: u64, session_id: String },
+
+    /// List members subscribed to a swarm channel
+    #[serde(rename = "comm_channel_members")]
+    CommChannelMembers {
+        id: u64,
+        session_id: String,
+        channel: String,
+    },
+
+    /// Propose a swarm plan update
+    #[serde(rename = "comm_propose_plan")]
+    CommProposePlan {
+        id: u64,
+        session_id: String,
+        items: Vec<PlanItem>,
+    },
+
+    /// Approve a plan proposal (coordinator only)
+    #[serde(rename = "comm_approve_plan")]
+    CommApprovePlan {
+        id: u64,
+        session_id: String,
+        proposer_session: String,
+    },
+
+    /// Reject a plan proposal (coordinator only)
+    #[serde(rename = "comm_reject_plan")]
+    CommRejectPlan {
+        id: u64,
+        session_id: String,
+        proposer_session: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Seed the swarm task DAG in one call (the first agent's draft). Replaces or
+    /// initializes the shared plan with a validated graph of nodes + edges.
+    #[serde(rename = "comm_seed_graph")]
+    CommSeedGraph {
+        id: u64,
+        session_id: String,
+        /// "deep" (comprehensive, gated) or "light" (fan-out).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        nodes: Vec<TaskGraphNodeSpec>,
+    },
+
+    /// Decompose a node the caller owns into a child sub-DAG (composite path). In
+    /// deep mode a critique/verify gate is auto-inserted.
+    #[serde(rename = "comm_expand_node")]
+    CommExpandNode {
+        id: u64,
+        session_id: String,
+        node_id: String,
+        children: Vec<TaskGraphNodeSpec>,
+    },
+
+    /// Complete a node the caller owns with a typed handoff artifact. In deep mode
+    /// the artifact is validated for thinness.
+    #[serde(rename = "comm_complete_node")]
+    CommCompleteNode {
+        id: u64,
+        session_id: String,
+        node_id: String,
+        /// Handoff artifact as a JSON object string.
+        artifact_json: String,
+    },
+
+    /// Inject gap/fix nodes from a gate that found a problem, re-blocking the gate
+    /// (and its composite parent) until the new nodes drain.
+    #[serde(rename = "comm_inject_gap")]
+    CommInjectGap {
+        id: u64,
+        session_id: String,
+        gate_id: String,
+        nodes: Vec<TaskGraphNodeSpec>,
+    },
+
+    /// Spawn a new agent session (coordinator only)
+    #[serde(rename = "comm_spawn")]
+    CommSpawn {
+        id: u64,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_nonce: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawn_mode: Option<String>,
+        /// Optional per-spawn model override. Takes precedence over
+        /// `agents.swarm_model` config. Supports explicit auth-route prefixes
+        /// (e.g. `openai-api:gpt-5.5`) and the `inherit`/`coordinator`
+        /// sentinels to force coordinator inheritance past a config pin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional reasoning effort for the spawned agent (e.g. `none`,
+        /// `low`, `medium`, `high`, `xhigh`, `max`). Unset = provider default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        /// Optional short human-readable label for the spawned agent shown in
+        /// swarm UI (gallery chips, member lists). Overrides the task label
+        /// otherwise derived from the first line of `initial_message`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+
+    /// List models/routes available for spawning swarm agents
+    #[serde(rename = "comm_list_models")]
+    CommListModels { id: u64, session_id: String },
+
+    /// Stop/destroy an agent session (coordinator only)
+    #[serde(rename = "comm_stop")]
+    CommStop {
+        id: u64,
+        session_id: String,
+        target_session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force: Option<bool>,
+    },
+
+    /// Assign a role to an agent (coordinator only)
+    #[serde(rename = "comm_assign_role")]
+    CommAssignRole {
+        id: u64,
+        session_id: String,
+        target_session: String,
+        role: String,
+    },
+
+    /// Get a summary of an agent's recent tool calls
+    #[serde(rename = "comm_summary")]
+    CommSummary {
+        id: u64,
+        session_id: String,
+        target_session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+
+    /// Get a lightweight status snapshot for an agent, even while it is busy
+    #[serde(rename = "comm_status")]
+    CommStatus {
+        id: u64,
+        session_id: String,
+        target_session: String,
+    },
+
+    /// Submit a structured swarm completion/progress report for this session
+    #[serde(rename = "comm_report")]
+    CommReport {
+        id: u64,
+        session_id: String,
+        /// Completion status to record for this member. Defaults to ready.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// Main report body.
+        message: String,
+        /// Optional validation/testing summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validation: Option<String>,
+        /// Optional blockers/follow-up summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        follow_up: Option<String>,
+        /// Reporter-provided one-line summary. Receiving UIs render long
+        /// report bodies collapsed to this with an expand control.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tldr: Option<String>,
+    },
+
+    /// Read another agent's full conversation context
+    #[serde(rename = "comm_read_context")]
+    CommReadContext {
+        id: u64,
+        session_id: String,
+        target_session: String,
+    },
+
+    /// Attach/resync this session with the swarm plan
+    #[serde(rename = "comm_resync_plan")]
+    CommResyncPlan { id: u64, session_id: String },
+
+    /// Get a lightweight summary of the current swarm plan graph
+    #[serde(rename = "comm_plan_status")]
+    CommPlanStatus { id: u64, session_id: String },
+
+    /// Assign a task from the plan to a specific agent (coordinator only)
+    #[serde(rename = "comm_assign_task")]
+    CommAssignTask {
+        id: u64,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+
+    /// Assign the next runnable unassigned task from the plan (coordinator only)
+    #[serde(rename = "comm_assign_next")]
+    CommAssignNext {
+        id: u64,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefer_spawn: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawn_if_needed: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Optional model override for workers spawned by this assignment
+        /// (same semantics as CommSpawn::model).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional reasoning effort for workers spawned by this assignment
+        /// (same semantics as CommSpawn::effort).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
+
+    /// Control an existing assigned task lifecycle (coordinator only)
+    #[serde(rename = "comm_task_control")]
+    CommTaskControl {
+        id: u64,
+        session_id: String,
+        action: String,
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+
+    /// Subscribe to a named channel in the swarm
+    #[serde(rename = "comm_subscribe_channel")]
+    CommSubscribeChannel {
+        id: u64,
+        session_id: String,
+        channel: String,
+    },
+
+    /// Unsubscribe from a named channel in the swarm
+    #[serde(rename = "comm_unsubscribe_channel")]
+    CommUnsubscribeChannel {
+        id: u64,
+        session_id: String,
+        channel: String,
+    },
+
+    /// Wait until specified (or all) swarm members reach a target status
+    #[serde(rename = "comm_await_members")]
+    CommAwaitMembers {
+        id: u64,
+        session_id: String,
+        /// Statuses that count as "done" (e.g. ["completed", "stopped"])
+        target_status: Vec<String>,
+        /// Specific session IDs to watch. If empty, watches all non-self members.
+        #[serde(default)]
+        session_ids: Vec<String>,
+        /// Whether to wait for all matching members or wake when any member matches.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// Timeout in seconds (default 3600 = 1 hour)
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        /// Run the wait as a detached background watcher instead of blocking the
+        /// requesting turn. Defaults to true so the agent stays responsive.
+        #[serde(default = "default_true")]
+        background: bool,
+        /// When backgrounded, surface a notification card on completion.
+        #[serde(default = "default_true")]
+        notify: bool,
+        /// When backgrounded, wake an idle requesting agent with the result (or
+        /// soft-interrupt it if busy). Defaults to true.
+        #[serde(default = "default_true")]
+        wake: bool,
+    },
+}

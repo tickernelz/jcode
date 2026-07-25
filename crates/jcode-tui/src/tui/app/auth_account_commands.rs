@@ -454,40 +454,22 @@ pub(crate) async fn execute_account_command_remote(
         }
         AccountCommand::Switch { provider_id, label } => match provider_id.as_str() {
             "claude" => {
-                if let Err(e) = crate::auth::claude::set_active_account(&label) {
-                    app.push_display_message(DisplayMessage::error(format!(
-                        "Failed to switch account: {}",
-                        e
-                    )));
-                    return Ok(());
-                }
-                crate::auth::AuthStatus::invalidate_cache();
-                app.context_limit = app.provider.context_window() as u64;
-                app.context_warning_shown = false;
-                remote.switch_anthropic_account(&label).await?;
-                app.push_display_message(DisplayMessage::system(format!(
-                    "Switched to Anthropic account {}.",
-                    label
-                )));
-                app.set_status_notice(format!("Account: switched to {}", label));
+                let id = remote.switch_anthropic_account(&label).await?;
+                app.pending_remote_account_switch = Some(PendingRemoteAccountSwitch {
+                    id,
+                    provider_id: "anthropic".to_string(),
+                    label,
+                });
+                app.set_status_notice("Waiting for server account switch");
             }
             "openai" => {
-                if let Err(e) = crate::auth::codex::set_active_account(&label) {
-                    app.push_display_message(DisplayMessage::error(format!(
-                        "Failed to switch OpenAI account: {}",
-                        e
-                    )));
-                    return Ok(());
-                }
-                crate::auth::AuthStatus::invalidate_cache();
-                app.context_limit = app.provider.context_window() as u64;
-                app.context_warning_shown = false;
-                remote.switch_openai_account(&label).await?;
-                app.push_display_message(DisplayMessage::system(format!(
-                    "Switched to OpenAI account {}.",
-                    label
-                )));
-                app.set_status_notice(format!("OpenAI account: switched to {}", label));
+                let id = remote.switch_openai_account(&label).await?;
+                app.pending_remote_account_switch = Some(PendingRemoteAccountSwitch {
+                    id,
+                    provider_id: "openai".to_string(),
+                    label,
+                });
+                app.set_status_notice("Waiting for server account switch");
             }
             _ => execute_account_command_local(app, AccountCommand::Switch { provider_id, label }),
         },
@@ -502,40 +484,22 @@ pub(crate) async fn execute_account_command_remote(
                 .any(|account| account.label == label);
             match (has_anthropic, has_openai) {
                 (true, false) => {
-                    if let Err(e) = crate::auth::claude::set_active_account(&label) {
-                        app.push_display_message(DisplayMessage::error(format!(
-                            "Failed to switch account: {}",
-                            e
-                        )));
-                        return Ok(());
-                    }
-                    crate::auth::AuthStatus::invalidate_cache();
-                    app.context_limit = app.provider.context_window() as u64;
-                    app.context_warning_shown = false;
-                    remote.switch_anthropic_account(&label).await?;
-                    app.push_display_message(DisplayMessage::system(format!(
-                        "Switched to Anthropic account {}.",
-                        label
-                    )));
-                    app.set_status_notice(format!("Account: switched to {}", label));
+                    let id = remote.switch_anthropic_account(&label).await?;
+                    app.pending_remote_account_switch = Some(PendingRemoteAccountSwitch {
+                        id,
+                        provider_id: "anthropic".to_string(),
+                        label,
+                    });
+                    app.set_status_notice("Waiting for server account switch");
                 }
                 (false, true) => {
-                    if let Err(e) = crate::auth::codex::set_active_account(&label) {
-                        app.push_display_message(DisplayMessage::error(format!(
-                            "Failed to switch OpenAI account: {}",
-                            e
-                        )));
-                        return Ok(());
-                    }
-                    crate::auth::AuthStatus::invalidate_cache();
-                    app.context_limit = app.provider.context_window() as u64;
-                    app.context_warning_shown = false;
-                    remote.switch_openai_account(&label).await?;
-                    app.push_display_message(DisplayMessage::system(format!(
-                        "Switched to OpenAI account {}.",
-                        label
-                    )));
-                    app.set_status_notice(format!("OpenAI account: switched to {}", label));
+                    let id = remote.switch_openai_account(&label).await?;
+                    app.pending_remote_account_switch = Some(PendingRemoteAccountSwitch {
+                        id,
+                        provider_id: "openai".to_string(),
+                        label,
+                    });
+                    app.set_status_notice("Waiting for server account switch");
                 }
                 _ => execute_account_command_local(app, AccountCommand::SwitchShorthand { label }),
             }
@@ -724,8 +688,11 @@ fn save_openai_effort_setting_local(app: &mut App, value: Option<&str>) {
     }
     match crate::config::Config::set_openai_reasoning_effort(value) {
         Ok(()) => {
-            if let Some(value) = value {
-                let _ = app.provider.set_reasoning_effort(value);
+            if let Err(error) = app.set_reasoning_effort_transactional(value.unwrap_or("")) {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Saved OpenAI effort preference, but failed to apply it to this session: {error}"
+                )));
+                return;
             }
             let label = value.unwrap_or("(provider default)");
             app.set_status_notice(format!("Effort: {}", label));

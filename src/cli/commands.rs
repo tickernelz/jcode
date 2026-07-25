@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
-
+use super::terminal::init_tui_runtime;
+use crate::{browser, gateway, memory, session, storage, tui};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -7,16 +8,10 @@ use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-
-use crate::{browser, gateway, memory, session, storage, tui};
-
-use super::terminal::init_tui_runtime;
-
 mod menubar;
 mod provider_setup;
 mod report_info;
 mod restart;
-
 pub(crate) use super::auth_test::run_post_login_validation;
 #[cfg(test)]
 pub(crate) use super::auth_test::{
@@ -32,7 +27,6 @@ pub use restart::{
     maybe_run_pending_restart_restore_on_startup, run_restart_clear_command,
     run_restart_restore_command, run_restart_save_command, run_restart_status_command,
 };
-
 pub enum AmbientSubcommand {
     Status,
     Log,
@@ -40,11 +34,9 @@ pub enum AmbientSubcommand {
     Stop,
     RunVisible,
 }
-
 pub enum CloudSubcommand {
     Sessions(CloudSessionsSubcommand),
 }
-
 pub enum CloudSessionsSubcommand {
     Configure {
         api_base: Option<String>,
@@ -125,7 +117,6 @@ pub enum CloudSessionsSubcommand {
         helper: Option<String>,
     },
 }
-
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CloudSessionsConfig {
     api_base: Option<String>,
@@ -3176,13 +3167,11 @@ pub async fn run_model_command(
     verbose: bool,
 ) -> Result<()> {
     let provider = super::provider_init::init_provider_quiet(choice, model).await?;
-
     if let Err(err) = provider.prefetch_models().await
         && !super::output::quiet_enabled()
     {
         eprintln!("Warning: failed to refresh dynamic model list: {}", err);
     }
-
     let routes = provider.model_routes();
     let filtered_routes = filter_cli_model_routes_for_choice(choice, &routes);
     let models = if filtered_routes.len() == routes.len() {
@@ -3190,14 +3179,12 @@ pub async fn run_model_command(
     } else {
         collect_cli_model_names(&filtered_routes, Vec::new())
     };
-
     if models.is_empty() {
         anyhow::bail!(
             "No models found for provider '{}'. Check credentials or try a different --provider.",
             provider.name()
         );
     }
-
     if emit_json {
         let provider_label = super::provider_init::login_provider_for_choice(choice)
             .map(|provider| provider.display_name.to_string())
@@ -3213,34 +3200,29 @@ pub async fn run_model_command(
                 .map(|route| ModelListRouteReport {
                     provider: cli_route_provider_display(&route.provider, &route.api_method),
                     model: route.model.clone(),
-                    method: cli_api_method_display(&route.api_method),
+                    method: crate::provider::ModelRouteApiMethod::parse(&route.api_method)
+                        .display_label(),
                     available: route.available,
                 })
                 .collect(),
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        if verbose {
-            println!(
-                "Provider: {}",
-                crate::provider_catalog::runtime_provider_display_name(provider.name())
-            );
-            println!("Selected model: {}", provider.model());
-            println!("Available models: {}", models.len());
-            println!();
-        }
-        for model in models {
-            println!("{}", model);
-        }
+        return Ok(());
     }
-
+    if verbose {
+        println!(
+            "Provider: {}",
+            crate::provider_catalog::runtime_provider_display_name(provider.name())
+        );
+        println!("Selected model: {}", provider.model());
+        println!("Available models: {}", models.len());
+        println!();
+    }
+    for model in models {
+        println!("{}", model);
+    }
     Ok(())
 }
-
-fn cli_api_method_display(raw: &str) -> String {
-    crate::provider::ModelRouteApiMethod::parse(raw).display_label()
-}
-
 fn cli_route_provider_display(provider: &str, api_method: &str) -> String {
     if crate::provider::ModelRouteApiMethod::parse(api_method).is_openrouter()
         && provider != "auto"
@@ -3251,14 +3233,12 @@ fn cli_route_provider_display(provider: &str, api_method: &str) -> String {
         provider.to_string()
     }
 }
-
 fn collect_cli_model_names(
     routes: &[crate::provider::ModelRoute],
     display_models: Vec<String>,
 ) -> Vec<String> {
     let mut deduped = Vec::new();
     let mut seen = BTreeSet::new();
-
     fn push_model(deduped: &mut Vec<String>, seen: &mut BTreeSet<String>, model: &str) {
         let trimmed = model.trim();
         if !crate::provider::is_listable_model_name(trimmed) {
@@ -3268,31 +3248,25 @@ fn collect_cli_model_names(
             deduped.push(trimmed.to_string());
         }
     }
-
     for route in routes.iter().filter(|route| route.available) {
         push_model(&mut deduped, &mut seen, &route.model);
     }
-
     if deduped.is_empty() {
         for route in routes {
             push_model(&mut deduped, &mut seen, &route.model);
         }
     }
-
     for model in display_models {
         push_model(&mut deduped, &mut seen, &model);
     }
-
     deduped
 }
-
 #[allow(deprecated)]
 fn filter_cli_model_routes_for_choice(
     choice: &super::provider_init::ProviderChoice,
     routes: &[crate::provider::ModelRoute],
 ) -> Vec<crate::provider::ModelRoute> {
     use super::provider_init::ProviderChoice;
-
     let keep = |route: &&crate::provider::ModelRoute| match choice {
         ProviderChoice::Claude | ProviderChoice::ClaudeSubprocess => {
             route.api_method_kind().is_anthropic_credential_route()

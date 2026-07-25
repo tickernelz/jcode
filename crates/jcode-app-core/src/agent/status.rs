@@ -1,6 +1,14 @@
 use super::*;
 
 impl Agent {
+    pub(crate) fn active_messages(&self) -> Vec<&StoredMessage> {
+        self.session
+            .active_stored_message_entries()
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
     pub fn session_memory_profile_snapshot(
         &mut self,
     ) -> crate::session::SessionMemoryProfileSnapshot {
@@ -30,12 +38,15 @@ impl Agent {
     }
 
     pub fn last_message_role(&self) -> Option<Role> {
-        self.session.messages.last().map(|m| m.role.clone())
+        self.active_messages()
+            .into_iter()
+            .last()
+            .map(|message| message.role.clone())
     }
 
     /// Get the text content of the last message (first Text block)
     pub fn last_message_text(&self) -> Option<&str> {
-        self.session.messages.last().and_then(|m| {
+        self.active_messages().into_iter().last().and_then(|m| {
             m.content.iter().find_map(|block| {
                 if let ContentBlock::Text { text, .. } = block {
                     Some(text.as_str())
@@ -50,7 +61,7 @@ impl Agent {
     /// This is a independent method so it can be called before spawning async tasks
     pub fn build_transcript_for_extraction(&self) -> String {
         let mut transcript = String::new();
-        for msg in &self.session.messages {
+        for msg in self.active_messages() {
             let role = match msg.role {
                 Role::User => "User",
                 Role::Assistant => "Assistant",
@@ -91,9 +102,8 @@ impl Agent {
     }
 
     pub fn last_assistant_text(&self) -> Option<String> {
-        self.session
-            .messages
-            .iter()
+        self.active_messages()
+            .into_iter()
             .rev()
             .find(|msg| msg.role == Role::Assistant)
             .map(|msg| {

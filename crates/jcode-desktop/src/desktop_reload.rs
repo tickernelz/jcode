@@ -233,6 +233,7 @@ pub(crate) enum DesktopReloadHandoffPoll {
 }
 
 impl DesktopReloadHandoffWatcher {
+    #[cfg(test)]
     pub(crate) fn poll(&self) -> Result<DesktopReloadHandoffPoll> {
         self.poll_with_placement(None)
     }
@@ -242,14 +243,13 @@ impl DesktopReloadHandoffWatcher {
         placement: Option<DesktopReloadWindowPlacement>,
     ) -> Result<DesktopReloadHandoffPoll> {
         if self.ready_file.exists() {
-            if let Some(placement) = placement {
-                if let Err(error) =
+            if let Some(placement) = placement
+                && let Err(error) =
                     write_desktop_reload_window_placement(&self.placement_file, placement)
-                {
-                    desktop_log::warn(format_args!(
-                        "jcode-desktop: failed to synchronize final reload window placement: {error:#}"
-                    ));
-                }
+            {
+                desktop_log::warn(format_args!(
+                    "jcode-desktop: failed to synchronize final reload window placement: {error:#}"
+                ));
             }
             write_desktop_reload_marker(&self.release_file)?;
             return Ok(DesktopReloadHandoffPoll::Ready);

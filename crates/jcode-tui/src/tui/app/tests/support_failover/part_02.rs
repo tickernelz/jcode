@@ -74,6 +74,77 @@ struct SwitchableMockProvider {
     active_provider: StdArc<StdMutex<String>>,
 }
 
+#[derive(Clone)]
+struct DurableIdentityMockProvider {
+    model: StdArc<StdMutex<String>>,
+    effort: StdArc<StdMutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for DurableIdentityMockProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<crate::provider::EventStream> {
+        unimplemented!("DurableIdentityMockProvider")
+    }
+
+    fn name(&self) -> &str {
+        "durable-identity-mock"
+    }
+
+    fn model(&self) -> String {
+        self.model.lock().unwrap().clone()
+    }
+
+    fn set_model(&self, model: &str) -> Result<()> {
+        *self.model.lock().unwrap() = model.to_string();
+        Ok(())
+    }
+
+    fn reasoning_effort(&self) -> Option<String> {
+        self.effort.lock().unwrap().clone()
+    }
+
+    fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
+        *self.effort.lock().unwrap() =
+            (!effort.trim().is_empty()).then(|| effort.trim().to_string());
+        Ok(())
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+type DurableIdentityTestApp = (
+    App,
+    StdArc<StdMutex<String>>,
+    StdArc<StdMutex<Option<String>>>,
+);
+
+fn create_durable_identity_test_app() -> DurableIdentityTestApp {
+    ensure_test_jcode_home_if_unset();
+    clear_persisted_test_ui_state();
+    crate::tui::ui::clear_test_render_state_for_tests();
+
+    let model = StdArc::new(StdMutex::new("old-model".to_string()));
+    let effort = StdArc::new(StdMutex::new(None));
+    let provider: Arc<dyn Provider> = Arc::new(DurableIdentityMockProvider {
+        model: model.clone(),
+        effort: effort.clone(),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
+    let mut app = App::new_for_test_harness(provider, registry);
+    app.queue_mode = false;
+    app.diff_mode = crate::config::DiffDisplayMode::Inline;
+    (app, model, effort)
+}
+
 #[async_trait::async_trait]
 impl Provider for SwitchableMockProvider {
     async fn complete(

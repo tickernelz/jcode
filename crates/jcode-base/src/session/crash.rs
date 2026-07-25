@@ -4,14 +4,94 @@ use crate::message::{ContentBlock, Role};
 use crate::storage;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 const RELEVANT_CRASH_GROUP_WINDOW_SECS: i64 = 60;
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionHandoffIntent {
+    source_id: String,
+    source_revision: u64,
+    target_id: String,
+    target_revision: u64,
+}
+
+fn handoff_path(source_id: &str) -> Result<std::path::PathBuf> {
+    Ok(super::session_path(source_id)?.with_extension("handoff"))
+}
+
+pub fn begin_session_handoff(source: &Session, target: &Session) -> Result<()> {
+    storage::write_json(
+        &handoff_path(&source.id)?,
+        &SessionHandoffIntent {
+            source_id: source.id.clone(),
+            source_revision: source.persistence_revision,
+            target_id: target.id.clone(),
+            target_revision: target.persistence_revision,
+        },
+    )
+}
+
+pub fn finish_session_handoff(source_id: &str) {
+    let Ok(path) = handoff_path(source_id) else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logging::warn(&format!(
+            "Failed to retire session handoff marker {}: {error}",
+            path.display()
+        ));
+    }
+}
+
+fn reconcile_pending_handoffs() -> Result<()> {
+    let sessions_dir = storage::jcode_dir()?.join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&sessions_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("handoff") {
+            continue;
+        }
+        let intent: SessionHandoffIntent = match storage::read_json(&path) {
+            Ok(intent) => intent,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot reconcile session handoff marker {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let target_activated = Session::load(&intent.target_id)
+            .is_ok_and(|target| target.persistence_revision > intent.target_revision);
+        if !target_activated
+            && let Ok(mut source) = Session::load(&intent.source_id)
+            && source.persistence_revision > intent.source_revision
+            && matches!(source.status, SessionStatus::Closed)
+        {
+            source.status = SessionStatus::Crashed {
+                message: Some(format!(
+                    "Session handoff to {} was interrupted before activation",
+                    intent.target_id
+                )),
+            };
+            source.save()?;
+            storage::unregister_active_pid(&source.id);
+        }
+        finish_session_handoff(&intent.source_id);
+    }
+    Ok(())
+}
+
 /// Recover crashed sessions from the most relevant crash group (text-only).
 /// Returns new recovery session IDs (most recent first).
 pub fn recover_crashed_sessions() -> Result<Vec<String>> {
+    reconcile_pending_handoffs()?;
     recover_crashed_sessions_matching(None)
 }
 
@@ -21,6 +101,7 @@ pub fn recover_crashed_sessions() -> Result<Vec<String>> {
 /// already guessed the relevant crash group, so this avoids restoring stale
 /// crashed sessions that happen to still exist on disk.
 pub fn recover_crashed_sessions_by_ids(session_ids: &[String]) -> Result<Vec<String>> {
+    reconcile_pending_handoffs()?;
     if session_ids.is_empty() {
         return Ok(Vec::new());
     }

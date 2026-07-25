@@ -285,13 +285,11 @@ fn test_route(model: &str, provider: &str, api_method: &str) -> ModelRoute {
 
 #[test]
 fn cli_route_display_uses_typed_api_methods() {
-    assert_eq!(cli_api_method_display("openai-oauth"), "oauth");
-    assert_eq!(cli_api_method_display("openai-api-key"), "api key");
-    assert_eq!(
-        cli_api_method_display("openai-compatible:cerebras"),
-        "api key"
-    );
-    assert_eq!(cli_api_method_display("mock-auth:profile"), "mock-auth");
+    let display = |raw| crate::provider::ModelRouteApiMethod::parse(raw).display_label();
+    assert_eq!(display("openai-oauth"), "oauth");
+    assert_eq!(display("openai-api-key"), "api key");
+    assert_eq!(display("openai-compatible:cerebras"), "api key");
+    assert_eq!(display("mock-auth:profile"), "mock-auth");
     assert_eq!(
         cli_route_provider_display("DeepSeek", "openrouter"),
         "OpenRouter/DeepSeek"

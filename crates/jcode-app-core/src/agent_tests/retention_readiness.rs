@@ -175,6 +175,14 @@ impl Provider for RetentionReadinessProvider {
         "retention-fixture-v1".to_string()
     }
 
+    fn set_model(&self, model: &str) -> Result<()> {
+        if model == "retention-fixture-v1" || model.ends_with(":retention-fixture-v1") {
+            Ok(())
+        } else {
+            anyhow::bail!("unsupported retention fixture model {model}")
+        }
+    }
+
     fn fork(&self) -> std::sync::Arc<dyn Provider> {
         std::sync::Arc::new(self.clone())
     }

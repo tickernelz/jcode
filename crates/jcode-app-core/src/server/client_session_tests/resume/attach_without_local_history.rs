@@ -1,7 +1,7 @@
 #[tokio::test]
 async fn handle_resume_session_allows_attach_without_local_history() -> Result<()> {
     let _guard = crate::storage::lock_test_env();
-    let (_runtime, prev_runtime) = setup_runtime_dir()?;
+    let _runtime = setup_runtime_dir()?;
 
     let target_session_id = "session_existing_live_takeover_rejected";
     let temp_session_id = "session_temp_connecting_takeover_rejected";
@@ -15,11 +15,11 @@ async fn handle_resume_session_allows_attach_without_local_history() -> Result<(
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let existing_registry = Registry::new(provider.clone()).await;
-    let existing_agent = Arc::new(Mutex::new(build_test_agent_with_id(
+    let existing_agent = Arc::new(Mutex::new(Agent::new_with_session(
         provider.clone(),
         existing_registry,
-        target_session_id,
-        Vec::new(),
+        persisted,
+        None,
     )));
 
     let new_registry = Registry::new(provider.clone()).await;
@@ -169,6 +169,5 @@ async fn handle_resume_session_allows_attach_without_local_history() -> Result<(
     ));
     assert!(!sessions_guard.contains_key(temp_session_id));
 
-    restore_runtime_dir(prev_runtime);
     Ok(())
 }

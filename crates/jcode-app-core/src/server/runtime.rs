@@ -337,47 +337,39 @@ impl ServerRuntime {
         nudge_ambient: bool,
         cancellation: CancellationToken,
     ) {
-        let result = {
-            let client = async {
-                let mcp_pool = get_shared_mcp_pool(&self.mcp_pool).await;
-                handle_client(
-                    stream,
-                    Arc::clone(&self.sessions),
-                    self.event_tx.clone(),
-                    Arc::clone(&self.provider),
-                    Arc::clone(&self.is_processing),
-                    Arc::clone(&self.session_id),
-                    Arc::clone(&self.client_count),
-                    Arc::clone(&self.client_connections),
-                    Arc::clone(&self.swarm_state.members),
-                    Arc::clone(&self.swarm_state.swarms_by_id),
-                    Arc::clone(&self.shared_context),
-                    Arc::clone(&self.swarm_state.plans),
-                    Arc::clone(&self.swarm_state.coordinators),
-                    self.file_touch.clone(),
-                    Arc::clone(&self.channel_subscriptions),
-                    Arc::clone(&self.channel_subscriptions_by_session),
-                    Arc::clone(&self.client_debug_state),
-                    self.client_debug_response_tx.clone(),
-                    Arc::clone(&self.event_history),
-                    Arc::clone(&self.event_counter),
-                    self.swarm_event_tx.clone(),
-                    self.server_name.clone(),
-                    self.server_icon.clone(),
-                    mcp_pool,
-                    Arc::clone(&self.shutdown_signals),
-                    Arc::clone(&self.soft_interrupt_queues),
-                    self.await_members_runtime.clone(),
-                    self.swarm_mutation_runtime.clone(),
-                )
-                .await
-            };
-            tokio::pin!(client);
-            tokio::select! {
-                result = &mut client => Some(result),
-                _ = cancellation.cancelled() => None,
-            }
-        };
+        let mcp_pool = get_shared_mcp_pool(&self.mcp_pool).await;
+        let result = handle_client(
+            stream,
+            Arc::clone(&self.sessions),
+            self.event_tx.clone(),
+            Arc::clone(&self.provider),
+            Arc::clone(&self.is_processing),
+            Arc::clone(&self.session_id),
+            Arc::clone(&self.client_count),
+            Arc::clone(&self.client_connections),
+            Arc::clone(&self.swarm_state.members),
+            Arc::clone(&self.swarm_state.swarms_by_id),
+            Arc::clone(&self.shared_context),
+            Arc::clone(&self.swarm_state.plans),
+            Arc::clone(&self.swarm_state.coordinators),
+            self.file_touch.clone(),
+            Arc::clone(&self.channel_subscriptions),
+            Arc::clone(&self.channel_subscriptions_by_session),
+            Arc::clone(&self.client_debug_state),
+            self.client_debug_response_tx.clone(),
+            Arc::clone(&self.event_history),
+            Arc::clone(&self.event_counter),
+            self.swarm_event_tx.clone(),
+            self.server_name.clone(),
+            self.server_icon.clone(),
+            mcp_pool,
+            Arc::clone(&self.shutdown_signals),
+            Arc::clone(&self.soft_interrupt_queues),
+            self.await_members_runtime.clone(),
+            self.swarm_mutation_runtime.clone(),
+            cancellation,
+        )
+        .await;
 
         self.decrement_client_count().await;
 
@@ -385,7 +377,7 @@ impl ServerRuntime {
             runner.nudge();
         }
 
-        if let Some(Err(e)) = result {
+        if let Err(e) = result {
             crate::logging::error(&format!("{}: {}", error_prefix, e));
         }
     }
@@ -439,11 +431,40 @@ impl ServerRuntime {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
-    use super::RuntimeTaskScope;
+    use super::{RuntimeTaskScope, ServerRuntime};
+    use crate::message::{Message, ToolDefinition};
+    use crate::protocol::Request;
+    use crate::provider::{EventStream, Provider};
+    use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    struct IdleProvider;
+
+    #[async_trait]
+    impl Provider for IdleProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _system: &str,
+            _resume_session_id: Option<&str>,
+        ) -> anyhow::Result<EventStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn name(&self) -> &str {
+            "runtime-cleanup-test"
+        }
+
+        fn fork(&self) -> Arc<dyn Provider> {
+            Arc::new(Self)
+        }
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -480,5 +501,73 @@ mod tests {
                 .spawn(|_| async { panic!("task spawned after shutdown") })
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_cancellation_exits_through_handle_client_owned_cleanup() {
+        let _env_lock = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("runtime dir");
+        let previous_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+        let previous_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+        crate::env::set_var("JCODE_HOME", temp.path().join("home"));
+
+        let server = crate::server::Server::new(Arc::new(IdleProvider));
+        let runtime = ServerRuntime::from_server(&server);
+        let (server_stream, client_stream) = crate::transport::Stream::pair().expect("socket pair");
+        runtime.increment_client_count().await;
+        assert!(
+            runtime
+                .spawn_client_task(server_stream, "runtime cleanup test", false)
+                .await
+        );
+
+        let (_reader, mut writer) = client_stream.into_split();
+        let request = Request::Subscribe {
+            id: 1,
+            working_dir: Some(temp.path().display().to_string()),
+            selfdev: None,
+            target_session_id: None,
+            client_instance_id: Some("runtime-cleanup-client".to_string()),
+            client_has_local_history: false,
+            allow_session_takeover: false,
+            terminal_env: Vec::new(),
+        };
+        writer
+            .write_all((serde_json::to_string(&request).unwrap() + "\n").as_bytes())
+            .await
+            .expect("subscribe request");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !runtime.client_connections.read().await.is_empty()
+                    && !runtime.sessions.read().await.is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client should become owned by handle_client");
+
+        tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+            .await
+            .expect("runtime shutdown should wait for handle_client cleanup");
+
+        assert!(runtime.client_connections.read().await.is_empty());
+        assert!(runtime.sessions.read().await.is_empty());
+        assert_eq!(*runtime.client_count.read().await, 0);
+
+        if let Some(value) = previous_runtime {
+            crate::env::set_var("JCODE_RUNTIME_DIR", value);
+        } else {
+            crate::env::remove_var("JCODE_RUNTIME_DIR");
+        }
+        if let Some(value) = previous_home {
+            crate::env::set_var("JCODE_HOME", value);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
     }
 }

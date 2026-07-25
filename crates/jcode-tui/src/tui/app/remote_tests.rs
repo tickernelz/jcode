@@ -713,6 +713,7 @@ fn handle_post_connect_dispatches_reload_followup_even_if_history_snapshot_looks
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let mut app = crate::tui::app::App::new_for_remote(Some(session_id.to_string()));
+    app.client_binary_mtime = None;
     app.queue_mode = false;
     app.diff_mode = crate::config::DiffDisplayMode::Inline;
     app.is_processing = true;

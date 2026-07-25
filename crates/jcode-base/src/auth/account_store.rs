@@ -1,6 +1,97 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{LazyLock, RwLock};
+
+pub struct CrossProcessFileLock(std::fs::File);
+
+impl CrossProcessFileLock {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for CrossProcessFileLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            crate::logging::warn(&format!("Failed to release auth file lock: {error}"));
+        }
+    }
+}
+
+static RUNTIME_CREDENTIAL_IDENTITIES: LazyLock<RwLock<HashMap<String, StoredAccountIdentity>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Return an opaque, non-secret identity for a credential source that has no
+/// provider account store of its own. The generation is deliberately renewed
+/// once per process: ambient API keys and cloud credential chains cannot be
+/// compared without inspecting secret material, so cross-process resumability
+/// must fail closed while identities remain stable within the live runtime.
+pub fn runtime_credential_identity(key: &str) -> (String, String, u64) {
+    let mut identities = RUNTIME_CREDENTIAL_IDENTITIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let identity = identities
+        .entry(key.to_string())
+        .or_insert_with(|| StoredAccountIdentity {
+            id: crate::id::new_id("credential"),
+            generation: 1,
+        });
+    (key.to_string(), identity.id.clone(), identity.generation)
+}
+
+pub fn invalidate_runtime_credential_identities() {
+    let mut identities = RUNTIME_CREDENTIAL_IDENTITIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for identity in identities.values_mut() {
+        identity.generation = identity.generation.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StoredAccountIdentity {
+    pub id: String,
+    #[serde(default = "default_account_generation")]
+    pub generation: u64,
+}
+
+fn default_account_generation() -> u64 {
+    1
+}
+
+pub fn ensure_account_identities<'a>(
+    labels: impl IntoIterator<Item = &'a str>,
+    identities: &mut HashMap<String, StoredAccountIdentity>,
+) -> bool {
+    let labels = labels.into_iter().collect::<std::collections::HashSet<_>>();
+    let before = identities.len();
+    identities.retain(|label, _| labels.contains(label.as_str()));
+    let mut changed = identities.len() != before;
+    for label in labels {
+        if !identities.contains_key(label) {
+            identities.insert(
+                label.to_string(),
+                StoredAccountIdentity {
+                    id: crate::id::new_id("account"),
+                    generation: 1,
+                },
+            );
+            changed = true;
+        }
+    }
+    changed
+}
 
 /// Runtime (process-local) active-account overrides, keyed by provider
 /// prefix ("claude", "openai", ...). Lets `/account switch <label>` take

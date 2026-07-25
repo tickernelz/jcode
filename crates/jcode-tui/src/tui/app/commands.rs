@@ -29,7 +29,6 @@ use crate::message::{ContentBlock, Message, Role};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
-
 pub(super) const REVIEW_PREFERRED_MODEL: &str = "gpt-5.5";
 const POKE_OFF_UI_HINT: &str = "/poke off to stop.";
 const TODO_CONFIDENCE_THRESHOLD: u8 = crate::todo::QUALITY_GATE_THRESHOLD;
@@ -37,7 +36,6 @@ const TODO_COMPLETION_CONTINUATION_MESSAGE: &str =
     crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE;
 const TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE: &str =
     crate::todo::TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TodoConfidenceSummary {
     pub completion_average: Option<u8>,
@@ -45,7 +43,6 @@ pub(super) struct TodoConfidenceSummary {
     pub confidence_spike_detected: bool,
     pub needs_more_work: bool,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PokeCommand {
     Trigger,
@@ -53,7 +50,6 @@ pub(super) enum PokeCommand {
     Off,
     Status,
 }
-
 pub(super) enum PokeActivation {
     EnabledNoIncomplete,
     Queued,
@@ -62,7 +58,6 @@ pub(super) enum PokeActivation {
         poke_msg: String,
     },
 }
-
 pub(super) fn parse_poke_command(trimmed: &str) -> Option<Result<PokeCommand, String>> {
     match trimmed {
         "/poke" => Some(Ok(PokeCommand::Trigger)),
@@ -73,21 +68,17 @@ pub(super) fn parse_poke_command(trimmed: &str) -> Option<Result<PokeCommand, St
         _ => None,
     }
 }
-
 pub(super) fn is_poke_message(message: &str) -> bool {
     crate::todo::is_auto_poke_message(message)
 }
-
 pub(super) fn is_todo_confidence_summary_message(message: &str) -> bool {
     message.starts_with(TODO_COMPLETION_CONTINUATION_MESSAGE)
         || message.starts_with(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE)
         || message.starts_with("All todos are done. Todo confidence summary:")
 }
-
 pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
     !messages.is_empty() && messages.iter().all(|message| is_poke_message(message))
 }
-
 pub(super) fn clear_queued_poke_messages(app: &mut App) -> usize {
     let before_queued = app.queued_messages.len();
     app.queued_messages
@@ -102,7 +93,6 @@ pub(super) fn clear_queued_poke_messages(app: &mut App) -> usize {
     }
     removed
 }
-
 pub(super) fn disable_auto_poke(app: &mut App) -> usize {
     let cleared = clear_queued_poke_messages(app);
     app.auto_poke_incomplete_todos = false;
@@ -110,10 +100,8 @@ pub(super) fn disable_auto_poke(app: &mut App) -> usize {
     app.todo_completion_gate_attempts = 0;
     cleared
 }
-
 pub(super) fn is_non_retryable_auto_poke_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-
     // These failures are deterministic for the current request/session shape. Retrying the same
     // auto-poke cannot help and can create an infinite spam loop.
     let deterministic_markers = [
@@ -163,12 +151,10 @@ pub(super) fn is_non_retryable_auto_poke_error(error: &str) -> bool {
         "credit balance",
         "out of credits",
     ];
-
     deterministic_markers
         .iter()
         .any(|marker| lower.contains(marker))
 }
-
 /// Whether `error` is a transient connectivity failure (DNS, name resolution,
 /// routing, unreachable host) that the agent itself cannot repair by resending
 /// immediately. These are NOT non-retryable: they resolve once the network
@@ -183,20 +169,16 @@ pub(super) fn is_auto_poke_connectivity_error(error: &str) -> bool {
     if crate::network_retry::classify_message(error).is_some() {
         return true;
     }
-
     let lower = error.to_ascii_lowercase();
-
     let connectivity_markers = [
         "failed to send openai-compatible chat request",
         "could not resolve host",
         "couldn't resolve host",
     ];
-
     connectivity_markers
         .iter()
         .any(|marker| lower.contains(marker))
 }
-
 /// Whether `error` is a deterministic model/endpoint-capability failure that can
 /// never succeed by resending the identical request: the configured model is not
 /// valid for the configured endpoint (e.g. Volcengine Ark's coding-plan endpoint
@@ -208,7 +190,6 @@ pub(super) fn is_auto_poke_connectivity_error(error: &str) -> bool {
 /// retry budget on a request that is structurally guaranteed to 4xx. See #387.
 pub(super) fn is_fatal_model_endpoint_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-
     let model_endpoint_markers = [
         "unsupportedmodel",
         "unsupported model",
@@ -220,17 +201,14 @@ pub(super) fn is_fatal_model_endpoint_error(error: &str) -> bool {
         "the model does not exist",
         "model does not exist",
     ];
-
     model_endpoint_markers
         .iter()
         .any(|marker| lower.contains(marker))
 }
-
 pub(super) fn stop_auto_poke_for_non_retryable_error(app: &mut App, error: &str) -> bool {
     if !app.auto_poke_incomplete_todos || !is_non_retryable_auto_poke_error(error) {
         return false;
     }
-
     let cleared = disable_auto_poke(app);
     app.rate_limit_pending_message = None;
     app.rate_limit_reset = None;
@@ -249,7 +227,6 @@ pub(super) fn stop_auto_poke_for_non_retryable_error(app: &mut App, error: &str)
     app.set_status_notice("Poke stopped: non-retryable error");
     true
 }
-
 pub(super) fn poke_disabled_message(cleared: usize) -> String {
     format!(
         "Auto-poke disabled.{}",
@@ -264,18 +241,15 @@ pub(super) fn poke_disabled_message(cleared: usize) -> String {
         }
     )
 }
-
 pub(super) fn poke_enabled_without_incomplete_message() -> String {
     "Auto-poke enabled. No incomplete todos found right now.".to_string()
 }
-
 pub(super) fn poke_queued_display_message() -> String {
     format!(
         "👉 /poke queued. Re-checking incomplete todos after this turn. {}",
         POKE_OFF_UI_HINT
     )
 }
-
 pub(super) fn poke_triggered_display_message(incomplete_count: usize) -> String {
     format!(
         "👉 Poking model: {} incomplete todo{}. {}",
@@ -284,7 +258,6 @@ pub(super) fn poke_triggered_display_message(incomplete_count: usize) -> String 
         POKE_OFF_UI_HINT,
     )
 }
-
 pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
     let incomplete = incomplete_poke_todos(app);
     app.auto_poke_incomplete_todos = true;
@@ -295,11 +268,9 @@ pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
     app.consecutive_guardrail_stops = 0;
     app.turn_guardrail_stopped = false;
     app.set_status_notice("Poke: ON");
-
     if incomplete.is_empty() {
         return PokeActivation::EnabledNoIncomplete;
     }
-
     if app.is_processing {
         app.set_status_notice("Poke queued after current turn");
         PokeActivation::Queued
@@ -312,7 +283,6 @@ pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
         }
     }
 }
-
 pub(super) fn activate_auto_poke_local(app: &mut App) {
     match activate_auto_poke(app) {
         PokeActivation::EnabledNoIncomplete => {
@@ -330,7 +300,6 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
             app.push_display_message(DisplayMessage::system(poke_triggered_display_message(
                 incomplete_count,
             )));
-
             app.add_provider_message(Message::user(&poke_msg));
             app.session.add_message(
                 Role::User,
@@ -340,7 +309,6 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
                 }],
             );
             let _ = app.session.save();
-
             app.is_processing = true;
             app.status = ProcessingStatus::Sending;
             app.clear_streaming_render_state();
@@ -369,7 +337,6 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
         }
     }
 }
-
 pub(super) fn toggle_auto_poke_hotkey_local(app: &mut App) {
     if app.auto_poke_incomplete_todos {
         let cleared = disable_auto_poke(app);
@@ -379,36 +346,42 @@ pub(super) fn toggle_auto_poke_hotkey_local(app: &mut App) {
         activate_auto_poke_local(app);
     }
 }
-
 pub(super) fn transfer_pause_message() -> String {
     "Transfer requested. Please pause after the current step, update the todo list if needed, and stop so work can continue in the transferred session."
         .to_string()
 }
-
 fn transfer_active_messages(session: &crate::session::Session) -> Vec<Message> {
+    let active = session.active_stored_message_entries();
     let start = session
         .compaction
         .as_ref()
-        .map(|state| state.compacted_count.min(session.messages.len()))
+        .map(|state| state.compacted_count.min(active.len()))
         .unwrap_or(0);
-    session.messages[start..]
+    active[start..]
         .iter()
-        .map(crate::session::StoredMessage::to_message)
+        .map(|(_, message)| message.to_message())
         .collect()
 }
-
 pub(super) fn create_transfer_session_from_parent(
     parent_session_id: &str,
     parent: &crate::session::Session,
     compaction: Option<crate::session::StoredCompactionState>,
+    summarizer_identity: Option<&jcode_provider_core::ExactRuntimeIdentity>,
     engine: crate::config::CompactionEngine,
 ) -> anyhow::Result<(String, String)> {
     let todos = crate::todo::load_todos(parent_session_id).unwrap_or_default();
     let mut child = crate::session::Session::create(Some(parent_session_id.to_string()), None);
     child.messages.clear();
+    child.exact_runtime_identity = parent.exact_runtime_identity.clone();
     if engine == crate::config::CompactionEngine::Lcm {
         if let Some(state) = compaction {
-            child.install_imported_context_root(parent, state)?;
+            child.install_imported_context_root(
+                parent,
+                state,
+                summarizer_identity.ok_or_else(|| {
+                    anyhow::anyhow!("LCM transfer summarizer identity is missing")
+                })?,
+            )?;
         }
     } else {
         child.compaction = compaction;
@@ -430,28 +403,37 @@ pub(super) fn create_transfer_session_from_parent(
     crate::todo::save_todos(&child.id, &todos)?;
     Ok((child.id.clone(), child.display_name().to_string()))
 }
-
 async fn prepare_transfer_session_local(
     parent: crate::session::Session,
     provider: std::sync::Arc<dyn crate::provider::Provider>,
 ) -> anyhow::Result<super::PreparedTransferSession> {
-    let transfer_engine = crate::config::config().compaction.engine.clone();
+    let transfer_engine = crate::config::config().compaction.engine;
     let provider = if transfer_engine == crate::config::CompactionEngine::Lcm {
         crate::compaction::CompactionManager::portable_provider_for_session(&parent, provider)?
     } else {
         provider
     };
+    let summarizer_identity = if transfer_engine == crate::config::CompactionEngine::Lcm {
+        Some(
+            provider
+                .exact_runtime_identity()
+                .ok_or_else(|| anyhow::anyhow!("LCM transfer provider identity is missing"))?,
+        )
+    } else {
+        None
+    };
     let compaction = crate::compaction::build_transfer_compaction_state(
         provider,
         transfer_active_messages(&parent),
         parent.compaction.clone(),
-        transfer_engine.clone(),
+        transfer_engine,
     )
     .await?;
     let (session_id, session_name) = create_transfer_session_from_parent(
         parent.id.as_str(),
         &parent,
         compaction,
+        summarizer_identity.as_ref(),
         transfer_engine,
     )?;
     Ok(super::PreparedTransferSession {
@@ -459,25 +441,20 @@ async fn prepare_transfer_session_local(
         session_name,
     })
 }
-
 pub(super) fn start_local_transfer_prepare(app: &mut App) -> anyhow::Result<()> {
     if app.pending_local_transfer.is_some() {
         return Ok(());
     }
-
     let parent = app.session.clone();
     let provider = app.provider.fork();
     let (tx, rx) = std::sync::mpsc::channel();
     app.pending_local_transfer = Some(super::PendingLocalTransfer { receiver: rx });
-
     tokio::spawn(async move {
         let result = prepare_transfer_session_local(parent, provider).await;
         let _ = tx.send(result);
     });
-
     Ok(())
 }
-
 pub(super) fn poll_local_transfer_prepare(app: &mut App) -> bool {
     let recv_result = {
         let Some(pending) = app.pending_local_transfer.as_ref() else {
@@ -485,7 +462,6 @@ pub(super) fn poll_local_transfer_prepare(app: &mut App) -> bool {
         };
         pending.receiver.try_recv()
     };
-
     match recv_result {
         Ok(result) => {
             app.pending_local_transfer = None;
@@ -552,7 +528,6 @@ pub(super) fn poll_local_transfer_prepare(app: &mut App) -> bool {
         }
     }
 }
-
 pub(super) fn maybe_begin_pending_local_transfer(app: &mut App) -> bool {
     if app.is_remote || app.is_processing || !app.pending_transfer_request {
         return false;
@@ -560,7 +535,6 @@ pub(super) fn maybe_begin_pending_local_transfer(app: &mut App) -> bool {
     if app.pending_local_transfer.is_some() {
         return false;
     }
-
     match start_local_transfer_prepare(app) {
         Ok(()) => {
             app.push_display_message(DisplayMessage::system(
@@ -579,7 +553,6 @@ pub(super) fn maybe_begin_pending_local_transfer(app: &mut App) -> bool {
     }
     true
 }
-
 pub(super) fn handle_transfer_command_local(app: &mut App) {
     if app.pending_transfer_request || app.pending_local_transfer.is_some() {
         app.push_display_message(DisplayMessage::system(
@@ -588,7 +561,6 @@ pub(super) fn handle_transfer_command_local(app: &mut App) {
         app.set_status_notice("Transfer already pending");
         return;
     }
-
     app.pending_transfer_request = true;
     if app.is_processing {
         app.interleave_message = Some(transfer_pause_message());
@@ -601,7 +573,6 @@ pub(super) fn handle_transfer_command_local(app: &mut App) {
         let _ = maybe_begin_pending_local_transfer(app);
     }
 }
-
 pub(super) fn poke_status_message(app: &App) -> String {
     let incomplete = incomplete_poke_todos(app);
     let queued_followup = app
@@ -630,14 +601,12 @@ pub(super) fn poke_status_message(app: &App) -> String {
     }
     message
 }
-
 pub(super) fn current_subagent_model_summary(app: &App) -> String {
     match app.session.subagent_model.as_deref() {
         Some(model) => format!("fixed {}", model),
         None => format!("inherit current ({})", app.provider.model()),
     }
 }
-
 fn derive_subagent_description(prompt: &str) -> String {
     let words: Vec<&str> = prompt.split_whitespace().take(4).collect();
     if words.is_empty() {
@@ -646,14 +615,12 @@ fn derive_subagent_description(prompt: &str) -> String {
         words.join(" ")
     }
 }
-
 pub(super) fn parse_manual_subagent_spec(rest: &str) -> Result<ManualSubagentSpec, String> {
     let mut iter = rest.split_whitespace().peekable();
     let mut subagent_type = "general".to_string();
     let mut model = None;
     let mut session_id = None;
     let mut prompt_tokens = Vec::new();
-
     while let Some(token) = iter.next() {
         match token {
             "--type" => {
@@ -684,12 +651,10 @@ pub(super) fn parse_manual_subagent_spec(rest: &str) -> Result<ManualSubagentSpe
             }
         }
     }
-
     let prompt = prompt_tokens.join(" ").trim().to_string();
     if prompt.is_empty() {
         return Err("Missing prompt. Add text after /subagent.".to_string());
     }
-
     Ok(ManualSubagentSpec {
         subagent_type,
         model,
@@ -697,7 +662,6 @@ pub(super) fn parse_manual_subagent_spec(rest: &str) -> Result<ManualSubagentSpe
         prompt,
     })
 }
-
 fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
     let description = derive_subagent_description(&spec.prompt);
     let tool_call = crate::message::ToolCall {
@@ -714,7 +678,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         intent: None,
         thought_signature: None,
     };
-
     app.push_display_message(DisplayMessage {
         role: "tool".to_string(),
         content: tool_call.name.clone(),
@@ -723,7 +686,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         title: None,
         tool_data: Some(tool_call.clone()),
     });
-
     let content_blocks = vec![ContentBlock::ToolUse {
         id: tool_call.id.clone(),
         name: tool_call.name.clone(),
@@ -740,7 +702,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
     let _ = app.session.save();
     app.subagent_status = Some("starting subagent".to_string());
     app.set_status_notice("Running subagent");
-
     let registry = app.registry.clone();
     let session_id = app.session.id.clone();
     let working_dir = app.session.working_dir.clone();
@@ -755,7 +716,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             intent: tool_call_for_task.intent.clone(),
             title: None,
         }));
-
         let ctx = crate::tool::ToolContext {
             session_id: session_id.clone(),
             message_id: message_id.clone(),
@@ -765,7 +725,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             graceful_shutdown_signal: None,
             execution_mode: crate::tool::ToolExecutionMode::Direct,
         };
-
         let start = Instant::now();
         let result = registry
             .execute(
@@ -775,7 +734,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             )
             .await;
         let duration_ms = start.elapsed().as_millis() as u64;
-
         let (output, is_error, title, status) = match result {
             Ok(output) => {
                 crate::telemetry::record_tool_call();
@@ -786,7 +744,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
                 (format!("Error: {}", error), true, None, ToolStatus::Error)
             }
         };
-
         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
             session_id: session_id.clone(),
             message_id,
@@ -796,7 +753,6 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             intent: tool_call_for_task.intent.clone(),
             title: title.clone(),
         }));
-
         Bus::global().publish(BusEvent::ManualToolCompleted(ManualToolCompleted {
             session_id,
             tool_call: tool_call_for_task,
@@ -807,24 +763,20 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         }));
     });
 }
-
 fn handle_subagent_model_command(app: &mut App, trimmed: &str) -> bool {
     if !trimmed.starts_with("/subagent-model") {
         return false;
     }
-
     if app.is_remote {
         app.push_display_message(DisplayMessage::error(
             "/subagent-model requires a live jcode server connection in remote mode.".to_string(),
         ));
         return true;
     }
-
     let rest = trimmed
         .strip_prefix("/subagent-model")
         .unwrap_or_default()
         .trim();
-
     if rest.is_empty() || matches!(rest, "show" | "status") {
         app.push_display_message(DisplayMessage::system(format!(
             "Subagent model for this session: {}\n\nUse /subagent-model <name> to pin a model, or /subagent-model inherit to use the current model.",
@@ -832,7 +784,6 @@ fn handle_subagent_model_command(app: &mut App, trimmed: &str) -> bool {
         )));
         return true;
     }
-
     if matches!(rest, "inherit" | "reset" | "clear") {
         app.session.subagent_model = None;
         let _ = app.session.save();
@@ -843,7 +794,6 @@ fn handle_subagent_model_command(app: &mut App, trimmed: &str) -> bool {
         app.set_status_notice("Subagent model: inherit");
         return true;
     }
-
     app.session.subagent_model = Some(rest.to_string());
     let _ = app.session.save();
     app.push_display_message(DisplayMessage::system(format!(
@@ -853,19 +803,16 @@ fn handle_subagent_model_command(app: &mut App, trimmed: &str) -> bool {
     app.set_status_notice(format!("Subagent model → {}", rest));
     true
 }
-
 fn handle_subagent_command(app: &mut App, trimmed: &str) -> bool {
     if !trimmed.starts_with("/subagent") || trimmed.starts_with("/subagent-model") {
         return false;
     }
-
     if app.is_remote {
         app.push_display_message(DisplayMessage::error(
             "/subagent requires a live jcode server connection in remote mode.".to_string(),
         ));
         return true;
     }
-
     let rest = trimmed.strip_prefix("/subagent").unwrap_or_default().trim();
     if rest.is_empty() {
         app.push_display_message(DisplayMessage::error(
@@ -874,7 +821,6 @@ fn handle_subagent_command(app: &mut App, trimmed: &str) -> bool {
         ));
         return true;
     }
-
     match parse_manual_subagent_spec(rest) {
         Ok(spec) => launch_manual_subagent(app, spec),
         Err(error) => {
@@ -886,7 +832,6 @@ fn handle_subagent_command(app: &mut App, trimmed: &str) -> bool {
     }
     true
 }
-
 /// `/cancel` (and `/stop`) interrupt the in-flight turn, mirroring Ctrl+C
 /// while processing. The command has long been registered and advertised by
 /// interactive prompts, but had no top-level dispatch, so typing it outside a
@@ -896,7 +841,6 @@ pub(super) fn handle_cancel_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed != "/cancel" && trimmed != "/stop" {
         return false;
     }
-
     if app.is_processing {
         app.cancel_requested = true;
         app.interleave_message = None;
@@ -914,7 +858,6 @@ pub(super) fn handle_cancel_command(app: &mut App, trimmed: &str) -> bool {
     }
     true
 }
-
 pub(super) fn handle_help_command(app: &mut App, trimmed: &str) -> bool {
     if let Some(topic) = trimmed
         .strip_prefix("/help ")
@@ -930,15 +873,12 @@ pub(super) fn handle_help_command(app: &mut App, trimmed: &str) -> bool {
         }
         return true;
     }
-
     if trimmed == "/help" || trimmed == "/?" || trimmed == "/commands" {
         app.help_scroll = Some(0);
         return true;
     }
-
     false
 }
-
 /// `/keys` shows the keymap diagnostics: detected terminal, discovered terminal
 /// and macOS shortcuts, and any conflicts with jcode's own keybindings.
 /// `/keys refresh` forces a fresh scan of the machine (otherwise a cached
@@ -949,18 +889,15 @@ pub(super) fn handle_keys_command(app: &mut App, trimmed: &str) -> bool {
     else {
         return false;
     };
-
     let force_refresh = matches!(rest.trim(), "refresh" | "rescan" | "reload");
     let snapshot = if force_refresh {
         crate::setup_hints::keymap::refresh_and_save()
     } else {
         crate::setup_hints::keymap::snapshot_cached_or_refresh()
     };
-
     let cfg = crate::config::config();
     let report = crate::setup_hints::keymap::render_report(&cfg.keybindings, &snapshot);
     app.push_display_message(DisplayMessage::system(report));
-
     if let Some(status) =
         crate::setup_hints::keymap::render_status_line(&cfg.keybindings, &snapshot)
     {
@@ -970,20 +907,17 @@ pub(super) fn handle_keys_command(app: &mut App, trimmed: &str) -> bool {
     }
     true
 }
-
 pub(super) fn handle_model_status_command(app: &mut App, trimmed: &str) -> bool {
     let Some(rest) = slash_command_rest(trimmed, "/provider-test-coverage")
         .or_else(|| slash_command_rest(trimmed, "/model-status"))
     else {
         return false;
     };
-
     if rest.trim().is_empty() {
         app.model_status_content = build_provider_test_coverage_summary();
         app.model_status_scroll = Some(0);
         return true;
     }
-
     let mut parts = rest.split_whitespace();
     let provider = parts
         .next()
@@ -995,12 +929,10 @@ pub(super) fn handle_model_status_command(app: &mut App, trimmed: &str) -> bool 
     } else {
         explicit_model
     };
-
     app.model_status_content = build_model_status_report(&provider, &model);
     app.model_status_scroll = Some(0);
     true
 }
-
 /// Parse an explicit diff-mode name accepted by `/diff <mode>`. Returns `None`
 /// for unrecognized values so the caller can report a usage error.
 fn parse_diff_mode_name(value: &str) -> Option<crate::config::DiffDisplayMode> {
@@ -1785,7 +1717,11 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/clear" {
-        reset_current_session(app);
+        if let Err(error) = reset_current_session(app) {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to clear session: {error}"
+            )));
+        }
         return true;
     }
 
@@ -2000,20 +1936,32 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/rewind undo" {
-        let Some(snapshot) = app.rewind_undo_snapshot.take() else {
+        let Some(snapshot) = app.rewind_undo_snapshot.clone() else {
             app.push_display_message(DisplayMessage::system("No rewind to undo.".to_string()));
             return true;
         };
 
         let current_count = app.session.rewind_target_count();
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
-        app.session.replace_messages(snapshot.messages);
-        app.session.compaction = snapshot.compaction;
-        app.session
-            .restore_context_graph_state(snapshot.context_graph);
+        let mut candidate = app.session.clone();
+        candidate.restore_active_branch(
+            snapshot.archived_message_ids.clone(),
+            snapshot.raw_message_count,
+        );
+        candidate.compaction = snapshot.compaction.clone();
+        candidate.restore_context_graph_state(snapshot.context_graph.clone());
+        candidate.provider_session_id = snapshot.session_provider_session_id.clone();
+        candidate.provider_session_identity = snapshot.session_provider_session_identity.clone();
+        candidate.updated_at = chrono::Utc::now();
+        if let Err(error) = candidate.save() {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to persist rewind undo: {error}"
+            )));
+            return true;
+        }
+        app.rewind_undo_snapshot = None;
+        app.session = candidate;
         app.provider_session_id = snapshot.provider_session_id;
-        app.session.provider_session_id = snapshot.session_provider_session_id;
-        app.session.updated_at = chrono::Utc::now();
         let provider_messages = app.session.messages_for_provider_uncached();
         app.replace_provider_messages(provider_messages);
 
@@ -2037,7 +1985,6 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             });
         }
 
-        let _ = app.session.save();
         app.push_display_message(DisplayMessage::system(format!(
             "✓ Undid rewind. Restored {} message{}.",
             restored,
@@ -2085,26 +2032,40 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         match num_str.parse::<usize>() {
             Ok(n) if n > 0 && n <= visible_count => {
                 let removed = visible_count - n;
-                app.rewind_undo_snapshot = Some(LocalRewindUndoSnapshot {
-                    messages: app.session.messages.clone(),
+                let undo_snapshot = LocalRewindUndoSnapshot {
+                    archived_message_ids: app.session.archived_message_ids.clone(),
+                    raw_message_count: app.session.messages.len(),
                     compaction: app.session.compaction.clone(),
                     context_graph: app.session.context_graph_state(),
                     provider_session_id: app.provider_session_id.clone(),
                     session_provider_session_id: app.session.provider_session_id.clone(),
+                    session_provider_session_identity: app
+                        .session
+                        .provider_session_identity
+                        .clone(),
                     visible_message_count: visible_count,
-                });
-                let stored_len = targets[n - 1] + 1;
-                if let Err(error) = app.session.retain_context_graph_prefix(stored_len) {
-                    crate::logging::warn(&format!(
-                        "Failed to retain valid LCM rewind prefix; falling back to raw history: {error}"
-                    ));
-                    app.session.compaction = None;
-                    app.session.clear_context_graph_state();
+                };
+                let target_raw_index = targets[n - 1];
+                let mut candidate = app.session.clone();
+                if let Err(error) = candidate.rewind_active_branch_through(target_raw_index) {
+                    app.push_display_message(DisplayMessage::error(format!(
+                        "Failed to update active rewind branch: {error}"
+                    )));
+                    return true;
                 }
-                app.session.truncate_messages(stored_len);
+                candidate.updated_at = chrono::Utc::now();
+                candidate.provider_session_id = None;
+                candidate.provider_session_identity = None;
+                if let Err(error) = candidate.save() {
+                    app.push_display_message(DisplayMessage::error(format!(
+                        "Failed to persist rewind: {error}"
+                    )));
+                    return true;
+                }
+                app.rewind_undo_snapshot = Some(undo_snapshot);
+                app.session = candidate;
                 let provider_messages = app.session.messages_for_provider_uncached();
                 app.replace_provider_messages(provider_messages);
-                app.session.updated_at = chrono::Utc::now();
 
                 app.clear_display_messages();
                 // Same defensive preview clear as /rewind undo above.
@@ -2129,8 +2090,6 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
                 }
 
                 app.provider_session_id = None;
-                app.session.provider_session_id = None;
-                let _ = app.session.save();
 
                 app.push_display_message(DisplayMessage::system(format!(
                     "✓ Rewound to message {}. Removed {} message{}. Undo anytime with /rewind undo.",

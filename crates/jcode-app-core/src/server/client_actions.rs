@@ -22,62 +22,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
-const INPUT_SHELL_MAX_OUTPUT_LEN: usize = 30_000;
-
-fn derive_subagent_description(prompt: &str) -> String {
-    let words: Vec<&str> = prompt.split_whitespace().take(4).collect();
-    if words.is_empty() {
-        "Manual subagent".to_string()
-    } else {
-        words.join(" ")
-    }
-}
-
-fn build_input_shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut cmd = Command::new("cmd.exe");
-        cmd.arg("/C").arg(command);
-        cmd
-    }
-
-    #[cfg(not(windows))]
-    {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(command);
-        cmd
-    }
-}
-
-fn combine_input_shell_output(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
-    let mut output = String::new();
-
-    if !stdout.is_empty() {
-        output.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str("[stderr]\n");
-        output.push_str(&stderr);
-    }
-
-    let truncated = if output.len() > INPUT_SHELL_MAX_OUTPUT_LEN {
-        output = truncate_str(&output, INPUT_SHELL_MAX_OUTPUT_LEN).to_string();
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str("… output truncated");
-        true
-    } else {
-        false
-    };
-
-    (output, truncated)
-}
+include!("client_actions_shell.rs");
 
 pub(super) struct NotifySessionContext<'a> {
     pub sessions: &'a SessionAgents,
@@ -659,9 +604,7 @@ fn clone_split_session(parent_session_id: &str) -> anyhow::Result<(String, Strin
     let parent = Session::load(parent_session_id)?;
 
     let mut child = Session::create(Some(parent_session_id.to_string()), None);
-    child.replace_messages(parent.messages.clone());
-    child.compaction = parent.compaction.clone();
-    child.inherit_context_graph_from(&parent)?;
+    child.inherit_context_continuity_from(&parent)?;
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
     child.provider_key = parent.provider_key.clone();
@@ -679,14 +622,15 @@ fn clone_split_session(parent_session_id: &str) -> anyhow::Result<(String, Strin
 }
 
 fn transfer_active_messages(session: &Session) -> Vec<crate::message::Message> {
+    let active = session.active_stored_message_entries();
     let start = session
         .compaction
         .as_ref()
-        .map(|state| state.compacted_count.min(session.messages.len()))
+        .map(|state| state.compacted_count.min(active.len()))
         .unwrap_or(0);
-    session.messages[start..]
+    active[start..]
         .iter()
-        .map(crate::session::StoredMessage::to_message)
+        .map(|(_, message)| message.to_message())
         .collect()
 }
 
@@ -694,14 +638,22 @@ fn create_transfer_child_session(
     parent_session_id: &str,
     parent: &Session,
     compaction: Option<crate::session::StoredCompactionState>,
+    summarizer_identity: Option<&jcode_provider_core::ExactRuntimeIdentity>,
     engine: crate::config::CompactionEngine,
 ) -> anyhow::Result<(String, String)> {
     let todos = crate::todo::load_todos(parent_session_id).unwrap_or_default();
     let mut child = Session::create(Some(parent_session_id.to_string()), None);
     child.messages.clear();
+    child.exact_runtime_identity = parent.exact_runtime_identity.clone();
     if engine == crate::config::CompactionEngine::Lcm {
         if let Some(state) = compaction {
-            child.install_imported_context_root(parent, state)?;
+            child.install_imported_context_root(
+                parent,
+                state,
+                summarizer_identity.ok_or_else(|| {
+                    anyhow::anyhow!("LCM transfer summarizer identity is missing")
+                })?,
+            )?;
         }
     } else {
         child.compaction = compaction;
@@ -710,6 +662,7 @@ fn create_transfer_child_session(
     child.model = parent.model.clone();
     child.provider_key = parent.provider_key.clone();
     child.route_api_method = parent.route_api_method.clone();
+    child.reasoning_effort = parent.reasoning_effort.clone();
     child.subagent_model = parent.subagent_model.clone();
     child.improve_mode = parent.improve_mode;
     child.autoreview_enabled = parent.autoreview_enabled;
@@ -717,6 +670,7 @@ fn create_transfer_child_session(
     child.is_canary = parent.is_canary;
     child.testing_build = parent.testing_build.clone();
     child.provider_session_id = None;
+    child.provider_session_identity = None;
     child.status = crate::session::SessionStatus::Closed;
     child.save()?;
     crate::todo::save_todos(&child.id, &todos)?;
@@ -818,20 +772,30 @@ pub(super) async fn handle_transfer(
         agent_guard.provider_fork()
     };
 
-    let transfer_engine = crate::config::config().compaction.engine.clone();
-    let transfer_compaction = match async {
+    let transfer_engine = crate::config::config().compaction.engine;
+    let (transfer_compaction, summarizer_identity) = match async {
         let provider = if transfer_engine == crate::config::CompactionEngine::Lcm {
             crate::compaction::CompactionManager::portable_provider_for_session(&parent, provider)?
         } else {
             provider
         };
-        crate::compaction::build_transfer_compaction_state(
+        let summarizer_identity = if transfer_engine == crate::config::CompactionEngine::Lcm {
+            Some(
+                provider
+                    .exact_runtime_identity()
+                    .ok_or_else(|| anyhow::anyhow!("LCM transfer provider identity is missing"))?,
+            )
+        } else {
+            None
+        };
+        let compaction = crate::compaction::build_transfer_compaction_state(
             provider,
             transfer_active_messages(&parent),
             parent.compaction.clone(),
-            transfer_engine.clone(),
+            transfer_engine,
         )
-        .await
+        .await?;
+        Ok::<_, anyhow::Error>((compaction, summarizer_identity))
     }
     .await
     {
@@ -860,6 +824,7 @@ pub(super) async fn handle_transfer(
         client_session_id,
         &parent,
         transfer_compaction,
+        summarizer_identity.as_ref(),
         transfer_engine,
     ) {
         Ok(result) => result,
@@ -970,6 +935,7 @@ pub(super) async fn handle_resume_all_sessions(
     let mut skipped = 0usize;
 
     for session_id in live_session_ids {
+        let lifecycle_lease = super::acquire_session_lifecycle_lease(&session_id).await;
         let agent = {
             let guard = sessions.read().await;
             guard.get(&session_id).cloned()
@@ -1015,6 +981,7 @@ pub(super) async fn handle_resume_all_sessions(
         super::live_turn::spawn_tracked_live_turn(
             &session_id,
             Arc::clone(&agent),
+            lifecycle_lease,
             String::new(),
             Some(reminder),
             Some("resuming interrupted session".to_string()),

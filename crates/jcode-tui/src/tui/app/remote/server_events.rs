@@ -4,11 +4,9 @@ use crate::tui::TuiState;
 use crate::tui::app as app_mod;
 use crate::tui::app::remote::swarm_plan_core::RemoteSwarmPlanSnapshot;
 use crate::tui::app::remote::swarm_status_core::swarm_status_transition_notice;
-
 fn allow_runtime_identity_mismatch() -> bool {
     std::env::var_os("JCODE_ALLOW_SERVER_VERSION_MISMATCH").is_some()
 }
-
 /// Parse a jcode version string into an orderable `(major, minor, patch)`, but
 /// only for *clean release* builds.
 ///
@@ -23,7 +21,6 @@ fn parse_release_semver(version: &str) -> Option<(u32, u32, u32)> {
     if lower.contains("-dev") || lower.contains("dirty") {
         return None;
     }
-    // Take the leading token, e.g. "v0.17.0 (d741696f)" -> "0.17.0".
     let token = lower
         .split([' ', '(', ')', ','])
         .next()
@@ -36,7 +33,6 @@ fn parse_release_semver(version: &str) -> Option<(u32, u32, u32)> {
     let patch = parts.next().unwrap_or("0").parse().ok()?;
     Some((major, minor, patch))
 }
-
 /// True when the connected server reports a clean release version strictly older
 /// than this client's own clean release version.
 ///
@@ -57,7 +53,6 @@ fn server_release_is_older_than_client(server_version: Option<&str>, client_vers
     };
     server < client
 }
-
 /// Decide whether to defer applying remote session state because the server we
 /// attached to is not running the binary we expect.
 ///
@@ -87,9 +82,6 @@ fn should_defer_history_for_runtime_identity_with_allow(
     if allow_mismatch {
         return false;
     }
-    // A client-proven-older server always wins: never let an old daemon's
-    // (locally correct but globally wrong) "no update" self-report veto the
-    // client's own release-order comparison.
     if client_detected_stale {
         return true;
     }
@@ -99,7 +91,6 @@ fn should_defer_history_for_runtime_identity_with_allow(
         None => false,
     }
 }
-
 /// The client's own version string, used for release-staleness comparison.
 ///
 /// Production always reads the compiled-in build metadata. A test-only env
@@ -114,7 +105,6 @@ fn client_release_version() -> String {
     }
     jcode_build_meta::version().to_string()
 }
-
 fn should_defer_history_for_runtime_identity(
     server_has_update: Option<bool>,
     server_version: Option<&str>,
@@ -127,14 +117,12 @@ fn should_defer_history_for_runtime_identity(
         allow_runtime_identity_mismatch(),
     )
 }
-
 #[cfg(test)]
 mod runtime_identity_tests {
     use super::{
         parse_release_semver, server_release_is_older_than_client,
         should_defer_history_for_runtime_identity_with_allow,
     };
-
     #[test]
     fn runtime_identity_gate_defers_stale_server_history_by_default() {
         assert!(should_defer_history_for_runtime_identity_with_allow(
@@ -151,7 +139,6 @@ mod runtime_identity_tests {
             None, false, false
         ));
     }
-
     #[test]
     fn runtime_identity_gate_allows_explicit_mismatch_escape_hatch() {
         assert!(!should_defer_history_for_runtime_identity_with_allow(
@@ -163,53 +150,36 @@ mod runtime_identity_tests {
             None, true, true
         ));
     }
-
     #[test]
     fn client_detected_older_server_always_defers() {
-        // Ancient server (server_has_update: None) that the client independently
-        // measured as older -> defer. This is the issue #295 macOS case where a
-        // pre-self-heal daemon can never set server_has_update itself.
         assert!(should_defer_history_for_runtime_identity_with_allow(
             None, true, false
         ));
-        // A server that self-reports "no newer binary" (Some(false)) but that the
-        // client can PROVE is an older release -> still defer. The daemon's
-        // self-report is locally correct (its own shared-server channel points at
-        // its old build) but globally wrong; the newer client is authoritative.
-        // This is the "current client, stale server" report: trusting Some(false)
-        // here is exactly what left the server stuck on the old version forever.
         assert!(should_defer_history_for_runtime_identity_with_allow(
             Some(false),
             true,
             false
         ));
-        // Same-release/newer server (client could not prove it is older) that
-        // self-reports "no newer binary" -> trust it, do not force a reload loop.
         assert!(!should_defer_history_for_runtime_identity_with_allow(
             Some(false),
             false,
             false
         ));
     }
-
     #[test]
     fn parse_release_semver_refuses_unorderable_dev_builds() {
         assert_eq!(parse_release_semver("v0.17.0 (d741696f)"), Some((0, 17, 0)));
         assert_eq!(parse_release_semver("0.14.2"), Some((0, 14, 2)));
-        // Dev/dirty builds share a base semver and must not be ordered.
         assert_eq!(parse_release_semver("v0.18.4-dev (102e9750, dirty)"), None);
         assert_eq!(parse_release_semver("v0.14.2-dev (38452185, dirty)"), None);
         assert_eq!(parse_release_semver("unknown"), None);
     }
-
     #[test]
     fn server_release_older_than_client_is_selfdev_safe() {
-        // Clean release older than clean client -> stale.
         assert!(server_release_is_older_than_client(
             Some("v0.14.2 (38452185)"),
             "v0.17.0 (d741696f)"
         ));
-        // Equal or newer -> not stale.
         assert!(!server_release_is_older_than_client(
             Some("v0.17.0"),
             "v0.17.0"
@@ -218,8 +188,6 @@ mod runtime_identity_tests {
             Some("v0.18.0"),
             "v0.17.0"
         ));
-        // Either side dev/dirty/unparseable -> never claim staleness (protects
-        // self-dev and branched daemons from a forced downgrade).
         assert!(!server_release_is_older_than_client(
             Some("v0.14.2-dev (abc, dirty)"),
             "v0.17.0"
@@ -231,7 +199,6 @@ mod runtime_identity_tests {
         assert!(!server_release_is_older_than_client(None, "v0.17.0"));
     }
 }
-
 /// Fingerprint of the last fully-applied History payload for one client
 /// instance, so byte-identical bootstrap redeliveries can be dropped without
 /// rebuilding the display transcript.
@@ -240,7 +207,6 @@ struct AppliedHistoryFingerprint {
     session_id: String,
     fingerprint: u64,
 }
-
 /// Last fully-applied History payload fingerprint, keyed by
 /// `App::remote_client_instance_id`.
 ///
@@ -253,19 +219,14 @@ struct AppliedHistoryFingerprint {
 static LAST_APPLIED_HISTORY: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, AppliedHistoryFingerprint>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 fn last_applied_history_fingerprint(instance_id: &str) -> Option<AppliedHistoryFingerprint> {
     LAST_APPLIED_HISTORY
         .lock()
         .ok()
         .and_then(|map| map.get(instance_id).cloned())
 }
-
 fn record_applied_history_fingerprint(instance_id: &str, session_id: &str, fingerprint: u64) {
     if let Ok(mut map) = LAST_APPLIED_HISTORY.lock() {
-        // Bound growth from short-lived test/replay Apps; one entry per live
-        // client is the steady state, so clearing is harmless (worst case one
-        // extra full re-apply per client).
         if !map.contains_key(instance_id) && map.len() >= 64 {
             map.clear();
         }
@@ -278,7 +239,6 @@ fn record_applied_history_fingerprint(instance_id: &str, session_id: &str, finge
         );
     }
 }
-
 /// Hash a JSON value structurally without serializing it to a string, so large
 /// tool inputs contribute to the fingerprint in one allocation-free pass.
 fn hash_json_value(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
@@ -314,7 +274,6 @@ fn hash_json_value(value: &serde_json::Value, hasher: &mut impl std::hash::Hashe
         }
     }
 }
-
 /// Cheap structural fingerprint of a full History payload.
 ///
 /// Reconnects, session-switch storms, and the history-recovery watchdog can
@@ -325,7 +284,6 @@ fn hash_json_value(value: &serde_json::Value, hasher: &mut impl std::hash::Hashe
 fn history_payload_fingerprint(messages: &[crate::protocol::HistoryMessage]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-
     let mut hasher = DefaultHasher::new();
     messages.len().hash(&mut hasher);
     for message in messages {
@@ -354,7 +312,6 @@ fn history_payload_fingerprint(messages: &[crate::protocol::HistoryMessage]) -> 
     }
     hasher.finish()
 }
-
 /// Pure skip decision for a full History payload: skip only when the session
 /// did not change, the display still has content to preserve, and the payload
 /// fingerprints identical to the one most recently applied for this session.
@@ -372,7 +329,6 @@ fn should_skip_identical_history_payload(
         && last_applied
             .is_some_and(|entry| entry.session_id == session_id && entry.fingerprint == fingerprint)
 }
-
 /// True when the incoming rendered-image set is (cheaply) identical to the
 /// already-retained set: same count and, per image, same data length plus
 /// equal cheap metadata. Image data is compared by length only so duplicate
@@ -390,7 +346,6 @@ fn history_images_match_retained(
                 && a.anchor == b.anchor
         })
 }
-
 #[cfg(test)]
 mod history_dedup_tests {
     use super::{
@@ -399,7 +354,6 @@ mod history_dedup_tests {
     };
     use crate::protocol::HistoryMessage;
     use crate::session::{RenderedImage, RenderedImageSource};
-
     fn message(role: &str, content: &str) -> HistoryMessage {
         HistoryMessage {
             role: role.to_string(),
@@ -408,7 +362,6 @@ mod history_dedup_tests {
             tool_data: None,
         }
     }
-
     fn image(data: &str) -> RenderedImage {
         RenderedImage {
             media_type: "image/png".to_string(),
@@ -418,7 +371,6 @@ mod history_dedup_tests {
             anchor: None,
         }
     }
-
     #[test]
     fn identical_payloads_fingerprint_equal() {
         let a = vec![message("user", "hi"), message("assistant", "hello")];
@@ -428,21 +380,16 @@ mod history_dedup_tests {
             history_payload_fingerprint(&b)
         );
     }
-
     #[test]
     fn fingerprint_changes_on_content_role_count_and_tool_data() {
         let base = vec![message("user", "hi"), message("assistant", "hello")];
         let fp = history_payload_fingerprint(&base);
-
         let content = vec![message("user", "hi"), message("assistant", "hello!")];
         assert_ne!(fp, history_payload_fingerprint(&content));
-
         let role = vec![message("user", "hi"), message("system", "hello")];
         assert_ne!(fp, history_payload_fingerprint(&role));
-
         let count = vec![message("user", "hi")];
         assert_ne!(fp, history_payload_fingerprint(&count));
-
         let mut tool = base.clone();
         tool[1].tool_data = Some(super::ToolCall {
             id: "t1".to_string(),
@@ -452,8 +399,6 @@ mod history_dedup_tests {
             thought_signature: None,
         });
         assert_ne!(fp, history_payload_fingerprint(&tool));
-
-        // Same tool call with different input must differ too.
         let mut tool_other = tool.clone();
         tool_other[1].tool_data.as_mut().unwrap().input = serde_json::json!({"command": "pwd"});
         assert_ne!(
@@ -461,15 +406,12 @@ mod history_dedup_tests {
             history_payload_fingerprint(&tool_other)
         );
     }
-
     #[test]
     fn skip_decision_requires_same_session_same_fingerprint_and_intact_display() {
         let entry = AppliedHistoryFingerprint {
             session_id: "ses_a".to_string(),
             fingerprint: 42,
         };
-
-        // Exact match with intact display and unchanged session -> skip.
         assert!(should_skip_identical_history_payload(
             false,
             false,
@@ -477,7 +419,6 @@ mod history_dedup_tests {
             "ses_a",
             42
         ));
-        // Session switch must always re-apply.
         assert!(!should_skip_identical_history_payload(
             true,
             false,
@@ -485,7 +426,6 @@ mod history_dedup_tests {
             "ses_a",
             42
         ));
-        // A cleared display must be repopulated even for an identical payload.
         assert!(!should_skip_identical_history_payload(
             false,
             true,
@@ -493,7 +433,6 @@ mod history_dedup_tests {
             "ses_a",
             42
         ));
-        // Different session id -> re-apply.
         assert!(!should_skip_identical_history_payload(
             false,
             false,
@@ -501,7 +440,6 @@ mod history_dedup_tests {
             "ses_b",
             42
         ));
-        // Different payload (e.g. rewind truncation) -> re-apply.
         assert!(!should_skip_identical_history_payload(
             false,
             false,
@@ -509,21 +447,17 @@ mod history_dedup_tests {
             "ses_a",
             43
         ));
-        // Nothing applied yet -> re-apply.
         assert!(!should_skip_identical_history_payload(
             false, false, None, "ses_a", 42
         ));
     }
-
     #[test]
     fn images_match_retained_compares_count_and_lengths() {
         let retained = vec![image("aaaa"), image("bbbbbb")];
         let same = vec![image("aaaa"), image("bbbbbb")];
         assert!(history_images_match_retained(&same, &retained));
-        // Length-only comparison: equal lengths count as identical.
         let same_len = vec![image("cccc"), image("dddddd")];
         assert!(history_images_match_retained(&same_len, &retained));
-
         assert!(!history_images_match_retained(&[], &retained));
         let fewer = vec![image("aaaa")];
         assert!(!history_images_match_retained(&fewer, &retained));
@@ -535,7 +469,6 @@ mod history_dedup_tests {
         assert!(history_images_match_retained(&[], &[]));
     }
 }
-
 pub(in crate::tui::app) fn handle_server_event(
     app: &mut App,
     event: ServerEvent,
@@ -545,13 +478,7 @@ pub(in crate::tui::app) fn handle_server_event(
     if app.is_processing {
         app.last_stream_activity = Some(Instant::now());
     }
-
     let had_remote_resume_activity = app.remote_resume_activity.is_some();
-
-    // A turn can start in this session without this client sending a message:
-    // swarm wake delivery, background-task wakes, scheduled tasks, resume-all,
-    // or another window attached to the same session. When live turn-stream
-    // events arrive while this client thinks the session is idle, adopt the
     // turn so the status line/spinner reflect the in-progress work and the
     // terminal Done/Error event can settle it like a resumed remote turn.
     let externally_started_turn_event = app.current_message_id.is_none()
@@ -1086,6 +1013,26 @@ pub(in crate::tui::app) fn handle_server_event(
             true
         }
         ServerEvent::Done { id } => {
+            if app
+                .pending_remote_account_switch
+                .as_ref()
+                .is_some_and(|pending| pending.id == id)
+            {
+                let Some(pending) = app.pending_remote_account_switch.take() else {
+                    app.set_status_notice(
+                        "Account switch completion lost its pending identity; refresh required",
+                    );
+                    return true;
+                };
+                app.context_limit = app.provider.context_window() as u64;
+                app.context_warning_shown = false;
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Switched `{}` account to `{}`.",
+                    pending.provider_id, pending.label
+                )));
+                app.set_status_notice(format!("Account: switched to {}", pending.label));
+                return true;
+            }
             let mut auto_poked = false;
             let mut completed_current_message = false;
             crate::logging::info(&format!(
@@ -1201,10 +1148,22 @@ pub(in crate::tui::app) fn handle_server_event(
             completed_current_message || auto_poked
         }
         ServerEvent::Error {
+            id,
             message,
             retry_after_secs,
-            ..
         } => {
+            if app
+                .pending_remote_account_switch
+                .as_ref()
+                .is_some_and(|pending| pending.id == id)
+            {
+                app.pending_remote_account_switch = None;
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Account switch failed: {message}"
+                )));
+                app.set_status_notice("Account switch failed");
+                return true;
+            }
             // The server rejects a Message request with this error while its
             // previous turn is still running. This typically happens when a
             // reload/reconnect raced the turn-end dispatch: the history
@@ -1498,6 +1457,7 @@ pub(in crate::tui::app) fn handle_server_event(
             session_id,
             provider_name,
             provider_model,
+            exact_runtime_identity,
             subagent_model,
             autoreview_enabled,
             autojudge_enabled,
@@ -1673,6 +1633,7 @@ pub(in crate::tui::app) fn handle_server_event(
             app.replace_remote_model_catalog_snapshot(model_catalog_snapshot);
             app.clear_remote_startup_phase();
             app.session.subagent_model = subagent_model;
+            app.session.exact_runtime_identity = exact_runtime_identity;
             app.session.autoreview_enabled = autoreview_enabled;
             app.session.autojudge_enabled = autojudge_enabled;
             app.autoreview_enabled =

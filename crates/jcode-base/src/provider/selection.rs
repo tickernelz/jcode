@@ -297,6 +297,39 @@ impl MultiProvider {
             .or_else(|| crate::session::derive_session_provider_key(provider_name))
     }
 
+    pub fn route_api_method_after_model_switch(
+        model_request: &str,
+        previous_api_method: Option<&str>,
+    ) -> Option<String> {
+        let model_request = model_request.trim();
+        if let Some((prefix, model)) = model_request.split_once(':') {
+            let prefix = prefix.trim();
+            if !prefix.is_empty() && !model.trim().is_empty() {
+                if let Some(route) = jcode_provider_core::AuthRoute::parse(prefix) {
+                    return Some(route.route_api_method().to_string());
+                }
+                if matches!(
+                    prefix,
+                    "copilot" | "antigravity" | "gemini" | "cursor" | "bedrock" | "openrouter"
+                ) {
+                    return Some(prefix.to_string());
+                }
+                if let Some(profile) =
+                    crate::provider_catalog::resolve_openai_compatible_profile_selection(prefix)
+                {
+                    return Some(format!("openai-compatible:{}", profile.id));
+                }
+                if crate::config::config().providers.contains_key(prefix) {
+                    return Some(format!("openai-compatible:{prefix}"));
+                }
+            }
+        }
+        if model_request.contains('@') {
+            return Some("openrouter".to_string());
+        }
+        previous_api_method.map(ToString::to_string)
+    }
+
     fn session_provider_key_from_provider_name(provider_name: &str) -> Option<String> {
         let normalized = provider_name.trim().to_ascii_lowercase();
         let key = match normalized.as_str() {
@@ -640,6 +673,32 @@ mod tests {
                 MultiProvider::model_switch_request_for_session_model(model, provider_key),
                 expected_request,
                 "restore {model:?} with {provider_key:?}"
+            );
+        }
+
+        for (request, previous, expected) in [
+            (
+                "openai-api:gpt-5.5",
+                Some("claude-oauth"),
+                Some("openai-api-key"),
+            ),
+            (
+                "claude-oauth:claude-opus-4-6",
+                Some("openai-api-key"),
+                Some("claude-oauth"),
+            ),
+            (
+                "nvidia-nim:nvidia/example",
+                Some("openrouter"),
+                Some("openai-compatible:nvidia-nim"),
+            ),
+            ("openrouter/model@upstream", None, Some("openrouter")),
+            ("gpt-5.5", Some("openai-oauth"), Some("openai-oauth")),
+        ] {
+            assert_eq!(
+                MultiProvider::route_api_method_after_model_switch(request, previous).as_deref(),
+                expected,
+                "persist exact route for {request:?}"
             );
         }
 

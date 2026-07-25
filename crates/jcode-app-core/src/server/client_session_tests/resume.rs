@@ -2,19 +2,42 @@ use super::*;
 use crate::transport::WriteHalf;
 use anyhow::{Result, anyhow};
 
-fn setup_runtime_dir() -> Result<(tempfile::TempDir, Option<std::ffi::OsString>)> {
-    let runtime = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
-    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
-    crate::env::set_var("JCODE_RUNTIME_DIR", runtime.path());
-    Ok((runtime, prev_runtime))
+struct TestRuntimeGuard {
+    _sandbox: tempfile::TempDir,
+    prev_runtime: Option<std::ffi::OsString>,
+    prev_home: Option<std::ffi::OsString>,
 }
 
-fn restore_runtime_dir(prev_runtime: Option<std::ffi::OsString>) {
-    if let Some(prev_runtime) = prev_runtime {
-        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
-    } else {
-        crate::env::remove_var("JCODE_RUNTIME_DIR");
+impl Drop for TestRuntimeGuard {
+    fn drop(&mut self) {
+        if let Some(prev_runtime) = self.prev_runtime.take() {
+            crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+        } else {
+            crate::env::remove_var("JCODE_RUNTIME_DIR");
+        }
+        if let Some(prev_home) = self.prev_home.take() {
+            crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
     }
+}
+
+fn setup_runtime_dir() -> Result<TestRuntimeGuard> {
+    let sandbox = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
+    let runtime = sandbox.path().join("runtime");
+    let home = sandbox.path().join("home");
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::create_dir_all(&home)?;
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_RUNTIME_DIR", &runtime);
+    crate::env::set_var("JCODE_HOME", &home);
+    Ok(TestRuntimeGuard {
+        _sandbox: sandbox,
+        prev_runtime,
+        prev_home,
+    })
 }
 
 fn test_writer() -> Result<(Arc<Mutex<WriteHalf>>, crate::transport::Stream)> {

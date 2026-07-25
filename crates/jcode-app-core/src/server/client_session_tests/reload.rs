@@ -473,23 +473,3 @@ async fn handle_reload_does_not_wait_for_busy_agent_lock() -> Result<()> {
     }
     Ok(())
 }
-
-#[tokio::test]
-async fn rename_shutdown_signal_moves_registration_to_restored_session() -> Result<()> {
-    let signal = InterruptSignal::new();
-    let shutdown_signals = Arc::new(RwLock::new(HashMap::from([(
-        "session_old".to_string(),
-        signal.clone(),
-    )])));
-
-    rename_shutdown_signal(&shutdown_signals, "session_old", "session_restored").await;
-
-    let signals = shutdown_signals.read().await;
-    assert!(!signals.contains_key("session_old"));
-    let renamed = signals
-        .get("session_restored")
-        .ok_or_else(|| anyhow!("restored session should retain shutdown signal"))?;
-    renamed.fire();
-    assert!(signal.is_set());
-    Ok(())
-}

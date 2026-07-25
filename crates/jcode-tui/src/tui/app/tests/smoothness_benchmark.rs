@@ -210,14 +210,21 @@ fn smoothness_plain_text_commit_preserves_the_live_viewport() {
 
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-    let mut recorder = jcode_tui_core::anchor_stability::AnchorStabilityRecorder::new();
+    let mut settling_recorder =
+        jcode_tui_core::anchor_stability::AnchorStabilityRecorder::new();
 
     // Settle the fully revealed live view before isolating the completion
     // transition. The committed assistant message should render identically;
     // only the compact turn footer is new.
     for _ in 0..3 {
-        observe_smoothness_frame(&app, &mut terminal, &mut recorder);
+        observe_smoothness_frame(&app, &mut terminal, &mut settling_recorder);
     }
+    // Initial layout/cache warm-up can legitimately change while settling, and
+    // other serial tests may leave additional fact-stack rows configured. Start
+    // a fresh recorder from the settled live frame so this benchmark measures
+    // only the completion transition described below.
+    let mut recorder = jcode_tui_core::anchor_stability::AnchorStabilityRecorder::new();
+    observe_smoothness_frame(&app, &mut terminal, &mut recorder);
     app.handle_server_event(crate::protocol::ServerEvent::MessageEnd, &mut remote);
     app.handle_server_event(crate::protocol::ServerEvent::Done { id: 7 }, &mut remote);
     for _ in 0..3 {

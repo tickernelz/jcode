@@ -1,8 +1,80 @@
 use super::*;
 
+mod session_and_repl;
+
+fn restore_provider_identity(
+    provider: &dyn Provider,
+    route_request: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<()> {
+    let route_result = crate::provider::set_model_with_auth_refresh(provider, route_request)
+        .map_err(|error| anyhow::anyhow!("route rollback via '{route_request}' failed: {error}"));
+    let rollback_effort = reasoning_effort.unwrap_or("");
+    let effort_result = if reasoning_effort.is_some() || provider.reasoning_effort().is_some() {
+        provider
+            .set_reasoning_effort(rollback_effort)
+            .map_err(|error| {
+                anyhow::anyhow!("reasoning rollback to '{rollback_effort}' failed: {error}")
+            })
+    } else {
+        Ok(())
+    };
+    match (route_result, effort_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(route), Ok(())) => Err(route),
+        (Ok(()), Err(effort)) => Err(effort),
+        (Err(route), Err(effort)) => Err(anyhow::anyhow!("{route}; {effort}")),
+    }
+}
+
 impl Agent {
+    async fn ensure_provider_identity_ready(&mut self) -> Result<()> {
+        crate::provider::ensure_no_account_transition()?;
+        // A startup reconciliation failure remains gated, but every later turn
+        // owns a retry so a transient storage/provider error cannot wedge this
+        // process until restart.
+        crate::server::provider_control::reconcile_pending_account_transition_for_admission_async(
+            Arc::clone(&self.provider),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn ensure_provider_identity_ready_under_admission(&mut self) -> Result<()> {
+        crate::provider::ensure_no_account_transition()?;
+        crate::server::ensure_no_pending_account_reconciliation()?;
+        let previous = self.session.exact_runtime_identity.clone();
+        if previous.as_ref().is_some_and(|identity| {
+            matches!(
+                identity.route.runtime_key,
+                jcode_provider_core::RuntimeKey::ClaudeOAuth
+                    | jcode_provider_core::RuntimeKey::OpenAIOAuth
+            )
+        }) {
+            self.provider.ensure_credentials_current().await?;
+        }
+        if self.provider.exact_runtime_identity().as_ref() != previous.as_ref() {
+            self.reconcile_exact_runtime_identity_after_request_open(previous.as_ref())?;
+        }
+        if let Some(error) = self.provider_identity_error.as_deref() {
+            anyhow::bail!("Provider identity is not safe for a model turn: {error}");
+        }
+        Ok(())
+    }
+
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
+        self.ensure_provider_identity_ready().await?;
+        let _account_admission =
+            crate::server::acquire_account_reconciliation_admission_lock().await?;
+        crate::session::with_account_transition_admission(self.run_once_admitted(user_message))
+            .await
+    }
+
+    async fn run_once_admitted(&mut self, user_message: &str) -> Result<()> {
+        self.ensure_provider_identity_ready_under_admission()
+            .await?;
+        self.rewind_undo_snapshot = None;
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
@@ -19,6 +91,19 @@ impl Agent {
     }
 
     pub async fn run_once_capture(&mut self, user_message: &str) -> Result<String> {
+        self.ensure_provider_identity_ready().await?;
+        let _account_admission =
+            crate::server::acquire_account_reconciliation_admission_lock().await?;
+        crate::session::with_account_transition_admission(
+            self.run_once_capture_admitted(user_message),
+        )
+        .await
+    }
+
+    async fn run_once_capture_admitted(&mut self, user_message: &str) -> Result<String> {
+        self.ensure_provider_identity_ready_under_admission()
+            .await?;
+        self.rewind_undo_snapshot = None;
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
@@ -41,6 +126,28 @@ impl Agent {
         system_reminder: Option<String>,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
+        self.ensure_provider_identity_ready().await?;
+        let _account_admission =
+            crate::server::acquire_account_reconciliation_admission_lock().await?;
+        crate::session::with_account_transition_admission(self.run_once_streaming_mpsc_admitted(
+            user_message,
+            images,
+            system_reminder,
+            event_tx,
+        ))
+        .await
+    }
+
+    async fn run_once_streaming_mpsc_admitted(
+        &mut self,
+        user_message: &str,
+        images: Vec<(String, String)>,
+        system_reminder: Option<String>,
+        event_tx: mpsc::UnboundedSender<ServerEvent>,
+    ) -> Result<()> {
+        self.ensure_provider_identity_ready_under_admission()
+            .await?;
+        self.rewind_undo_snapshot = None;
         // Inject any pending notifications before the user message
         let alerts = self.take_alerts();
         if !alerts.is_empty() {
@@ -143,37 +250,109 @@ impl Agent {
     }
 
     /// Clear conversation history
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.clear_with_canary(None)
+    }
+
+    pub(crate) fn clear_with_canary(&mut self, force_canary: Option<&str>) -> Result<(), String> {
+        self.clear_with_canary_session(force_canary, Session::create(None, None))
+    }
+
+    pub(crate) fn clear_with_canary_session(
+        &mut self,
+        force_canary: Option<&str>,
+        mut new_session: Session,
+    ) -> Result<(), String> {
+        let old_session_id = self.session.id.clone();
         let preserve_canary = self.session.is_canary;
         let preserve_testing_build = self.session.testing_build.clone();
         let preserve_debug = self.session.is_debug;
         let preserve_working_dir = self.session.working_dir.clone();
 
-        self.session.mark_closed();
-        self.persist_session_best_effort("pre-clear session close state");
-
-        let mut new_session = Session::create(None, None);
-        new_session.mark_active();
         new_session.model = Some(self.provider.model());
         new_session.provider_key =
             crate::session::derive_session_provider_key(self.provider.name());
         new_session.is_canary = preserve_canary;
         new_session.testing_build = preserve_testing_build;
+        if let Some(build_hash) = force_canary {
+            new_session.set_canary(build_hash);
+        }
         new_session.is_debug = preserve_debug;
         new_session.working_dir = preserve_working_dir;
         new_session.ensure_initial_session_context_message();
 
+        // Prepare an inert durable replacement before closing the live
+        // session. No PID marker or in-memory binding points at it yet.
+        new_session.status = SessionStatus::Closed;
+        new_session.last_pid = None;
+        new_session
+            .save()
+            .map_err(|error| format!("Failed to create cleared session: {error}"))?;
+        crate::session::begin_session_handoff(&self.session, &new_session)
+            .map_err(|error| format!("Failed to prepare cleared-session handoff: {error}"))?;
+
+        let now = chrono::Utc::now();
+        let mut closed_old = self.session.clone();
+        closed_old.status = SessionStatus::Closed;
+        closed_old.last_active_at = Some(now);
+        if let Err(error) = closed_old.save() {
+            crate::session::finish_session_handoff(&old_session_id);
+            return Err(format!("Failed to close cleared session: {error}"));
+        }
+
+        new_session.status = SessionStatus::Active;
+        new_session.last_pid = Some(std::process::id());
+        new_session.last_active_at = Some(now);
+        if let Err(error) = new_session.save() {
+            closed_old.status = SessionStatus::Active;
+            closed_old.last_pid = Some(std::process::id());
+            let rollback = closed_old.save();
+            if rollback.is_ok() {
+                self.session = closed_old;
+                crate::session::finish_session_handoff(&old_session_id);
+            } else {
+                crate::storage::unregister_active_pid(&old_session_id);
+                self.provider_identity_error = Some(format!(
+                    "Cleared-session activation and source rollback both failed for {old_session_id}; startup handoff reconciliation is required"
+                ));
+            }
+            return Err(format!(
+                "Failed to activate cleared session: {error}; old-session rollback: {}",
+                rollback
+                    .err()
+                    .map_or_else(|| "ok".to_string(), |rollback| rollback.to_string())
+            ));
+        }
+
+        new_session.publish_active_presence();
+        crate::storage::unregister_active_pid(&old_session_id);
+        crate::session::finish_session_handoff(&old_session_id);
         self.session = new_session;
+        self.provider_identity_error = None;
         self.reset_runtime_state_for_session_change();
+        self.soft_interrupt_queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.background_tool_signal = InterruptSignal::new();
+        self.graceful_shutdown = InterruptSignal::new();
+        crate::tool::clear_session_tool_policy(&old_session_id);
+        crate::tool::set_session_tool_policy(
+            &self.session.id,
+            self.allowed_tools.clone(),
+            self.disabled_tools.clone(),
+        );
         self.provider_session_id = None;
         self.seed_compaction_from_session();
+        Ok(())
     }
 
     /// Clear provider session so the next turn sends full context.
-    pub fn reset_provider_session(&mut self) {
+    pub fn reset_provider_session(&mut self) -> Result<()> {
+        let mut candidate = self.session.clone();
+        candidate.provider_session_id = None;
+        candidate.provider_session_identity = None;
+        candidate.save()?;
+        self.session = candidate;
         self.provider_session_id = None;
-        self.session.provider_session_id = None;
-        self.persist_session_best_effort("provider session reset");
+        Ok(())
     }
 
     /// Rewind the conversation to a 1-based visible transcript message index.
@@ -196,55 +375,63 @@ impl Agent {
                 message_index, message_count
             ));
         }
-        let stored_len = targets[message_index - 1] + 1;
+        let target_raw_index = targets[message_index - 1];
 
         let removed = message_count - message_index;
-        self.rewind_undo_snapshot = Some(RewindUndoSnapshot {
-            messages: self.session.messages.clone(),
+        let undo_snapshot = RewindUndoSnapshot {
+            archived_message_ids: self.session.archived_message_ids.clone(),
+            raw_message_count: self.session.messages.len(),
             compaction: self.session.compaction.clone(),
             context_graph: self.session.context_graph_state(),
             provider_session_id: self.provider_session_id.clone(),
             session_provider_session_id: self.session.provider_session_id.clone(),
+            session_provider_session_identity: self.session.provider_session_identity.clone(),
             visible_message_count: message_count,
-        });
-        if let Err(error) = self.session.retain_context_graph_prefix(stored_len) {
-            logging::warn(&format!(
-                "Failed to retain valid LCM rewind prefix; falling back to raw history: {error}"
-            ));
-            self.session.compaction = None;
-            self.session.clear_context_graph_state();
-        }
-        self.session.truncate_messages(stored_len);
-        self.session.updated_at = chrono::Utc::now();
+        };
+        let mut candidate = self.session.clone();
+        candidate
+            .rewind_active_branch_through(target_raw_index)
+            .map_err(|error| format!("Failed to update active rewind branch: {error}"))?;
+        candidate.updated_at = chrono::Utc::now();
+        candidate.provider_session_id = None;
+        candidate.provider_session_identity = None;
+        candidate
+            .save()
+            .map_err(|error| format!("Failed to persist conversation rewind: {error}"))?;
+        self.rewind_undo_snapshot = Some(undo_snapshot);
+        self.session = candidate;
         self.provider_session_id = None;
-        self.session.provider_session_id = None;
         self.cache_tracker.reset();
         self.locked_tools = None;
         self.reset_tool_output_tracking();
         self.seed_compaction_from_session();
-        self.persist_session_best_effort("conversation rewind");
         Ok(removed)
     }
 
     pub fn undo_rewind(&mut self) -> Result<usize, String> {
-        let Some(snapshot) = self.rewind_undo_snapshot.take() else {
+        let Some(snapshot) = self.rewind_undo_snapshot.clone() else {
             return Err("No rewind to undo.".to_string());
         };
 
         let current_count = self.session.rewind_target_count();
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
-        self.session.replace_messages(snapshot.messages);
-        self.session.compaction = snapshot.compaction;
-        self.session
-            .restore_context_graph_state(snapshot.context_graph);
+        let mut candidate = self.session.clone();
+        candidate.restore_active_branch(snapshot.archived_message_ids, snapshot.raw_message_count);
+        candidate.compaction = snapshot.compaction;
+        candidate.restore_context_graph_state(snapshot.context_graph);
+        candidate.provider_session_id = snapshot.session_provider_session_id;
+        candidate.provider_session_identity = snapshot.session_provider_session_identity;
+        candidate.updated_at = chrono::Utc::now();
+        candidate
+            .save()
+            .map_err(|error| format!("Failed to persist conversation rewind undo: {error}"))?;
+        self.rewind_undo_snapshot = None;
+        self.session = candidate;
         self.provider_session_id = snapshot.provider_session_id;
-        self.session.provider_session_id = snapshot.session_provider_session_id;
-        self.session.updated_at = chrono::Utc::now();
         self.cache_tracker.reset();
         self.locked_tools = None;
         self.reset_tool_output_tracking();
         self.seed_compaction_from_session();
-        self.persist_session_best_effort("conversation rewind undo");
         Ok(restored)
     }
 
@@ -474,6 +661,7 @@ impl Agent {
         name: &str,
         input: serde_json::Value,
     ) -> Result<crate::tool::ToolOutput> {
+        self.ensure_tool_identity_ready()?;
         self.validate_tool_allowed(name)?;
 
         let call_id = std::time::SystemTime::now()
@@ -552,380 +740,5 @@ impl Agent {
             return Err(anyhow::anyhow!("Tool '{}' is disabled", name));
         }
         Ok(())
-    }
-
-    /// Restore a session by ID (loads from disk)
-    pub fn restore_session(&mut self, session_id: &str) -> Result<SessionStatus> {
-        self.restore_session_with_working_dir(session_id, None)
-    }
-
-    pub(crate) fn restore_session_with_working_dir(
-        &mut self,
-        session_id: &str,
-        working_dir: Option<&str>,
-    ) -> Result<SessionStatus> {
-        let restore_start = Instant::now();
-        let load_start = Instant::now();
-        let mut session = Session::load(session_id)?;
-        if let Some(working_dir) = working_dir {
-            session.working_dir = Some(working_dir.to_string());
-            session.refresh_initial_session_context_message();
-        }
-        let load_ms = load_start.elapsed().as_millis();
-        logging::info(&format!(
-            "Restoring session '{}' with {} messages, provider_session_id: {:?}, status: {}",
-            session_id,
-            session.messages.len(),
-            session.provider_session_id,
-            session.status.display()
-        ));
-        let previous_status = session.status.clone();
-
-        let assign_start = Instant::now();
-        let previous_session_id = self.session.id.clone();
-        // Restore provider_session_id for Claude CLI session resume
-        self.provider_session_id = session.provider_session_id.clone();
-        self.session = session;
-        crate::tool::clear_session_tool_policy(&previous_session_id);
-        crate::tool::set_session_tool_policy(
-            &self.session.id,
-            self.allowed_tools.clone(),
-            self.disabled_tools.clone(),
-        );
-        let assign_ms = assign_start.elapsed().as_millis();
-
-        let reset_start = Instant::now();
-        self.reset_runtime_state_for_session_change();
-        let restored_soft_interrupts = self.restore_persisted_soft_interrupts();
-        let reset_ms = reset_start.elapsed().as_millis();
-
-        let model_start = Instant::now();
-        if let Some(model) = self.session.model.clone() {
-            let model_request =
-                crate::provider::MultiProvider::model_switch_request_for_session_route(
-                    &model,
-                    self.session.provider_key.as_deref(),
-                    self.session.route_api_method.as_deref(),
-                );
-            if let Err(e) =
-                crate::provider::set_model_with_auth_refresh(self.provider.as_ref(), &model_request)
-            {
-                logging::error(&format!(
-                    "Failed to restore session model '{}' via '{}': {}",
-                    model, model_request, e
-                ));
-            }
-        } else {
-            self.session.model = Some(self.provider.model());
-        }
-        self.restore_reasoning_effort_from_session();
-        let model_ms = model_start.elapsed().as_millis();
-
-        let mark_active_start = Instant::now();
-        self.session.mark_active();
-        let mark_active_ms = mark_active_start.elapsed().as_millis();
-        self.sync_memory_dedup_state_from_session();
-
-        logging::info(&format!(
-            "restore_session: loaded session {} with {} messages, calling seed_compaction",
-            session_id,
-            self.session.messages.len()
-        ));
-        let compaction_start = Instant::now();
-        self.seed_compaction_from_session();
-        let compaction_ms = compaction_start.elapsed().as_millis();
-
-        let env_snapshot_start = Instant::now();
-        self.log_env_snapshot("resume");
-        let env_snapshot_ms = env_snapshot_start.elapsed().as_millis();
-        self.fire_session_lifecycle_hook("session_start", "resume");
-
-        let save_start = Instant::now();
-        if let Err(err) = self.session.save() {
-            logging::error(&format!(
-                "Failed to persist resumed session state for {}: {}",
-                session_id, err
-            ));
-        }
-        let save_ms = save_start.elapsed().as_millis();
-
-        logging::info(&format!(
-            "[TIMING] restore_session: session={}, messages={}, restored_soft_interrupts={}, load={}ms, assign={}ms, reset={}ms, model={}ms, mark_active={}ms, compaction={}ms, env_snapshot={}ms, save={}ms, total={}ms",
-            session_id,
-            self.session.messages.len(),
-            restored_soft_interrupts,
-            load_ms,
-            assign_ms,
-            reset_ms,
-            model_ms,
-            mark_active_ms,
-            compaction_ms,
-            env_snapshot_ms,
-            save_ms,
-            restore_start.elapsed().as_millis(),
-        ));
-        logging::info(&format!(
-            "Session restored: {} messages in session",
-            self.session.messages.len()
-        ));
-        Ok(previous_status)
-    }
-
-    /// Get conversation history for sync
-    pub fn get_history(&self) -> Vec<HistoryMessage> {
-        crate::session::render_messages(&self.session)
-            .into_iter()
-            .map(|msg| HistoryMessage {
-                role: msg.role,
-                content: msg.content,
-                tool_calls: if msg.tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(msg.tool_calls)
-                },
-                tool_data: msg.tool_data,
-            })
-            .collect()
-    }
-
-    pub fn get_history_and_rendered_images(
-        &self,
-    ) -> (Vec<HistoryMessage>, Vec<crate::session::RenderedImage>) {
-        let (messages, images) = crate::session::render_messages_and_images(&self.session);
-        let history = messages
-            .into_iter()
-            .map(|msg| HistoryMessage {
-                role: msg.role,
-                content: msg.content,
-                tool_calls: if msg.tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(msg.tool_calls)
-                },
-                tool_data: msg.tool_data,
-            })
-            .collect();
-        (history, images)
-    }
-
-    pub fn get_history_and_rendered_images_with_compacted_history(
-        &self,
-        compacted_history_visible: usize,
-    ) -> (
-        Vec<HistoryMessage>,
-        Vec<crate::session::RenderedImage>,
-        Option<crate::session::RenderedCompactedHistoryInfo>,
-    ) {
-        let (messages, images, compacted_info) =
-            crate::session::render_messages_and_images_with_compacted_history(
-                &self.session,
-                compacted_history_visible,
-            );
-        let history = messages
-            .into_iter()
-            .map(|msg| HistoryMessage {
-                role: msg.role,
-                content: msg.content,
-                tool_calls: if msg.tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(msg.tool_calls)
-                },
-                tool_data: msg.tool_data,
-            })
-            .collect();
-        (history, images, compacted_info)
-    }
-
-    pub fn get_tool_call_summaries(&self, limit: usize) -> Vec<crate::protocol::ToolCallSummary> {
-        crate::session::summarize_tool_calls(&self.session, limit)
-    }
-
-    /// Start an interactive REPL
-    pub async fn repl(&mut self) -> Result<()> {
-        println!("J-Code - Coding Agent");
-        println!("Type your message, or 'quit' to exit.");
-
-        // Show available skills
-        let skills = self.current_skills_snapshot();
-        let skill_list = skills.list();
-        if !skill_list.is_empty() {
-            println!(
-                "Available skills: {}",
-                skill_list
-                    .iter()
-                    .map(|s| format!("/{}", s.name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        println!();
-
-        loop {
-            print!("> ");
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-
-            let input = input.trim();
-            if input.is_empty() {
-                continue;
-            }
-
-            if input == "quit" || input == "exit" {
-                break;
-            }
-
-            if input == "clear" {
-                self.clear();
-                println!("Conversation cleared.");
-                continue;
-            }
-
-            // Check for skill invocation
-            if let Some(invocation) = SkillRegistry::parse_invocation(input) {
-                if let Some(skill) = skills.get(invocation.name) {
-                    println!("Activating skill: {}", skill.name);
-                    println!("{}\n", skill.description);
-                    self.active_skill = Some(invocation.name.to_string());
-                    if let Some(prompt) = invocation.prompt {
-                        if let Err(e) = self.run_once(prompt).await {
-                            eprintln!("\nError: {}\n", e);
-                        }
-                        println!();
-                    }
-                    continue;
-                } else {
-                    println!("Unknown skill: /{}", invocation.name);
-                    println!(
-                        "Available: {}",
-                        skills
-                            .list()
-                            .iter()
-                            .map(|s| format!("/{}", s.name))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    continue;
-                }
-            }
-
-            if let Err(e) = self.run_once(input).await {
-                eprintln!("\nError: {}\n", e);
-            }
-
-            println!();
-        }
-
-        // Extract memories from session before exiting
-        self.extract_session_memories().await;
-
-        Ok(())
-    }
-
-    /// Extract memories from the session transcript
-    /// Returns the number of memories extracted, or 0 if none/skipped
-    pub async fn extract_session_memories(&self) -> usize {
-        if !self.memory_enabled {
-            return 0;
-        }
-
-        // Need at least 4 messages for meaningful extraction
-        if self.session.messages.len() < 4 {
-            return 0;
-        }
-
-        logging::info(&format!(
-            "Extracting memories from {} messages",
-            self.session.messages.len()
-        ));
-
-        // Build transcript
-        let mut transcript = String::new();
-        for msg in &self.session.messages {
-            let role = match msg.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-            };
-            transcript.push_str(&format!("**{}:**\n", role));
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text, .. } => {
-                        transcript.push_str(text);
-                        transcript.push('\n');
-                    }
-                    ContentBlock::ToolUse { name, .. } => {
-                        transcript.push_str(&format!("[Used tool: {}]\n", name));
-                    }
-                    ContentBlock::ToolResult { content, .. } => {
-                        let preview = if content.len() > 200 {
-                            format!("{}...", crate::util::truncate_str(content, 200))
-                        } else {
-                            content.clone()
-                        };
-                        transcript.push_str(&format!("[Result: {}]\n", preview));
-                    }
-                    ContentBlock::Reasoning { .. }
-                    | ContentBlock::ReasoningTrace { .. }
-                    | ContentBlock::AnthropicThinking { .. }
-                    | ContentBlock::OpenAIReasoning { .. } => {}
-                    ContentBlock::Image { .. } => {
-                        transcript.push_str("[Image]\n");
-                    }
-                    ContentBlock::OpenAICompaction { .. } => {
-                        transcript.push_str("[OpenAI native compaction]\n");
-                    }
-                }
-            }
-            transcript.push('\n');
-        }
-
-        if !crate::memory::memory_llm_judge_available() {
-            logging::info("Memory extraction skipped: LLM judge unavailable");
-            return 0;
-        }
-
-        // Extract using sidecar
-        let sidecar = crate::sidecar::Sidecar::new();
-        match sidecar.extract_memories(&transcript).await {
-            Ok(extracted) if !extracted.is_empty() => {
-                let manager = self
-                    .session
-                    .working_dir
-                    .as_deref()
-                    .map(|dir| crate::memory::MemoryManager::new().with_project_dir(dir))
-                    .unwrap_or_default();
-                let mut stored_count = 0;
-
-                for memory in &extracted {
-                    let category = crate::memory::MemoryCategory::from_extracted(&memory.category);
-
-                    let trust = match memory.trust.as_str() {
-                        "high" => crate::memory::TrustLevel::High,
-                        "low" => crate::memory::TrustLevel::Low,
-                        _ => crate::memory::TrustLevel::Medium,
-                    };
-
-                    let entry = crate::memory::MemoryEntry::new(category, &memory.content)
-                        .with_source(&self.session.id)
-                        .with_trust(trust);
-
-                    if manager.remember_project(entry).is_ok() {
-                        stored_count += 1;
-                    }
-                }
-
-                if stored_count > 0 {
-                    logging::info(&format!("Extracted {} memories from session", stored_count));
-                }
-                stored_count
-            }
-            Ok(_) => 0,
-            Err(e) => {
-                logging::info(&format!("Memory extraction skipped: {}", e));
-                0
-            }
-        }
     }
 }

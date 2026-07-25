@@ -6,14 +6,15 @@ impl Agent {
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
+        self.session.provider_session_identity = None;
     }
 
     pub fn poll_compaction_completion_event(&mut self) -> Option<CompactionEvent> {
         let compaction = self.registry.compaction();
         let (event, lcm) = match compaction.try_write() {
             Ok(mut manager) => {
-                if manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
-                    self.session.clear_context_graph_state();
+                if manager.synchronize_engine(crate::config::config().compaction.engine) {
+                    self.session.deactivate_context_graph_state();
                     self.note_compaction_applied();
                     self.persist_session_best_effort("compaction engine switch");
                 }
@@ -63,8 +64,8 @@ impl Agent {
 
         match compaction.try_write() {
             Ok(mut manager) => {
-                if manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
-                    self.session.clear_context_graph_state();
+                if manager.synchronize_engine(crate::config::config().compaction.engine) {
+                    self.session.deactivate_context_graph_state();
                     self.note_compaction_applied();
                     self.persist_session_best_effort("compaction engine switch");
                 }
@@ -177,8 +178,8 @@ impl Agent {
 
         let (dropped, usage_pct, compaction_event) = match compaction.try_write() {
             Ok(mut manager) => {
-                if manager.synchronize_engine(crate::config::config().compaction.engine.clone()) {
-                    self.session.clear_context_graph_state();
+                if manager.synchronize_engine(crate::config::config().compaction.engine) {
+                    self.session.deactivate_context_graph_state();
                     self.note_compaction_applied();
                     self.persist_session_best_effort("compaction engine switch");
                 }
@@ -186,12 +187,14 @@ impl Agent {
                 let all_messages = self.session.messages_for_provider_uncached();
                 let usage_pct = manager.context_usage_with(&all_messages) * 100.0;
                 let dropped = if manager.engine() == crate::config::CompactionEngine::Lcm {
-                    match manager.hard_lcm_compact_with(&mut self.session) {
-                        Ok(dropped) => dropped,
-                        Err(reason) => {
-                            logging::warn(&format!(
-                                "Context-limit auto-recovery failed: hard LCM failed ({reason})"
-                            ));
+                    match manager
+                        .ensure_lcm_context_fits(&mut self.session, Arc::clone(&self.provider))
+                    {
+                        crate::compaction::CompactionAction::HardCompacted(dropped) => dropped,
+                        _ => {
+                            logging::warn(
+                                "Context-limit auto-recovery failed: LCM fallback chain did not compact",
+                            );
                             return None;
                         }
                     }
@@ -222,6 +225,7 @@ impl Agent {
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
+        self.session.provider_session_identity = None;
 
         logging::warn(&format!(
             "Context limit exceeded; auto-compacted and retrying (dropped {} messages, usage was {:.1}%)",
@@ -260,9 +264,9 @@ impl Agent {
     ///
     /// This failure is caused by the serialized request body (dominated by inline
     /// base64 images) exceeding the provider's size cap, which is independent of
-    /// the token context window. We strip oversized images from the persisted
-    /// transcript, oldest-first, down to a conservative byte budget and reset the
-    /// provider session/cache so the caller can retry the same turn immediately.
+    /// the token context window. We persist an oldest-first provider projection
+    /// budget without changing canonical history, then reset provider state so
+    /// the caller can retry the same turn immediately.
     fn try_recover_after_payload_too_large(&mut self, error: &str) -> bool {
         if !crate::compaction::is_request_payload_too_large_error(error) {
             return false;
@@ -270,7 +274,7 @@ impl Agent {
 
         let stripped = self
             .session
-            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+            .suppress_oversized_images_for_provider(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
         if stripped == 0 {
             logging::warn(
                 "Request-too-large recovery skipped: no oversized inline images to strip",
@@ -278,7 +282,7 @@ impl Agent {
             return false;
         }
 
-        // The transcript changed; reseed compaction bookkeeping and reset
+        // The provider projection changed; reseed compaction bookkeeping and reset
         // provider session/cache state so the retry sends the reduced payload.
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
@@ -297,9 +301,16 @@ impl Agent {
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
+        self.session.provider_session_identity = None;
+        if let Err(error) = self.session.save() {
+            logging::error(&format!(
+                "Request-too-large recovery could not persist its provider projection: {error:#}"
+            ));
+            return false;
+        }
 
         logging::warn(&format!(
-            "Request body exceeded provider size limit; stripped {} oversized inline image(s) and retrying",
+            "Request body exceeded provider size limit; suppressed {} oversized inline image(s) in provider projection and retrying",
             stripped
         ));
         crate::runtime_memory_log::emit_event(
@@ -308,7 +319,7 @@ impl Agent {
                 "request_payload_too_large",
             )
             .with_session_id(self.session.id.clone())
-            .with_detail(format!("images_stripped={stripped}"))
+            .with_detail(format!("images_suppressed={stripped}"))
             .force_attribution(),
         );
 
@@ -341,6 +352,7 @@ impl Agent {
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
+        self.session.provider_session_identity = None;
 
         logging::warn(
             "OpenAI native compaction payload exceeded provider size limit; discarded native state and retrying with text fallback",

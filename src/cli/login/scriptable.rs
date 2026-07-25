@@ -335,11 +335,8 @@ pub(super) async fn complete_scriptable_claude_login(
         auth::oauth::claude_redirect_uri_for_input(&raw_input, &redirect_uri);
     let tokens =
         auth::oauth::exchange_claude_code(&verifier, &raw_input, &selected_redirect_uri).await?;
-    auth::oauth::save_claude_tokens_for_account(&tokens, &account_label)?;
-    let profile_email =
-        auth::oauth::update_claude_account_profile(&account_label, &tokens.access_token)
-            .await
-            .unwrap_or(None);
+    let (profile_email, _) =
+        auth::oauth::replace_claude_tokens_and_profile(tokens, account_label.clone()).await?;
     clear_pending_login(&pending_path);
     crate::telemetry::record_auth_success(provider_id, "oauth");
     emit_scriptable_auth_success(
@@ -397,7 +394,7 @@ pub(super) async fn complete_scriptable_openai_login(
         &redirect_uri,
     )
     .await?;
-    auth::oauth::save_openai_tokens_for_account(&tokens, &account_label)?;
+    auth::oauth::replace_openai_tokens_for_account(tokens, account_label.clone()).await?;
     clear_pending_login(&pending_path);
     crate::telemetry::record_auth_success(provider_id, "oauth");
     let credentials_path = crate::storage::jcode_dir()?.join("openai-auth.json");

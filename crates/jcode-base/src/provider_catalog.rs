@@ -849,7 +849,13 @@ pub fn openai_compatible_profile_is_configured(profile: OpenAiCompatibleProfile)
     // env vars set by `apply_named_provider_profile_env`, not the built-in
     // `openai-compatible.env`. Honor those first so auth-test does not report a
     // false `not_configured` for a correctly-configured named profile (#402).
-    if let Some(configured) = active_named_provider_profile_is_configured() {
+    let explicit_builtin_profile = std::env::var_os("JCODE_OPENAI_COMPAT_API_BASE").is_some()
+        || std::env::var_os("JCODE_OPENAI_COMPAT_API_KEY_NAME").is_some()
+        || std::env::var_os("JCODE_OPENAI_COMPAT_ENV_FILE").is_some();
+    if profile.id == OPENAI_COMPAT_PROFILE.id
+        && !explicit_builtin_profile
+        && let Some(configured) = active_named_provider_profile_is_configured()
+    {
         return configured;
     }
 

@@ -1,4 +1,4 @@
-use super::AmbientRunnerHandle;
+use super::{AmbientRunnerHandle, session_is_not_live_error};
 use crate::ambient::{Priority, ScheduleTarget, ScheduledItem};
 use crate::message::{Message, Role, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
@@ -34,6 +34,19 @@ impl Drop for EnvVarGuard {
 }
 
 struct TestProvider;
+
+#[test]
+fn headless_fallback_requires_authoritative_not_live_response() {
+    let session_id = "scheduled-session";
+    assert!(session_is_not_live_error(
+        session_id,
+        &anyhow::anyhow!("Session 'scheduled-session' is not currently live")
+    ));
+    assert!(!session_is_not_live_error(
+        session_id,
+        &anyhow::anyhow!("server connection failed")
+    ));
+}
 
 #[derive(Clone, Default)]
 struct StreamingTestProvider {

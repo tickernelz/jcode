@@ -499,6 +499,10 @@ mod tests {
     /// round-trip through the real (non-test-mode) manager when the tool
     /// context carries a working dir.
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the process-wide test environment must stay isolated for the entire async scenario"
+    )]
     async fn project_scope_round_trips_with_working_dir() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::tempdir().expect("home");

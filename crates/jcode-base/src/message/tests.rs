@@ -318,6 +318,63 @@ fn redact_secrets_leaves_normal_output_unchanged() {
 }
 
 #[test]
+fn redact_uncertain_secrets_omits_opaque_values_but_keeps_ordinary_lines() {
+    let opaque = "vault/q7Vn4Zp9Lx2Kc8Mw5Rt1Hs6Bd3Yf.rs";
+    let uppercase_opaque = "ABCDEFGH23456789ABCDEFGH23456789";
+    let hexadecimal_opaque = "0123456789abcdef0123456789abcdef";
+    let lowercase_opaque = "abcdefghijklmnopqrstuvwxyzabcdef";
+    let output = redact_uncertain_secrets(&format!(
+        "ordinary build output\n{opaque}\n{uppercase_opaque}\n{hexadecimal_opaque}\n{lowercase_opaque}\ncommit 01846a47"
+    ));
+
+    assert!(output.contains("ordinary build output"));
+    assert!(output.contains("commit 01846a47"));
+    assert!(output.contains("[LCM sensitive source omitted]"));
+    assert!(!output.contains(opaque));
+    assert!(!output.contains(uppercase_opaque));
+    assert!(!output.contains(hexadecimal_opaque));
+    assert!(!output.contains(lowercase_opaque));
+}
+
+#[test]
+fn redact_uncertain_secrets_scans_the_rest_of_a_line_after_known_redaction() {
+    let opaque = "q7Vn4Zp9Lx2Kc8Mw5Rt1Hs6Bd3YfAa9";
+    let output = redact_uncertain_secrets(&format!(
+        "Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz {opaque} ordinary"
+    ));
+
+    assert!(output.contains("[REDACTED_SECRET]"));
+    assert!(!output.contains(opaque));
+    assert!(output.contains("ordinary"));
+}
+
+#[test]
+fn redact_uncertain_secrets_preserves_existing_omission_and_safe_json_fields() {
+    let value = serde_json::json!({
+        "file_path": "src/lib.rs",
+        "OPENAI_API_KEY": "sk-secret-that-must-not-return"
+    });
+    let redacted = redact_uncertain_json(&value).to_string();
+    let redacted_again = redact_uncertain_secrets(&redacted);
+
+    assert!(redacted_again.contains(UNCERTAIN_SECRET_OMISSION));
+    assert!(redacted_again.contains("src/lib.rs"));
+    assert!(!redacted_again.contains("sk-secret-that-must-not-return"));
+}
+
+#[test]
+fn redact_uncertain_json_redacts_secret_shaped_object_keys_and_values() {
+    let opaque_key = "q7Vn4Zp9Lx2Kc8Mw5Rt1Hs6Bd3YfAa9";
+    let opaque_value = "t8Wp5Ar0My3Ld9Nx6Su2Iv7Ce4ZgBb0";
+    let value = serde_json::json!({ opaque_key: opaque_value, "safe": "ordinary" });
+    let output = redact_uncertain_json(&value).to_string();
+
+    assert!(!output.contains(opaque_key));
+    assert!(!output.contains(opaque_value));
+    assert!(output.contains("ordinary"));
+}
+
+#[test]
 fn redact_secrets_covers_database_and_generic_credentials() {
     let input = concat!(
         "AWS_SESSION_TOKEN=temporary-session-token-value\n",

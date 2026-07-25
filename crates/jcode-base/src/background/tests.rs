@@ -4,6 +4,44 @@ use anyhow::anyhow;
 use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
+struct TaskDropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TaskDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn adopt_aborts_nested_task_when_durable_registration_fails() -> Result<()> {
+    let tmp = tempdir()?;
+    let unwritable_task_dir = tmp.path().join("not-a-directory");
+    std::fs::write(&unwritable_task_dir, b"blocks task status directory")?;
+    let manager = BackgroundTaskManager::with_output_dir(unwritable_task_dir);
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_dropped = std::sync::Arc::clone(&dropped);
+    let handle = tokio::spawn(async move {
+        let _drop_flag = TaskDropFlag(task_dropped);
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        Ok(jcode_tool_types::ToolOutput::new("never"))
+    });
+    tokio::task::yield_now().await;
+
+    let result = manager.adopt("test", "session", handle).await;
+
+    assert!(
+        result.is_err(),
+        "registration failure must be visible to owner"
+    );
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "nested task must be aborted and joined before adoption returns"
+    );
+    assert!(manager.tasks.read().await.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn spawn_with_notify_emits_started_ui_activity() -> Result<()> {
     let tmp = tempdir()?;

@@ -276,6 +276,121 @@ async fn test_set_model_clears_persistent_ws_state() {
 }
 
 #[tokio::test]
+async fn reasoning_change_rejects_stale_response_chain_when_socket_lock_is_busy() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let provider = OpenAIProvider::new(CodexCredentials {
+        access_token: "test".to_string(),
+        refresh_token: String::new(),
+        id_token: None,
+        account_id: None,
+        expires_at: None,
+    });
+    let (state, server) = test_persistent_ws_state().await;
+    let mut socket_guard = provider.persistent_ws.lock().await;
+    *socket_guard = Some(state);
+    let stale_generation = provider
+        .response_chain_generation
+        .load(AtomicOrdering::Acquire);
+    let next_effort = if provider.reasoning_effort().as_deref() == Some("high") {
+        "low"
+    } else {
+        "high"
+    };
+
+    provider
+        .set_reasoning_effort(next_effort)
+        .expect("change reasoning effort");
+
+    assert!(
+        socket_guard.is_some(),
+        "the busy socket lock should exercise generation rejection rather than eager cleanup"
+    );
+    assert!(
+        provider
+            .response_chain_generation
+            .load(AtomicOrdering::Acquire)
+            > stale_generation,
+        "reasoning identity changes must synchronously advance the response-chain generation"
+    );
+    drop(socket_guard);
+
+    let (tx, _rx) = mpsc::channel(1);
+    let result = try_persistent_ws_continuation(
+        &provider.persistent_ws,
+        &provider.response_chain_generation,
+        &serde_json::json!({"model": provider.model()}),
+        &[serde_json::json!({"type": "message", "role": "user", "content": "next"})],
+        1,
+        &tx,
+    )
+    .await;
+
+    assert!(matches!(result, PersistentWsResult::NotAvailable));
+    assert!(
+        provider.persistent_ws.lock().await.is_none(),
+        "a response ID created under another reasoning identity must be discarded fail-closed"
+    );
+    server.abort();
+}
+
+#[test]
+fn auth_change_advances_response_chain_generation() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let provider = OpenAIProvider::new(CodexCredentials {
+        access_token: "test".to_string(),
+        refresh_token: String::new(),
+        id_token: None,
+        account_id: None,
+        expires_at: None,
+    });
+    let before = provider
+        .response_chain_generation
+        .load(AtomicOrdering::Acquire);
+
+    provider.on_auth_changed();
+
+    assert!(
+        provider
+            .response_chain_generation
+            .load(AtomicOrdering::Acquire)
+            > before,
+        "account-label, account-ID, or account-generation changes must invalidate provider response IDs"
+    );
+}
+
+#[tokio::test]
+async fn credential_mode_change_is_atomic_when_mode_lock_is_busy() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _api_key = EnvVarGuard::set("OPENAI_API_KEY", "replacement-api-key");
+    let provider = OpenAIProvider::new(CodexCredentials {
+        access_token: "original-token".to_string(),
+        refresh_token: "original-refresh".to_string(),
+        id_token: None,
+        account_id: Some("original-account".to_string()),
+        expires_at: None,
+    });
+    let original_credentials = provider.credentials.read().await.clone();
+    let original_generation = provider
+        .response_chain_generation
+        .load(AtomicOrdering::Acquire);
+    let mode_guard = provider.credential_mode.write().await;
+
+    let err = provider
+        .set_credential_mode(OpenAICredentialMode::ApiKey)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("while a request is in progress"));
+    assert_eq!(*provider.credentials.read().await, original_credentials);
+    assert_eq!(
+        provider
+            .response_chain_generation
+            .load(AtomicOrdering::Acquire),
+        original_generation
+    );
+    drop(mode_guard);
+}
+
+#[tokio::test]
 async fn test_switching_to_https_clears_persistent_ws_state() {
     // Serialize with the tests that set JCODE_OPENAI_MODEL via EnvVarGuard:
     // provider construction reads that process-global env var, so an

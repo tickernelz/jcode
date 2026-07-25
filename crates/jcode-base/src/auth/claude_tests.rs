@@ -44,6 +44,7 @@ fn jcode_auth_file_roundtrip() {
             subscription_type: Some("max".to_string()),
         }],
         active_anthropic_account: Some("work".to_string()),
+        account_identities: std::collections::HashMap::new(),
         anthropic: None,
     };
 
@@ -146,6 +147,7 @@ fn jcode_auth_file_multi_account() {
             },
         ],
         active_anthropic_account: Some("work".to_string()),
+        account_identities: std::collections::HashMap::new(),
         anthropic: None,
     };
 
@@ -576,4 +578,49 @@ impl Drop for EnvStringGuard {
             crate::env::remove_var(self.key);
         }
     }
+}
+#[test]
+fn concurrent_account_token_updates_preserve_both_rotated_tokens() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    set_active_account_override(None);
+    let account = |label: &str, access: &str, refresh: &str| AnthropicAccount {
+        label: label.to_string(),
+        access: access.to_string(),
+        refresh: refresh.to_string(),
+        expires: 1,
+        email: None,
+        subscription_type: Some("max".to_string()),
+        scopes: Vec::new(),
+    };
+    let first = upsert_account(account("first", "a0", "ra0")).unwrap();
+    let second = upsert_account(account("second", "b0", "rb0")).unwrap();
+
+    let lock_path = jcode_path().unwrap().with_extension("atomic.lock");
+    let gate = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    gate.lock().unwrap();
+    let update_first = std::thread::spawn(move || {
+        update_account_tokens(&first, "a1", "ra1", 2).unwrap();
+    });
+    let update_second = std::thread::spawn(move || {
+        update_account_tokens(&second, "b1", "rb1", 2).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!update_first.is_finished());
+    assert!(!update_second.is_finished());
+    drop(gate.unlock());
+    update_first.join().unwrap();
+    update_second.join().unwrap();
+
+    let accounts = list_accounts().unwrap();
+    assert_eq!(accounts.len(), 2);
+    assert!(accounts.iter().any(|account| account.access == "a1"));
+    assert!(accounts.iter().any(|account| account.access == "b1"));
 }

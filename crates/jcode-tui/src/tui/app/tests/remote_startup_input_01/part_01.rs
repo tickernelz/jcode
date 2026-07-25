@@ -154,6 +154,92 @@ fn test_review_and_judge_startup_prompts_are_analysis_only() {
 }
 
 #[test]
+fn test_review_and_prompt_clones_inherit_active_lcm_graph_continuity() {
+    with_temp_jcode_home(|| {
+        let identity = jcode_provider_core::ExactRuntimeIdentity {
+            provider_key: "test-provider".to_string(),
+            route: jcode_provider_core::RouteSelection {
+                model: "test-model".to_string(),
+                runtime_key: jcode_provider_core::RuntimeKey::OpenAIOAuth,
+                api_method: "test-api".to_string(),
+                provider_label: "Test Provider".to_string(),
+                detail: String::new(),
+            },
+            account_label: Some("test-account".to_string()),
+            account_id: Some("stable-test-account".to_string()),
+            account_generation: Some(1),
+            reasoning_effort: None,
+        };
+        let mut source = crate::session::Session::create_with_id(
+            crate::id::new_id("review_clone_lcm_source"),
+            None,
+            Some("source".to_string()),
+        );
+        source.exact_runtime_identity = Some(identity.clone());
+        source.model = Some(identity.route.model.clone());
+        source.provider_key = Some(identity.provider_key.clone());
+        source.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "canonical LCM source".to_string(),
+                cache_control: None,
+            }],
+        );
+        source.save().expect("save LCM source");
+
+        let mut active = crate::session::Session::create_with_id(
+            crate::id::new_id("review_clone_lcm_active"),
+            Some(source.id.clone()),
+            Some("active".to_string()),
+        );
+        active.exact_runtime_identity = Some(identity.clone());
+        active.model = Some(identity.route.model.clone());
+        active.provider_key = Some(identity.provider_key.clone());
+        active
+            .install_imported_context_root(
+                &source,
+                crate::session::StoredCompactionState {
+                    summary_text: "portable review context".to_string(),
+                    openai_encrypted_content: None,
+                    covers_up_to_turn: 1,
+                    original_turn_count: 1,
+                    compacted_count: 0,
+                },
+                &identity,
+            )
+            .expect("install active LCM root");
+        active.save().expect("save active LCM session");
+
+        let mut app = create_test_app();
+        app.session = active.clone();
+        let (prompt_id, _) = super::commands_review::clone_session_for_prompt(&app)
+            .expect("prompt clone with active graph");
+        let (review_id, _) = super::commands_review::clone_session_for_review(
+            &app,
+            "review",
+            identity.route.model.clone(),
+            Some(identity.provider_key.clone()),
+        )
+        .expect("review clone with active graph");
+
+        for clone_id in [prompt_id, review_id] {
+            let clone = crate::session::Session::load(&clone_id).expect("reload clone");
+            assert_eq!(
+                serde_json::to_value(&clone.messages[..active.messages.len()])
+                    .expect("serialize clone prefix"),
+                serde_json::to_value(&active.messages).expect("serialize active history")
+            );
+            assert_eq!(clone.archived_message_ids, active.archived_message_ids);
+            assert_eq!(clone.exact_runtime_identity, active.exact_runtime_identity);
+            assert_eq!(clone.context_nodes, active.context_nodes);
+            assert_eq!(clone.context_frontier, active.context_frontier);
+            assert_eq!(clone.compaction, active.compaction);
+            assert!(clone.provider_session_id.is_none());
+        }
+    });
+}
+
+#[test]
 fn test_autojudge_prompt_is_continue_or_stop_manager() {
     let prompt = super::commands::build_autojudge_startup_message("session_parent");
 

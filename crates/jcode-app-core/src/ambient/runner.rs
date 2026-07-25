@@ -380,9 +380,20 @@ impl AmbientRunnerHandle {
     async fn resume_dead_session_with_reminder(
         &self,
         provider: &Arc<dyn Provider>,
-        item: &ScheduledItem,
         session_id: &str,
+        reminder: &str,
     ) -> anyhow::Result<()> {
+        // Live delivery can fail while the owning connection is being cleaned
+        // up. Join the server's lifecycle ordering before treating the session
+        // as dead, and retain ownership through the headless turn and close so
+        // disconnect cleanup cannot publish a competing terminal generation.
+        let _session_lifecycle_lease =
+            crate::server::acquire_session_lifecycle_lease(session_id).await;
+        match self.notify_live_session(session_id, reminder).await {
+            Ok(()) => return Ok(()),
+            Err(error) if session_is_not_live_error(session_id, &error) => {}
+            Err(error) => return Err(error),
+        }
         let session = Session::load(session_id)?;
         let cycle_provider = provider.fork();
         let registry = tool::Registry::new(cycle_provider.clone()).await;
@@ -394,9 +405,8 @@ impl AmbientRunnerHandle {
         agent.set_debug(session.is_debug);
         agent.restore_session(session_id)?;
 
-        let reminder = ambient::format_scheduled_session_message(item);
-        let _ = agent.run_once_capture(&reminder).await?;
-        agent.mark_closed();
+        let _ = agent.run_once_capture(reminder).await?;
+        agent.try_mark_closed()?;
         Ok(())
     }
 
@@ -416,9 +426,7 @@ impl AmbientRunnerHandle {
                             .unwrap_or_else(|| "Scheduled task".to_string()),
                     ),
                 );
-                child.replace_messages(parent.messages.clone());
-                child.compaction = parent.compaction.clone();
-                child.inherit_context_graph_from(&parent)?;
+                child.inherit_context_continuity_from(&parent)?;
                 child.provider_key = parent.provider_key.clone();
                 child.route_api_method = parent.route_api_method.clone();
                 child.model = parent.model.clone();
@@ -471,7 +479,7 @@ impl AmbientRunnerHandle {
 
         let reminder = ambient::format_scheduled_session_message(item);
         let _ = agent.run_once_capture(&reminder).await?;
-        agent.mark_closed();
+        agent.try_mark_closed()?;
         Ok(child_session_id)
     }
 
@@ -497,7 +505,7 @@ impl AmbientRunnerHandle {
                             "Ambient runner: live delivery for {} fell back to headless resume: {}",
                             session_id, err
                         ));
-                        self.resume_dead_session_with_reminder(provider, item, session_id)
+                        self.resume_dead_session_with_reminder(provider, session_id, &reminder)
                             .await
                     }
                 }
@@ -920,7 +928,7 @@ impl AmbientRunnerHandle {
         if let Some(result) = ambient_tools::take_cycle_result() {
             ambient_tools::unregister_ambient_session(&ambient_session_id);
             let conversation = agent.export_conversation_markdown();
-            agent.mark_closed();
+            agent.try_mark_closed()?;
             return Ok(AmbientCycleResult {
                 started_at,
                 ended_at: Utc::now(),
@@ -947,7 +955,7 @@ impl AmbientRunnerHandle {
         if let Some(result) = ambient_tools::take_cycle_result() {
             ambient_tools::unregister_ambient_session(&ambient_session_id);
             let conversation = agent.export_conversation_markdown();
-            agent.mark_closed();
+            agent.try_mark_closed()?;
             return Ok(AmbientCycleResult {
                 started_at,
                 ended_at: Utc::now(),
@@ -971,7 +979,7 @@ impl AmbientRunnerHandle {
             status: CycleStatus::Incomplete,
             conversation: Some(agent.export_conversation_markdown()),
         };
-        agent.mark_closed();
+        agent.try_mark_closed()?;
         Ok(forced)
     }
 
@@ -1066,6 +1074,10 @@ impl AmbientRunnerHandle {
             }
         }
     }
+}
+
+fn session_is_not_live_error(session_id: &str, error: &anyhow::Error) -> bool {
+    error.to_string() == format!("Session '{}' is not currently live", session_id)
 }
 
 // ---------------------------------------------------------------------------
