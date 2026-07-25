@@ -71,30 +71,7 @@ jobs:
       - name: Run targeted Windows validation tests
         shell: pwsh
         run: |
-          $tests = @(
-            'command_candidates_adds_extension_on_windows',
-            'command_exists_for_known_binary',
-            'command_exists_absolute_path',
-            'sibling_socket_path_roundtrip',
-            'cleanup_socket_pair_removes_main_and_debug_files',
-            'is_process_running_reports_exited_children_as_stopped',
-            'spawn_replacement_process_returns_without_waiting_for_child_exit',
-            'build_shell_command_uses_cmd_and_executes_command',
-            'pipe_name_is_stable_and_normalizes_case_and_separators',
-            'pipe_name_falls_back_when_stem_is_empty',
-            'busy_pipe_is_reported_as_a_live_socket_path',
-            'stream_pair_round_trips_bytes',
-            'split_stream_supports_concurrent_read_and_write',
-            'auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_blocking'
-          )
-
-          foreach ($testName in $tests) {
-            & ./scripts/invoke_cargo_with_timeout.ps1 `
-              -Name "Windows targeted test: $testName" `
-              -TimeoutSeconds 300 `
-              -RequireTests `
-              -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '--lib', $testName, '--', '--nocapture')
-          }
+          & ./scripts/run_windows_targeted_tests.ps1
 
       - name: Run Windows smoke tests
         shell: pwsh
