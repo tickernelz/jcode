@@ -278,32 +278,32 @@ jobs:
         shell: pwsh
         run: |
           $tests = @(
-            'command_candidates_adds_extension_on_windows',
-            'command_exists_for_known_binary',
-            'command_exists_absolute_path',
-            'sibling_socket_path_roundtrip',
-            'cleanup_socket_pair_removes_main_and_debug_files',
-            'is_process_running_reports_exited_children_as_stopped',
-            'spawn_replacement_process_returns_without_waiting_for_child_exit',
-            'build_shell_command_uses_cmd_and_executes_command',
-            'pipe_name_is_stable_and_normalizes_case_and_separators',
-            'pipe_name_falls_back_when_stem_is_empty',
-            'busy_pipe_is_reported_as_a_live_socket_path',
-            'stream_pair_round_trips_bytes',
-            'split_stream_supports_concurrent_read_and_write',
-            'test_cancel_command_idle_reports_nothing_to_cancel',
-            'test_menu_number_rejected_as_api_key',
-            'test_command_palette_suppressed_while_api_key_prompt_pending',
-            'test_ctrl_c_with_active_copy_selection_copies_instead_of_quitting',
-            'test_ctrl_c_in_copy_mode_without_selection_still_falls_through'
+            @{ Package = 'jcode-base'; Name = 'command_candidates_adds_extension_on_windows' },
+            @{ Package = 'jcode-base'; Name = 'command_exists_for_known_binary' },
+            @{ Package = 'jcode-base'; Name = 'command_exists_absolute_path' },
+            @{ Package = 'jcode-app-core'; Name = 'sibling_socket_path_roundtrip' },
+            @{ Package = 'jcode-app-core'; Name = 'cleanup_socket_pair_removes_main_and_debug_files' },
+            @{ Package = 'jcode-base'; Name = 'is_process_running_reports_exited_children_as_stopped' },
+            @{ Package = 'jcode-base'; Name = 'spawn_replacement_process_returns_without_waiting_for_child_exit' },
+            @{ Package = 'jcode-app-core'; Name = 'build_shell_command_uses_cmd_and_executes_command' },
+            @{ Package = 'jcode-base'; Name = 'pipe_name_is_stable_and_normalizes_case_and_separators' },
+            @{ Package = 'jcode-base'; Name = 'pipe_name_falls_back_when_stem_is_empty' },
+            @{ Package = 'jcode-base'; Name = 'busy_pipe_is_reported_as_a_live_socket_path' },
+            @{ Package = 'jcode-base'; Name = 'stream_pair_round_trips_bytes' },
+            @{ Package = 'jcode-base'; Name = 'split_stream_supports_concurrent_read_and_write' },
+            @{ Package = 'jcode-tui'; Name = 'test_cancel_command_idle_reports_nothing_to_cancel' },
+            @{ Package = 'jcode-tui'; Name = 'test_menu_number_rejected_as_api_key' },
+            @{ Package = 'jcode-tui'; Name = 'test_command_palette_suppressed_while_api_key_prompt_pending' },
+            @{ Package = 'jcode-tui'; Name = 'test_ctrl_c_with_active_copy_selection_copies_instead_of_quitting' },
+            @{ Package = 'jcode-tui'; Name = 'test_ctrl_c_in_copy_mode_without_selection_still_falls_through' }
           )
 
-          foreach ($testName in $tests) {
+          foreach ($test in $tests) {
             & ./scripts/invoke_cargo_with_timeout.ps1 `
-              -Name "Windows targeted test: $testName" `
+              -Name "Windows targeted test: $($test.Name)" `
               -TimeoutSeconds 300 `
               -RequireTests `
-              -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '--lib', $testName, '--', '--nocapture')
+              -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', $test.Package, '--lib', $test.Name, '--', '--nocapture')
           }
 
       - name: Run Windows hotkey and power tests

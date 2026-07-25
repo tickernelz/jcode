@@ -18,7 +18,6 @@ impl App {
         ))
         .await
     }
-
     async fn run_turn_interactive_admitted(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -30,14 +29,12 @@ impl App {
         let mut redraw_interval = super::run_shell::redraw_timer(redraw_period);
         let mut status_spinner_interval = super::run_shell::status_spinner_interval();
         let mut status_spinner_renderer = super::run_shell::StatusSpinnerRenderer::default();
-
         'turn_loop: loop {
             let desired_redraw = crate::tui::redraw_interval(self);
             if desired_redraw != redraw_period {
                 redraw_period = desired_redraw;
                 redraw_interval = super::run_shell::redraw_timer(redraw_period);
             }
-
             self.status = ProcessingStatus::Sending;
             status_spinner_renderer.draw_full(self, terminal)?;
             super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);

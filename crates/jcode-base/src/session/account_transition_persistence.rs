@@ -27,10 +27,10 @@ impl Drop for DeactivateAccountTransitionAdmission {
 }
 
 pub fn capture_account_transition_admission() -> Option<AccountTransitionAdmission> {
-    ACCOUNT_TRANSITION_ADMISSION
-        .try_with(Clone::clone)
-        .ok()
-        .filter(AccountTransitionAdmission::active)
+    match ACCOUNT_TRANSITION_ADMISSION.try_with(Clone::clone) {
+        Ok(admission) if admission.active() => Some(admission),
+        Ok(_) | Err(_) => None,
+    }
 }
 
 pub fn account_transition_admission_held() -> bool {
@@ -226,7 +226,9 @@ impl AccountTransitionFileLock {
     ) -> Result<Self> {
         let turnstile = open_lock_file(&account_transition_turnstile_path()?)?;
         turnstile.lock()?;
-        let _ = turnstile_acquired.send(());
+        turnstile_acquired
+            .send(())
+            .map_err(|_| anyhow::anyhow!("account transition observer disconnected"))?;
         Self::acquire_main(false).inspect(|_| drop(turnstile))
     }
 }

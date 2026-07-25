@@ -263,6 +263,9 @@ async fn test_resume_session_with_local_history_uses_metadata_only_history() -> 
     let mut session = Session::create(None, Some("Target Subscribe Test".to_string()));
     session.model = Some("model-a".to_string());
     session.provider_session_id = Some("provider-resume-123".to_string());
+    let identity = crate::mock_provider::test_runtime_identity("mock", "model-a");
+    session.exact_runtime_identity = Some(identity.clone());
+    session.provider_session_identity = Some(identity);
     session.add_message(
         jcode::message::Role::User,
         vec![jcode::message::ContentBlock::Text {

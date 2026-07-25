@@ -3,6 +3,7 @@
 //! These tests verify the full flow from user input to response
 //! without making actual API calls.
 
+mod capturing_compaction_provider;
 mod mock_provider;
 mod test_support;
 

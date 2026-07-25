@@ -3176,7 +3176,7 @@ impl App {
         }
         let profile_suffix = profile_email
             .map(|email| format!(" (email: {})", mask_email(&email)))
-            .unwrap_or_default();
+            .unwrap_or_else(String::new);
 
         Ok(format!(
             "Successfully logged in to Claude! (account: {}){}",

@@ -5,7 +5,7 @@
 use anyhow::Result;
 use async_stream::stream;
 use jcode::message::{Message, StreamEvent, ToolDefinition};
-use jcode::provider::{EventStream, Provider};
+use jcode::provider::{EventStream, ExactRuntimeIdentity, Provider, RouteSelection, RuntimeKey};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +54,23 @@ impl MockProvider {
     }
 }
 
+pub fn test_runtime_identity(provider_key: &str, model: &str) -> ExactRuntimeIdentity {
+    ExactRuntimeIdentity {
+        provider_key: provider_key.to_string(),
+        route: RouteSelection {
+            model: model.to_string(),
+            runtime_key: RuntimeKey::OpenAIApiKey,
+            api_method: "mock".to_string(),
+            provider_label: provider_key.to_string(),
+            detail: "deterministic e2e fixture".to_string(),
+        },
+        account_label: Some("e2e-account".to_string()),
+        account_id: Some("e2e-account-id".to_string()),
+        account_generation: Some(1),
+        reasoning_effort: None,
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for MockProvider {
     async fn complete(
@@ -96,6 +113,10 @@ impl Provider for MockProvider {
 
     fn model(&self) -> String {
         self.current_model.lock().unwrap().clone()
+    }
+
+    fn exact_runtime_identity(&self) -> Option<ExactRuntimeIdentity> {
+        Some(test_runtime_identity(self.name(), &self.model()))
     }
 
     fn set_model(&self, model: &str) -> Result<()> {

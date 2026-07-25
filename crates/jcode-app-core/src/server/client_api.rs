@@ -2,6 +2,7 @@ use super::{connect_socket, debug_socket_path, socket_path};
 use crate::protocol::{HistoryMessage, Request, ServerEvent, TranscriptMode};
 use crate::transport::{ReadHalf, WriteHalf};
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -10,6 +11,7 @@ pub struct Client {
     reader: BufReader<ReadHalf>,
     writer: WriteHalf,
     next_id: u64,
+    pending_events: VecDeque<ServerEvent>,
 }
 
 impl Client {
@@ -24,6 +26,7 @@ impl Client {
             reader: BufReader::new(reader),
             writer,
             next_id: 1,
+            pending_events: VecDeque::new(),
         })
     }
 
@@ -38,6 +41,7 @@ impl Client {
             reader: BufReader::new(reader),
             writer,
             next_id: 1,
+            pending_events: VecDeque::new(),
         })
     }
 
@@ -95,6 +99,13 @@ impl Client {
 
     /// Read the next event from the server
     pub async fn read_event(&mut self) -> Result<ServerEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(event);
+        }
+        self.read_socket_event().await
+    }
+
+    async fn read_socket_event(&mut self) -> Result<ServerEvent> {
         let mut line = String::new();
         let n = self.reader.read_line(&mut line).await?;
         if n == 0 {
@@ -171,16 +182,16 @@ impl Client {
         let request = Request::GetHistory { id };
         let json = serde_json::to_string(&request)? + "\n";
         self.writer.write_all(json.as_bytes()).await?;
-        for _ in 0..10 {
-            let mut line = String::new();
-            let n = self.reader.read_line(&mut line).await?;
-            if n == 0 {
-                anyhow::bail!("Server disconnected");
-            }
-            let event: ServerEvent = serde_json::from_str(&line)?;
-            match event {
-                ServerEvent::Ack { .. } => continue,
-                _ => return Ok(event),
+        for _ in 0..100 {
+            let event = self.read_socket_event().await?;
+            match &event {
+                ServerEvent::History {
+                    id: response_id, ..
+                }
+                | ServerEvent::Error {
+                    id: response_id, ..
+                } if *response_id == id => return Ok(event),
+                _ => self.pending_events.push_back(event),
             }
         }
 

@@ -55,6 +55,10 @@ async fn resume_session_restores_persisted_compaction_for_provider_context() -> 
             original_turn_count: 2,
             compacted_count: 2,
         });
+        session.exact_runtime_identity = Some(crate::mock_provider::test_runtime_identity(
+            "capturing-compaction",
+            "capturing-compaction-model",
+        ));
         session.save()?;
 
         wait_for_server_ready(&socket_path, &debug_socket_path).await?;
